@@ -1,10 +1,20 @@
 import gymnasium as gym
-import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-from scipy.integrate import solve_ivp
 from typing import Optional
-from libs.constants import *
+from libs.constants import (
+    ENV_BONUS,
+    ENV_BOUNDARY,
+    ENV_DT,
+    ENV_FUEL_COEFF,
+    ENV_INITIAL_STATE_VBAR,
+    ENV_MAX_DV,
+    ENV_POS_TOLERANCE,
+    ENV_TIMEOUT,
+    ENV_VEL_COEFF,
+    ENV_VEL_TOLERANCE,
+    OMEGA,
+)
 from scipy.linalg import expm
 import torch
 
@@ -12,16 +22,16 @@ class CWRendezvousEnv(gym.Env):
 
     def __init__(
             self, 
-            omega: float, 
-            dt: float = 5.0, 
-            max_dv: float = 0.2, 
-            boundary: float = 1000.0, 
-            timeout: float = 10 * T,
-            pos_tolerance: float = 1.0,
-            vel_tolerance: float = 0.01,
-            vel_coeff: float = 10.0,
-            fuel_coeff: float = 1.0,
-            bonus: float = 100.0,
+            omega: float = OMEGA,
+            dt: float = ENV_DT,
+            max_dv: float = ENV_MAX_DV,
+            boundary: float = ENV_BOUNDARY,
+            timeout: float = ENV_TIMEOUT,
+            pos_tolerance: float = ENV_POS_TOLERANCE,
+            vel_tolerance: float = ENV_VEL_TOLERANCE,
+            vel_coeff: float = ENV_VEL_COEFF,
+            fuel_coeff: float = ENV_FUEL_COEFF,
+            bonus: float = ENV_BONUS,
         ):
         
 
@@ -46,7 +56,7 @@ class CWRendezvousEnv(gym.Env):
         A[5, 2] = 3 * omega ** 2
         A[5, 3] = -2 * omega
         self.STM = torch.tensor(expm(A * dt), dtype=torch.float32)  # constant, precomputed 
-        
+        self.STM_np = expm(A * dt)                       # for the numpy env step
 
         # Observation: [x, y, z, xdot, ydot, zdot] -- continuous, unbounded
         # (bounding it artificially isn't physically meaningful here, since
@@ -66,25 +76,30 @@ class CWRendezvousEnv(gym.Env):
         """Differentiable CW propagation for actor training (HDP model step)."""
         v_new = state[3:6] + action
         s0 = torch.cat([state[0:3], v_new])
-        return self.STM @ s0
+        stm = self.STM.to(device=state.device, dtype=state.dtype)
+        return stm @ s0
 
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
 
-        theta = self.np_random.uniform(0, 2 * np.pi)
-        r     = 100.0
-        self.state = np.array(
-            [r * np.cos(theta), r * np.sin(theta), 0.0, 0.0, 0.0, 0.0],
-            dtype=np.float64,
-        )
+        # Random circle
 
-
-        # # Random 2D point within 100m box
+        # theta = self.np_random.uniform(0, 2 * np.pi)
+        # r     = 100.0
         # self.state = np.array(
-        #     [self.np_random.uniform(0, 100), self.np_random.uniform(0, 100), 0.0, 0.0, 0.0, 0.0],
+        #     [r * np.cos(theta), r * np.sin(theta), 0.0, 0.0, 0.0, 0.0],
         #     dtype=np.float64,
         # )
+
+        # Shift along V-bar
+        self.state = np.array(
+            ENV_INITIAL_STATE_VBAR,
+            dtype=np.float64,
+        )
+        
+        self.best_distance = np.linalg.norm(self.state[0:3])
+
         self.elapsed_time = 0.0
 
         observation = self.state.copy()
@@ -92,42 +107,57 @@ class CWRendezvousEnv(gym.Env):
         return observation, info
 
     def step(self, action: np.ndarray):
-        action = np.clip(action, -self.max_dv, self.max_dv)  # enforce action_space bounds
+
+        # enforce action_space bounds
+        action = np.clip(action, -self.max_dv, self.max_dv)
+
         # apply impulsive delta-v to velocity components
         self.state[3:6] += action
+        
         # propagate freely under CW dynamics for dt
 
-        sol = solve_ivp(
-            self.cw_dynamics, (0, self.dt), self.state,
-            args=(self.omega,), rtol=1e-9, atol=1e-9
-        )
+        # sol = solve_ivp(
+        #     self.cw_dynamics, (0, self.dt), self.state,
+        #     args=(self.omega,), rtol=1e-9, atol=1e-9
+        # )
 
-        self.state = sol.y[:, -1]
+        self.state = self.STM_np @ self.state
+        
         self.elapsed_time += self.dt
 
         pos_error = np.linalg.norm(self.state[0:3])
         vel_error = np.linalg.norm(self.state[3:6])
-        docked = (pos_error < self.pos_tolerance) and (vel_error < self.vel_tolerance)
+
+        docked = (pos_error < self.pos_tolerance)
+
+        if pos_error < self.best_distance:
+            reward_pos = self.best_distance - pos_error  # reward = distance closed
+            self.best_distance = pos_error
+        else:
+            reward_pos = 0.0
 
         terminated = bool((pos_error > self.boundary) or docked)
         truncated = bool(self.elapsed_time > self.timeout)
 
-        reward = -pos_error - self.vel_coeff * vel_error - self.fuel_coeff * np.linalg.norm(action)
+        reward_fuel = - self.fuel_coeff * np.linalg.norm(action)
+        reward_shaping = -0.01 * pos_error  # scaled ~100x smaller than progress bonus
+        reward_bonus = self.bonus if docked else 0.0
+        
         if docked:
-            reward += self.bonus
+            reward_vel = -self.vel_coeff * vel_error
+        else:
+            reward_vel = 0
+
+        reward = reward_pos + reward_fuel + reward_vel + reward_shaping
 
         observation = self.state.copy()
-        info = {"distance": pos_error, "docked": docked}
+        info = {
+            "distance": pos_error,
+            "docked": docked,
+            "reward_pos": reward_pos,
+            "reward_vel": reward_vel,
+            "reward_fuel": reward_fuel,
+            "reward_bonus": reward_bonus,
+        }
 
         return observation, reward, terminated, truncated, info
-
-    @staticmethod
-    def cw_dynamics(t, s, omega):
-        r = s[0:3]
-        r_dot = s[3:6]
-        r_ddot = np.array([
-            2 * omega * r_dot[2],
-            -omega ** 2 * r[1],
-            3 * omega ** 2 * r[2] - 2 * omega * r_dot[0]
-        ])
-        return np.concatenate([r_dot, r_ddot])

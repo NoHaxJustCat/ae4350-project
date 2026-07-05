@@ -1,10 +1,39 @@
 import numpy as np
 
-earth_mu = 3.986 * 10 ** 14 # m ** 3 / s ** 2
-radius = (6378 + 600) * 10 ** 3 # m
-omega = np.sqrt(earth_mu / radius ** 3)
-T = 2 * np.pi/omega
+# --- Orbit / physics constants ---
+EARTH_MU = 3.986 * 10 ** 14  # m^3 / s^2
+ORBIT_RADIUS = (6378 + 600) * 10 ** 3  # m
+OMEGA = np.sqrt(EARTH_MU / ORBIT_RADIUS ** 3)
+ORBIT_PERIOD = 2 * np.pi / OMEGA
 
-gamma = 0.95  # Discount rate [7]
-num_episodes = 5000
-max_steps = 50
+# --- Environment defaults ---
+ENV_DT = 50.0
+ENV_MAX_DV = 0.2
+ENV_BOUNDARY = 1000.0
+ENV_TIMEOUT = 10 * ORBIT_PERIOD
+ENV_POS_TOLERANCE = 1.0
+ENV_VEL_TOLERANCE = 0.01
+ENV_VEL_COEFF = 100.0
+ENV_FUEL_COEFF = 1.0
+ENV_BONUS = 1000.0
+ENV_INITIAL_STATE_VBAR = np.array([0.0, 100.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+ENV_INITIAL_STATE_XPLUS = np.array([100.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+# --- Training defaults ---
+GAMMA = 0.95
+NUM_EPISODES = 5000
+MAX_STEPS = 50
+ACTOR_LR = 1e-5
+CRITIC_LR = 1e-4
+GRAD_CLIP_NORM = 1.0
+LOG_EVERY = 10
+
+# --- Evaluation / plotting defaults ---
+SMOOTHING_WINDOW = 20
+DOCK_RATE_WINDOW = 50
+CLOSE_NOTE_THRESHOLD = 5.0
+BOUNDARY_WARNING_FACTOR = 0.8
+TRAINED_ACTOR_PATH = "trained/actor.pt"
+TRAINED_CRITIC_PATH = "trained/critic.pt"
+DIAGNOSTICS_PLOT_PATH = "out/diagnostics.png"
+TRAINING_HISTORY_PATH = "out/training_history.npz"
