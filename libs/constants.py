@@ -13,7 +13,7 @@ ENV_BOUNDARY = 1000.0
 ENV_TIMEOUT = 10 * ORBIT_PERIOD
 ENV_POS_TOLERANCE = 1.0
 ENV_VEL_TOLERANCE = 0.01
-ENV_VEL_COEFF = 100.0
+ENV_VEL_COEFF = 5.0
 ENV_FUEL_COEFF = 1.0
 ENV_BONUS = 1000.0
 ENV_INITIAL_STATE_VBAR = np.array([0.0, 100.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
@@ -23,10 +23,11 @@ ENV_INITIAL_STATE_XPLUS = np.array([100.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.fl
 GAMMA = 0.95
 NUM_EPISODES = 5000
 MAX_STEPS = 50
-ACTOR_LR = 1e-5
+ACTOR_LR = 1e-6
 CRITIC_LR = 1e-4
 GRAD_CLIP_NORM = 1.0
 LOG_EVERY = 10
+TAU = 0.005  # soft update rate — add to constants.py
 
 # --- Evaluation / plotting defaults ---
 SMOOTHING_WINDOW = 20

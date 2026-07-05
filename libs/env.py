@@ -148,7 +148,7 @@ class CWRendezvousEnv(gym.Env):
         else:
             reward_vel = 0
 
-        reward = reward_pos + reward_fuel + reward_vel + reward_shaping
+        reward = reward_pos + reward_fuel + reward_vel + reward_shaping + reward_bonus
 
         observation = self.state.copy()
         info = {
@@ -158,6 +158,7 @@ class CWRendezvousEnv(gym.Env):
             "reward_vel": reward_vel,
             "reward_fuel": reward_fuel,
             "reward_bonus": reward_bonus,
+            "vel_error": vel_error,
         }
 
         return observation, reward, terminated, truncated, info
