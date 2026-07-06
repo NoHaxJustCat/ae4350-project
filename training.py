@@ -102,7 +102,8 @@ def main():
 
         state, _ = env.reset()
         state = torch.tensor(state, dtype=torch.float32)
-        prev_J = critic(state)
+        with torch.no_grad():
+            prev_J = critic(state, actor(state).detach())
         episode_states = [state.detach().numpy().copy()]
 
         total_reward = 0.0
@@ -129,11 +130,13 @@ def main():
             if info["docked"]:
                 docked = True
  
-            current_J = critic(next_state)
+            current_J = critic(next_state, action.detach())  # action already computed above
  
-            target = reward_t + GAMMA * critic_target(next_state).detach()
+            next_action = actor(next_state).detach()
+            target = reward_t + GAMMA * critic_target(next_state, next_action).detach()
  
-            critic_loss = torch.mean((prev_J - target) ** 2)
+            # Critic update
+            critic_loss = torch.mean((critic(state, action) - target) ** 2)
             critic_opt.zero_grad()
             critic_loss.backward()
             torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=GRAD_CLIP_NORM)
@@ -146,8 +149,8 @@ def main():
  
             current_action = actor(state)
             predicted_next_state = env.propagate_torch(state, current_action)
-            action_penalty = env.fuel_coeff * torch.linalg.norm(current_action)
-            actor_loss = -critic(predicted_next_state).mean() + action_penalty
+            next_action_pred = actor(predicted_next_state)  # no detach — grad flows
+            actor_loss = -critic(predicted_next_state, next_action_pred).mean()
             actor_opt.zero_grad()
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=GRAD_CLIP_NORM)
@@ -158,7 +161,6 @@ def main():
             total_J += current_J.item()
  
             state = next_state
-            prev_J = critic(state)
  
             if terminated or truncated:
                 break
