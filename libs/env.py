@@ -77,7 +77,10 @@ class CWRendezvousEnv(gym.Env):
         """Differentiable CW propagation for actor training (HDP model step)."""
         v_new = state[3:6] + action
         s0 = torch.cat([state[0:3], v_new])
-        stm = self.STM.to(device=state.device, dtype=state.dtype)
+        stm = self.STM
+        if stm.device != state.device or stm.dtype != state.dtype:
+            stm = stm.to(device=state.device, dtype=state.dtype)
+            self.STM = stm
         return stm @ s0
 
 
