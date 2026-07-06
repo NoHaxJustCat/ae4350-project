@@ -108,58 +108,59 @@ class CWRendezvousEnv(gym.Env):
         return observation, info
 
     def step(self, action: np.ndarray):
-
-        # enforce action_space bounds
         action = np.clip(action, -self.max_dv, self.max_dv)
-
-        # apply impulsive delta-v to velocity components
+        
+        # Store previous state for delta-rewards
+        prev_pos_error = np.linalg.norm(self.state[0:3])
+        
+        # Apply action and propagate
         self.state[3:6] += action
-        
-        # propagate freely under CW dynamics for dt
-
-        # sol = solve_ivp(
-        #     self.cw_dynamics, (0, self.dt), self.state,
-        #     args=(self.omega,), rtol=1e-9, atol=1e-9
-        # )
-
         self.state = self.STM_np @ self.state
-        
         self.elapsed_time += self.dt
-
+        
         pos_error = np.linalg.norm(self.state[0:3])
         vel_error = np.linalg.norm(self.state[3:6])
-
-        docked = (pos_error < self.pos_tolerance)
-
-        if pos_error < self.best_distance:
-            reward_pos = 10 * (self.best_distance - pos_error)  # reward = distance closed
-            self.best_distance = pos_error
-        else:
-            reward_pos = 0.0
-
-        terminated = bool((pos_error > self.boundary) or docked)
-        truncated = bool(self.elapsed_time > self.timeout)
-
-        reward_fuel = - self.fuel_coeff * np.linalg.norm(action)
-        reward_shaping = -ENV_SHAPING_COEFF * pos_error  # scaled ~100x smaller than progress bonus
-        reward_bonus = self.bonus if docked else 0.0
         
+        docked = pos_error < self.pos_tolerance
+        out_of_bounds = pos_error > self.boundary
+        timeout = self.elapsed_time > self.timeout
+        
+        terminated = bool(docked or out_of_bounds)
+        truncated = bool(timeout)
+        
+        # --- REWARD COMPONENTS ---
+        
+        # 1. Distance progress (DENSE - always active)
+        # Positive = getting closer, Negative = getting farther
+        reward_pos = ENV_SHAPING_COEFF * (prev_pos_error - pos_error)
+        
+        # 2. Velocity progress (helps learn braking)
+        # reward_vel = 1.0 * (prev_vel_error - vel_error)
+        
+        # 3. Fuel penalty (keep this small)
+        reward_fuel = -ENV_FUEL_COEFF* np.linalg.norm(action)
+        
+        # 4. Terminal rewards (clear success vs failure signals)
         if docked:
-            reward_vel = -self.vel_coeff * vel_error
+            reward_terminal = ENV_BONUS - ENV_VEL_COEFF * vel_error  # Bonus, penalize crash speed
+        elif out_of_bounds:
+            reward_terminal = -200.0  # Clear failure
+        elif truncated:
+            reward_terminal = -50.0  # Mild failure (didn't crash, just slow)
         else:
-            reward_vel = 0
-
-        reward = reward_pos + reward_fuel + reward_vel + reward_shaping + reward_bonus
-
+            reward_terminal = 0.0
+        
+        reward = reward_pos + reward_fuel + reward_terminal
+        
         observation = self.state.copy()
         info = {
             "distance": pos_error,
             "docked": docked,
             "reward_pos": reward_pos,
-            "reward_vel": reward_vel,
             "reward_fuel": reward_fuel,
-            "reward_bonus": reward_bonus,
+            "reward_terminal": reward_terminal,
             "vel_error": vel_error,
+            "delta_v": np.linalg.norm(action),
         }
-
+        
         return observation, reward, terminated, truncated, info

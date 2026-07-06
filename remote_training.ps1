@@ -15,7 +15,7 @@ $RemoteHost      = "nicolobasso@aurora-server"
 $RemoteSubfolder = "hdp_training"
 $CondaEnvName    = "hdp-cw"
 $PythonVersion   = "3.11"
-$TrainCommand    = "python training.py"
+$TrainCommand    = "python -u training.py"
 $ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results", "tmp",
                      "__pycache__", ".venv", "venv")
 #############################################
