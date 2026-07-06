@@ -1,13 +1,14 @@
+from copy import deepcopy
 from pathlib import Path
 import shutil
 import time
-
+ 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.optim as optim
 from gymnasium.utils.env_checker import check_env
-
+ 
 from libs.actor import Actor
 from libs.constants import (
     ACTOR_LR,
@@ -20,6 +21,7 @@ from libs.constants import (
     MAX_STEPS,
     NUM_EPISODES,
     OMEGA,
+    TAU,
     SMOOTHING_WINDOW,
     TRAINED_ACTOR_PATH,
     TRAINED_CRITIC_PATH,
@@ -28,7 +30,6 @@ from libs.constants import (
 from libs.critic import Critic
 from libs.env import CWRendezvousEnv
 from libs.trajectory import plot_trajectory
-
 
 def set_requires_grad(module, requires_grad: bool) -> None:
     for parameter in module.parameters():
@@ -67,6 +68,11 @@ def main():
 
     actor = Actor(max_action=env.max_dv)
     critic = Critic()
+ 
+    critic_target = deepcopy(critic)  # soft-update with TAU each step
+    for p in critic_target.parameters():
+        p.requires_grad_(False)  # never backprop through target
+ 
     actor_opt = optim.Adam(actor.parameters(), lr=ACTOR_LR)
     critic_opt = optim.Adam(critic.parameters(), lr=CRITIC_LR)
 
@@ -95,7 +101,7 @@ def main():
         actor_seconds = 0.0
 
         state, _ = env.reset()
-        state = torch.as_tensor(state, dtype=torch.float32)
+        state = torch.tensor(state, dtype=torch.float32)
         prev_J = critic(state)
         episode_states = [state.detach().numpy().copy()]
 
@@ -109,36 +115,35 @@ def main():
         docked = False
 
         for step in range(MAX_STEPS):
-            with torch.no_grad():
-                action = actor(state)
+            action = actor(state).detach()
             total_delta_v += torch.linalg.norm(action).item()
-
-            step_start = time.perf_counter()
+ 
             next_state, reward, terminated, truncated, info = env.step(action.numpy())
-            env_step_seconds += time.perf_counter() - step_start
-
-            next_state = torch.as_tensor(next_state, dtype=torch.float32)
+            next_state = torch.tensor(next_state, dtype=torch.float32)
             episode_states.append(next_state.detach().numpy().copy())
-            reward_t = torch.tensor(reward, dtype=torch.float32)
-
+            reward_t = torch.tensor([reward], dtype=torch.float32)
+ 
             total_reward += reward
             total_r_pos += info["reward_pos"]
             total_r_fuel += info["reward_fuel"]
             if info["docked"]:
                 docked = True
-
-            step_start = time.perf_counter()
+ 
             current_J = critic(next_state)
-            target = reward_t + GAMMA * current_J.detach()
+ 
+            target = reward_t + GAMMA * critic_target(next_state).detach()
+ 
             critic_loss = torch.mean((prev_J - target) ** 2)
             critic_opt.zero_grad()
             critic_loss.backward()
             torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=GRAD_CLIP_NORM)
             critic_opt.step()
-            critic_seconds += time.perf_counter() - step_start
-
-            step_start = time.perf_counter()
-            set_requires_grad(critic, False)
+ 
+            with torch.no_grad():
+                for p, p_tgt in zip(critic.parameters(), critic_target.parameters()):
+                    p_tgt.data.mul_(1 - TAU)
+                    p_tgt.data.add_(TAU * p.data)
+ 
             current_action = actor(state)
             predicted_next_state = env.propagate_torch(state, current_action)
             action_penalty = env.fuel_coeff * torch.linalg.norm(current_action)
@@ -147,16 +152,14 @@ def main():
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=GRAD_CLIP_NORM)
             actor_opt.step()
-            set_requires_grad(critic, True)
-            actor_seconds += time.perf_counter() - step_start
-
+ 
             total_critic_loss += critic_loss.item()
             total_actor_loss += actor_loss.item()
             total_J += current_J.item()
-
+ 
             state = next_state
             prev_J = critic(state)
-
+ 
             if terminated or truncated:
                 break
 
