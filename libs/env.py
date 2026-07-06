@@ -75,13 +75,19 @@ class CWRendezvousEnv(gym.Env):
 
     def propagate_torch(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """Differentiable CW propagation for actor training (HDP model step)."""
-        v_new = state[3:6] + action
-        s0 = torch.cat([state[0:3], v_new])
         stm = self.STM
         if stm.device != state.device or stm.dtype != state.dtype:
             stm = stm.to(device=state.device, dtype=state.dtype)
             self.STM = stm
-        return stm @ s0
+
+        if state.dim() == 1:
+            v_new = state[3:6] + action
+            s0 = torch.cat([state[0:3], v_new])
+            return stm @ s0
+
+        v_new = state[:, 3:6] + action
+        s0 = torch.cat([state[:, 0:3], v_new], dim=1)
+        return s0 @ stm.T
 
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):

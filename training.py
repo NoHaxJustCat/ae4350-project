@@ -1,5 +1,7 @@
 from copy import deepcopy
+from collections import deque
 from pathlib import Path
+import random
 import shutil
 import time
  
@@ -17,10 +19,13 @@ from libs.constants import (
     DOCK_RATE_WINDOW,
     GAMMA,
     GRAD_CLIP_NORM,
+    BATCH_SIZE,
     LOG_EVERY,
     MAX_STEPS,
+    MIN_BUFFER,
     NUM_EPISODES,
     OMEGA,
+    REPLAY_BUFFER_SIZE,
     TAU,
     SMOOTHING_WINDOW,
     TRAINED_ACTOR_PATH,
@@ -76,6 +81,8 @@ def main():
     actor_opt = optim.Adam(actor.parameters(), lr=ACTOR_LR)
     critic_opt = optim.Adam(critic.parameters(), lr=CRITIC_LR)
 
+    buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
+
     Path("trained").mkdir(parents=True, exist_ok=True)
     Path("out").mkdir(parents=True, exist_ok=True)
     tmp_dir = Path("tmp")
@@ -91,7 +98,7 @@ def main():
 
     print(f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | {'r_fuel':>8} | "
           f"{'dv':>7} | {'c_loss':>9} | {'a_loss':>9} | {'J_mean':>8} | {'docked':>6} | "
-          f"{'ms/step':>8} | {'env':>7} | {'critic':>7} | {'actor':>7}")
+          f"{'ms/step':>8}")
     print("-" * 141)
 
     for episode in range(NUM_EPISODES):
@@ -113,6 +120,7 @@ def main():
         total_critic_loss = 0.0
         total_actor_loss = 0.0
         total_J = 0.0
+        update_count = 0
         docked = False
 
         for step in range(MAX_STEPS):
@@ -129,35 +137,57 @@ def main():
             total_r_fuel += info["reward_fuel"]
             if info["docked"]:
                 docked = True
+
+            buffer.append((
+                state.numpy().copy(),
+                action.numpy().copy(),
+                reward,
+                next_state.numpy().copy(),
+                terminated or truncated,
+            ))
+
+            if len(buffer) >= MIN_BUFFER:
+                batch = random.sample(buffer, BATCH_SIZE)
+                s, a, r, s2, done = zip(*batch)
+
+                s = torch.tensor(np.array(s), dtype=torch.float32)
+                a = torch.tensor(np.array(a), dtype=torch.float32)
+                r = torch.tensor(np.array(r), dtype=torch.float32).unsqueeze(1)
+                s2 = torch.tensor(np.array(s2), dtype=torch.float32)
+                done = torch.tensor(np.array(done), dtype=torch.float32).unsqueeze(1)
+
+                with torch.no_grad():
+                    a2 = actor(s2)
+                    target = r + GAMMA * (1 - done) * critic_target(s2, a2)
+
+                critic_loss = torch.mean((critic(s, a) - target) ** 2)
+                critic_opt.zero_grad()
+                critic_loss.backward()
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), GRAD_CLIP_NORM)
+                critic_opt.step()
+
+                with torch.no_grad():
+                    for p, p_tgt in zip(critic.parameters(), critic_target.parameters()):
+                        p_tgt.data.mul_(1 - TAU)
+                        p_tgt.data.add_(TAU * p.data)
+
+                set_requires_grad(critic, False)
+                a_pred = actor(s)
+                s2_pred = env.propagate_torch(s, a_pred)
+                a2_pred = actor(s2_pred)
+                actor_loss = -critic(s2_pred, a2_pred).mean()
+                actor_opt.zero_grad()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(actor.parameters(), GRAD_CLIP_NORM)
+                actor_opt.step()
+                set_requires_grad(critic, True)
  
             current_J = critic(next_state, action.detach())  # action already computed above
- 
-            next_action = actor(next_state).detach()
-            target = reward_t + GAMMA * critic_target(next_state, next_action).detach()
- 
-            # Critic update
-            critic_loss = torch.mean((critic(state, action) - target) ** 2)
-            critic_opt.zero_grad()
-            critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=GRAD_CLIP_NORM)
-            critic_opt.step()
- 
-            with torch.no_grad():
-                for p, p_tgt in zip(critic.parameters(), critic_target.parameters()):
-                    p_tgt.data.mul_(1 - TAU)
-                    p_tgt.data.add_(TAU * p.data)
- 
-            current_action = actor(state)
-            predicted_next_state = env.propagate_torch(state, current_action)
-            next_action_pred = actor(predicted_next_state)  # no detach — grad flows
-            actor_loss = -critic(predicted_next_state, next_action_pred).mean()
-            actor_opt.zero_grad()
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=GRAD_CLIP_NORM)
-            actor_opt.step()
- 
-            total_critic_loss += critic_loss.item()
-            total_actor_loss += actor_loss.item()
+
+            if len(buffer) >= MIN_BUFFER:
+                total_critic_loss += critic_loss.item()
+                total_actor_loss += actor_loss.item()
+                update_count += 1
             total_J += current_J.item()
  
             state = next_state
@@ -170,18 +200,19 @@ def main():
         episode_rewards.append(total_reward)
         episode_steps.append(n)
         episode_delta_vs.append(total_delta_v)
-        episode_critic_losses.append(total_critic_loss / n)
-        episode_actor_losses.append(total_actor_loss / n)
+        episode_critic_losses.append(total_critic_loss / update_count if update_count else 0.0)
+        episode_actor_losses.append(total_actor_loss / update_count if update_count else 0.0)
         episode_docked.append(docked)
 
         if episode % LOG_EVERY == 0:
             dock_rate = np.mean(episode_docked[-DOCK_RATE_WINDOW:]) * 100
+            avg_critic_loss = total_critic_loss / update_count if update_count else 0.0
+            avg_actor_loss = total_actor_loss / update_count if update_count else 0.0
             print(f"{episode:>6} | {n:>5} | {total_reward:>9.2f} | {total_r_pos/n:>8.2f} | "
                   f"{total_r_fuel/n:>8.2f} | {total_delta_v:>7.3f} | "
-                  f"{total_critic_loss/n:>9.4f} | {total_actor_loss/n:>9.4f} | "
+                  f"{avg_critic_loss:>9.4f} | {avg_actor_loss:>9.4f} | "
                   f"{total_J/n:>8.3f} | {dock_rate:>5.1f}% | "
-                  f"{1000 * episode_seconds / n:>8.2f} | {1000 * env_step_seconds / n:>7.2f} | "
-                  f"{1000 * critic_seconds / n:>7.2f} | {1000 * actor_seconds / n:>7.2f}")
+                  f"{1000 * episode_seconds / n:>8.2f}")
 
         if (episode + 1) % 50 == 0:
             episode_tag = f"ep_{episode + 1:04d}"
