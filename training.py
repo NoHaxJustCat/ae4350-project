@@ -77,7 +77,11 @@ def main():
     critic_target = deepcopy(critic)  # soft-update with TAU each step
     for p in critic_target.parameters():
         p.requires_grad_(False)  # never backprop through target
- 
+
+    actor_target = deepcopy(actor)
+    for p in actor_target.parameters():
+        p.requires_grad_(False)
+    
     actor_opt = optim.Adam(actor.parameters(), lr=ACTOR_LR)
     critic_opt = optim.Adam(critic.parameters(), lr=CRITIC_LR)
 
@@ -103,14 +107,9 @@ def main():
 
     for episode in range(NUM_EPISODES):
         episode_start = time.perf_counter()
-        env_step_seconds = 0.0
-        critic_seconds = 0.0
-        actor_seconds = 0.0
 
         state, _ = env.reset()
         state = torch.tensor(state, dtype=torch.float32)
-        with torch.no_grad():
-            prev_J = critic(state, actor(state).detach())
         episode_states = [state.detach().numpy().copy()]
 
         total_reward = 0.0
@@ -157,7 +156,7 @@ def main():
                 done = torch.tensor(np.array(done), dtype=torch.float32).unsqueeze(1)
 
                 with torch.no_grad():
-                    a2 = actor(s2)
+                    a2 = actor_target(s2)
                     target = r + GAMMA * (1 - done) * critic_target(s2, a2)
 
                 critic_loss = torch.mean((critic(s, a) - target) ** 2)
@@ -168,6 +167,9 @@ def main():
 
                 with torch.no_grad():
                     for p, p_tgt in zip(critic.parameters(), critic_target.parameters()):
+                        p_tgt.data.mul_(1 - TAU)
+                        p_tgt.data.add_(TAU * p.data)
+                    for p, p_tgt in zip(actor.parameters(), actor_target.parameters()):
                         p_tgt.data.mul_(1 - TAU)
                         p_tgt.data.add_(TAU * p.data)
 

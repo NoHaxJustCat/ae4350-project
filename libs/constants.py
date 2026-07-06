@@ -19,9 +19,10 @@ ENV_SHAPING_COEFF = 10.0
 ENV_BONUS = 500.0
 ENV_INITIAL_STATE_VBAR = np.array([0.0, 100.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
 ENV_INITIAL_STATE_XPLUS = np.array([100.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+ENV_MAX_DIR_CHANGE = 4
 
 # --- Training defaults ---
-GAMMA = 0.99
+GAMMA = 0.97
 NUM_EPISODES = 5000
 MAX_STEPS = int(ENV_TIMEOUT/ENV_DT)
 ACTOR_LR = 1e-5
@@ -30,7 +31,7 @@ GRAD_CLIP_NORM = 1.0
 LOG_EVERY = 10
 TAU = 0.005  # soft update rate — add to constants.py
 REPLAY_BUFFER_SIZE = 100_000
-BATCH_SIZE = 256
+BATCH_SIZE = 64
 MIN_BUFFER = 1000  # don't train until buffer has this many samples
 
 # --- Evaluation / plotting defaults ---

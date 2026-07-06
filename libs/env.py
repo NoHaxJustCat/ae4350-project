@@ -15,6 +15,7 @@ from libs.constants import (
     ENV_VEL_TOLERANCE,
     ENV_SHAPING_COEFF,
     OMEGA,
+    ENV_MAX_DIR_CHANGE,
 )
 from scipy.linalg import expm
 import torch
@@ -33,6 +34,7 @@ class CWRendezvousEnv(gym.Env):
             vel_coeff: float = ENV_VEL_COEFF,
             fuel_coeff: float = ENV_FUEL_COEFF,
             bonus: float = ENV_BONUS,
+            max_direction_changes: float = ENV_MAX_DIR_CHANGE
         ):
         
 
@@ -47,6 +49,7 @@ class CWRendezvousEnv(gym.Env):
         self.vel_coeff = vel_coeff
         self.fuel_coeff = fuel_coeff
         self.bonus = bonus
+        self.max_direction_changes = max_direction_changes
 
         A = np.zeros((6, 6))
         A[0, 3] = 1.0
@@ -112,6 +115,9 @@ class CWRendezvousEnv(gym.Env):
 
         self.elapsed_time = 0.0
 
+        self._direction_changes = 0
+        self._prev_delta = None
+
         observation = self.state.copy()
         info = {}
         return observation, info
@@ -126,50 +132,58 @@ class CWRendezvousEnv(gym.Env):
         self.state[3:6] += action
         self.state = self.STM_np @ self.state
         self.elapsed_time += self.dt
-        
+
         pos_error = np.linalg.norm(self.state[0:3])
         vel_error = np.linalg.norm(self.state[3:6])
-        
+
+        # --- OSCILLATION DETECTION ---
+        delta = prev_pos_error - pos_error
+        if hasattr(self, '_prev_delta') and self._prev_delta is not None:
+            if np.sign(delta) != np.sign(self._prev_delta):
+                self._direction_changes += 1
+        self._prev_delta = delta
+        oscillating = self._direction_changes >= self.max_direction_changes
+
         docked = pos_error < self.pos_tolerance
         out_of_bounds = pos_error > self.boundary
         timeout = self.elapsed_time > self.timeout
-        
-        terminated = bool(docked or out_of_bounds)
+
+        terminated = bool(docked or out_of_bounds or oscillating)
         truncated = bool(timeout)
-        
+
         # --- REWARD COMPONENTS ---
-        
+
         # 1. Distance progress (DENSE - always active)
-        # Positive = getting closer, Negative = getting farther
         reward_pos = ENV_SHAPING_COEFF * (prev_pos_error - pos_error)
-        
-        # 2. Velocity progress (helps learn braking)
-        # reward_vel = 1.0 * (prev_vel_error - vel_error)
-        
-        # 3. Fuel penalty (keep this small)
-        reward_fuel = -ENV_FUEL_COEFF* np.linalg.norm(action)
-        
-        # 4. Terminal rewards (clear success vs failure signals)
+
+        # 3. Fuel penalty
+        reward_fuel = -ENV_FUEL_COEFF * np.linalg.norm(action)
+
+        # 4. Terminal rewards
         if docked:
-            reward_terminal = ENV_BONUS - ENV_VEL_COEFF * vel_error  # Bonus, penalize crash speed
+            reward_terminal = ENV_BONUS - ENV_VEL_COEFF * vel_error
         elif out_of_bounds:
-            reward_terminal = -200.0  # Clear failure
+            reward_terminal = -200.0
+        elif oscillating:
+            reward_terminal = 0.0  # No reward, no penalty
         elif truncated:
-            reward_terminal = -50.0  # Mild failure (didn't crash, just slow)
+            reward_terminal = -50.0
         else:
             reward_terminal = 0.0
-        
+
         reward = reward_pos + reward_fuel + reward_terminal
-        
+
         observation = self.state.copy()
         info = {
             "distance": pos_error,
             "docked": docked,
+            "oscillating": oscillating,
+            "direction_changes": self._direction_changes,
             "reward_pos": reward_pos,
             "reward_fuel": reward_fuel,
             "reward_terminal": reward_terminal,
             "vel_error": vel_error,
             "delta_v": np.linalg.norm(action),
         }
-        
+
         return observation, reward, terminated, truncated, info
