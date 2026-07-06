@@ -16,7 +16,7 @@ $RemoteSubfolder = "hdp_training"
 $CondaEnvName    = "hdp-cw"
 $PythonVersion   = "3.11"
 $TrainCommand    = "python training.py"
-$ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results",
+$ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results", "tmp",
                      "__pycache__", ".venv", "venv")
 #############################################
 
@@ -103,7 +103,8 @@ echo "========================================="
 echo " Training started  -- $(date)"
 echo "========================================="
 cd "$REMOTE_DIR"
-mkdir -p out trained
+rm -rf tmp
+mkdir -p out trained tmp
 __TRAINCMD__
 echo ""
 echo "========================================="
@@ -135,6 +136,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "`n==> [4/4] Retrieving out/ and trained/ ..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path ".\out"     | Out-Null
 New-Item -ItemType Directory -Force -Path ".\trained" | Out-Null
+New-Item -ItemType Directory -Force -Path ".\tmp" | Out-Null
 
 scp -r "${RemoteHost}:~/${RemoteSubfolder}/out/*"     ".\out\"     2>$null
 if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: out/ was empty." -ForegroundColor Yellow }
@@ -142,8 +144,14 @@ if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: out/ was empty." -ForegroundColor
 scp -r "${RemoteHost}:~/${RemoteSubfolder}/trained/*" ".\trained\" 2>$null
 if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: trained/ was empty." -ForegroundColor Yellow }
 
+
+scp -r "${RemoteHost}:~/${RemoteSubfolder}/tmp/*" ".\tmp\" 2>$null
+if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: tmp/ was empty." -ForegroundColor Yellow }
+
 Write-Host "`n==> All done." -ForegroundColor Green
 Write-Host "`n--- out\ ---"
 Get-ChildItem ".\out"     -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime
 Write-Host "--- trained\ ---"
 Get-ChildItem ".\trained" -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime
+Write-Host "--- tmo\ ---"
+Get-ChildItem ".\tmp" -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime

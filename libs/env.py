@@ -13,6 +13,7 @@ from libs.constants import (
     ENV_TIMEOUT,
     ENV_VEL_COEFF,
     ENV_VEL_TOLERANCE,
+    ENV_SHAPING_COEFF,
     OMEGA,
 )
 from scipy.linalg import expm
@@ -131,7 +132,7 @@ class CWRendezvousEnv(gym.Env):
         docked = (pos_error < self.pos_tolerance)
 
         if pos_error < self.best_distance:
-            reward_pos = self.best_distance - pos_error  # reward = distance closed
+            reward_pos = 10 * (self.best_distance - pos_error)  # reward = distance closed
             self.best_distance = pos_error
         else:
             reward_pos = 0.0
@@ -140,7 +141,7 @@ class CWRendezvousEnv(gym.Env):
         truncated = bool(self.elapsed_time > self.timeout)
 
         reward_fuel = - self.fuel_coeff * np.linalg.norm(action)
-        reward_shaping = -0.01 * pos_error  # scaled ~100x smaller than progress bonus
+        reward_shaping = -ENV_SHAPING_COEFF * pos_error  # scaled ~100x smaller than progress bonus
         reward_bonus = self.bonus if docked else 0.0
         
         if docked:

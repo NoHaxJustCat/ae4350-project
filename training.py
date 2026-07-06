@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,6 +14,7 @@ from libs.constants import (
     DIAGNOSTICS_PLOT_PATH,
     DOCK_RATE_WINDOW,
     GAMMA,
+    GRAD_CLIP_NORM,
     LOG_EVERY,
     MAX_STEPS,
     NUM_EPISODES,
@@ -21,10 +23,10 @@ from libs.constants import (
     TRAINED_ACTOR_PATH,
     TRAINED_CRITIC_PATH,
     TRAINING_HISTORY_PATH,
-    TAU
 )
 from libs.critic import Critic
 from libs.env import CWRendezvousEnv
+from libs.trajectory import plot_trajectory
 
 
 def build_env() -> CWRendezvousEnv:
@@ -58,12 +60,11 @@ def main():
     actor_opt = optim.Adam(actor.parameters(), lr=ACTOR_LR)
     critic_opt = optim.Adam(critic.parameters(), lr=CRITIC_LR)
 
-    critic_target = Critic()
-    critic_target.load_state_dict(critic.state_dict())
-    critic_target.eval()
-
     Path("trained").mkdir(parents=True, exist_ok=True)
     Path("out").mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path("tmp")
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     episode_rewards = []
     episode_steps = []
@@ -73,19 +74,19 @@ def main():
     episode_docked = []
 
     print(f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | {'r_fuel':>8} | "
-          f"{'dv':>7} | {'c_loss':>9} | {'a_loss':>9} | {'J_mean':.8} | {'docked':>6} | {'vel_err':>8}")
+          f"{'dv':>7} | {'c_loss':>9} | {'a_loss':>9} | {'J_mean':.8} | {'docked':>6}")
     print("-" * 105)
 
     for episode in range(NUM_EPISODES):
         state, _ = env.reset()
         state = torch.tensor(state, dtype=torch.float32)
         prev_J = critic(state)
+        episode_states = [state.detach().numpy().copy()]
 
         total_reward = 0.0
         total_delta_v = 0.0
         total_r_pos = 0.0
         total_r_fuel = 0.0
-        total_vel_error = 0.0
         total_critic_loss = 0.0
         total_actor_loss = 0.0
         total_J = 0.0
@@ -97,32 +98,22 @@ def main():
 
             next_state, reward, terminated, truncated, info = env.step(action.numpy())
             next_state = torch.tensor(next_state, dtype=torch.float32)
+            episode_states.append(next_state.detach().numpy().copy())
             reward_t = torch.tensor([reward], dtype=torch.float32)
 
             total_reward += reward
             total_r_pos += info["reward_pos"]
             total_r_fuel += info["reward_fuel"]
-            total_vel_error += info["vel_error"]
-            
             if info["docked"]:
                 docked = True
-            ########
-            with torch.no_grad():
-                target = reward_t + GAMMA * critic_target(next_state)
-                target = torch.clamp(target, -500.0, 500.0)
-            ######## 
-            # current_J = critic(next_state)
-            # target = reward_t + GAMMA * current_J.detach()
+
+            current_J = critic(next_state)
+            target = reward_t + GAMMA * current_J.detach()
             critic_loss = torch.mean((prev_J - target) ** 2)
             critic_opt.zero_grad()
             critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=GRAD_CLIP_NORM)
             critic_opt.step()
-
-            #########
-            with torch.no_grad():
-                for p, p_tgt in zip(critic.parameters(), critic_target.parameters()):
-                    p_tgt.data.mul_(1 - TAU).add_(TAU * p.data)
-            #########
 
             current_action = actor(state)
             predicted_next_state = env.propagate_torch(state, current_action)
@@ -130,11 +121,12 @@ def main():
             actor_loss = -critic(predicted_next_state).mean() + action_penalty
             actor_opt.zero_grad()
             actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=GRAD_CLIP_NORM)
             actor_opt.step()
 
             total_critic_loss += critic_loss.item()
             total_actor_loss += actor_loss.item()
-            total_J += critic(next_state).item()   # ── CHANGED: re-evaluate after update
+            total_J += current_J.item()
 
             state = next_state
             prev_J = critic(state)
@@ -154,8 +146,21 @@ def main():
             dock_rate = np.mean(episode_docked[-DOCK_RATE_WINDOW:]) * 100
             print(f"{episode:>6} | {n:>5} | {total_reward:>9.2f} | {total_r_pos/n:>8.2f} | "
                   f"{total_r_fuel/n:>8.2f} | {total_delta_v:>7.3f} | "
-                  f"{total_critic_loss/n:>9.1f} | {total_actor_loss/n:>9.1f} | "
-                  f"{total_J/n:>8.1f} | {dock_rate:>5.1f}% | {total_vel_error/n:>8.3f}")
+                  f"{total_critic_loss/n:>9.4f} | {total_actor_loss/n:>9.4f} | "
+                  f"{total_J/n:>8.3f} | {dock_rate:>5.1f}%")
+
+        if (episode + 1) % 50 == 0:
+            episode_tag = f"ep_{episode + 1:04d}"
+            plot_trajectory(episode_states, str(tmp_dir / f"{episode_tag}.png"))
+            np.savez(
+                tmp_dir / f"{episode_tag}.npz",
+                states=np.array(episode_states),
+                rewards=np.array([total_reward]),
+                steps=np.array([n]),
+                delta_v=np.array([total_delta_v]),
+                docked=np.array([docked]),
+            )
+
     torch.save(actor.state_dict(), TRAINED_ACTOR_PATH)
     torch.save(critic.state_dict(), TRAINED_CRITIC_PATH)
 
