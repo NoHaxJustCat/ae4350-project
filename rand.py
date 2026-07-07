@@ -3,6 +3,7 @@ from libs.env import CWRendezvousEnv
 from libs.constants import ENV_INITIAL_STATE_VBAR, ENV_INITIAL_STATE_XPLUS, MAX_STEPS, OMEGA, TRAINED_ACTOR_PATH, TRAINED_CRITIC_PATH
 from libs.actor import Actor
 from libs.critic import Critic
+from libs.normalization import normalize_state
 import torch
 import torch.optim as optim
 import matplotlib.pyplot as plt
@@ -22,17 +23,19 @@ total_dv = 0.0
 with torch.no_grad():
     state, _ = env.reset()
     state = torch.tensor(state, dtype=torch.float32)
+    state_nn = normalize_state(state)
     trajectory = [state.numpy()]
     total_reward = 0.0
 
     for step in range(MAX_STEPS):
-        action = actor(state)
+        action = actor(state_nn)
         action_np = action.numpy()
         clipped_action = np.clip(action_np, -env.max_dv, env.max_dv)  
         total_dv += np.linalg.norm(clipped_action)
 
         next_state, reward, terminated, truncated, info = env.step(clipped_action)
         state = torch.tensor(next_state, dtype=torch.float32)
+        state_nn = normalize_state(state)
         trajectory.append(state.numpy())
         total_reward += reward
         if terminated or truncated:
@@ -50,17 +53,19 @@ with torch.no_grad():
     env.state = np.array(ENV_INITIAL_STATE_XPLUS, dtype=np.float64)  # sync the env
     env.elapsed_time = 0.0  # also reset the clock, otherwise timeout is wrong
     state = torch.tensor(env.state, dtype=torch.float32)  # derive tensor from env.state
+    state_nn = normalize_state(state)
     trajectory = [state.numpy()]
     total_reward = 0.0
 
     for step in range(MAX_STEPS):
-        action = actor(state)
+        action = actor(state_nn)
         action_np = action.numpy()
         clipped_action = np.clip(action_np, -env.max_dv, env.max_dv)  
         total_dv += np.linalg.norm(clipped_action)
 
         next_state, reward, terminated, truncated, info = env.step(action.numpy())
         state = torch.tensor(next_state, dtype=torch.float32)
+        state_nn = normalize_state(state)
         trajectory.append(state.numpy())
         total_reward += reward
         if terminated or truncated:

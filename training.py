@@ -34,6 +34,7 @@ from libs.constants import (
 )
 from libs.critic import Critic
 from libs.env import CWRendezvousEnv
+from libs.normalization import normalize_action, normalize_state
 from libs.trajectory import plot_trajectory
 
 # ── Feature flags ────────────────────────────────────────────────────────────
@@ -115,9 +116,9 @@ def main():
     episode_actor_losses  = []
     episode_docked       = []
 
-    print(f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | {'r_fuel':>8} | "
-          f"{'dv':>7} | {'c_loss':>9} | {'a_loss':>9} | {'J_mean':>8} | {'docked':>6} | "
-          f"{'ms/step':>8}")
+    print(f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | {'dv/step':>8} | "
+      f"{'dv':>7} | {'c_loss':>9} | {'a_loss':>9} | {'J_mean':>8} | {'docked':>6} | "
+      f"{'ms/step':>8}")
     print("-" * 110)
 
     for episode in range(NUM_EPISODES):
@@ -125,8 +126,9 @@ def main():
 
         state, _ = env.reset()
         state = torch.tensor(state, dtype=torch.float32)
+        state_nn = normalize_state(state)
         with torch.no_grad():
-            prev_J = critic(state, actor(state).detach())
+            prev_J = critic(state_nn, actor(state_nn).detach())
         episode_states = [state.detach().numpy().copy()]
 
         total_reward      = 0.0
@@ -140,11 +142,12 @@ def main():
         docked            = False
 
         for step in range(MAX_STEPS):
-            action = actor(state).detach()
+            action = actor(state_nn).detach()
             total_delta_v += torch.linalg.norm(action).item()
 
             next_state, reward, terminated, truncated, info = env.step(action.numpy())
             next_state = torch.tensor(next_state, dtype=torch.float32)
+            next_state_nn = normalize_state(next_state)
             episode_states.append(next_state.detach().numpy().copy())
             reward_t = torch.tensor([reward], dtype=torch.float32)
 
@@ -177,6 +180,9 @@ def main():
                     r    = torch.tensor(np.array(r),    dtype=torch.float32).unsqueeze(1)
                     s2   = torch.tensor(np.array(s2),   dtype=torch.float32)
                     done = torch.tensor(np.array(done), dtype=torch.float32).unsqueeze(1)
+                    s_nn  = normalize_state(s)
+                    a_nn  = normalize_action(a)
+                    s2_nn = normalize_state(s2)
                 else:
                     # On-policy: single transition, shapes match batch API
                     s    = state.unsqueeze(0)
@@ -184,14 +190,21 @@ def main():
                     r    = reward_t.unsqueeze(0)
                     s2   = next_state.unsqueeze(0)
                     done = torch.tensor([[terminated or truncated]], dtype=torch.float32)
+                    s_nn  = state_nn.unsqueeze(0)
+                    a_nn  = normalize_action(a)
+                    s2_nn = next_state_nn.unsqueeze(0)
 
                 # ── Critic update ─────────────────────────────────────────
                 with torch.no_grad():
-                    a2_next  = actor_target(s2) if USE_ACTOR_TARGET  else actor(s2)
-                    q_next   = critic_target(s2, a2_next) if USE_CRITIC_TARGET else critic(s2, a2_next)
+                    a2_next  = actor_target(s2_nn) if USE_ACTOR_TARGET  else actor(s2_nn)
+                    q_next   = (
+                        critic_target(s2_nn, normalize_action(a2_next))
+                        if USE_CRITIC_TARGET
+                        else critic(s2_nn, normalize_action(a2_next))
+                    )
                     target   = r + GAMMA * (1 - done) * q_next
 
-                critic_loss = torch.mean((critic(s, a) - target) ** 2)
+                critic_loss = torch.mean((critic(s_nn, a_nn) - target) ** 2)
                 critic_opt.zero_grad()
                 critic_loss.backward()
                 torch.nn.utils.clip_grad_norm_(critic.parameters(), GRAD_CLIP_NORM)
@@ -211,8 +224,8 @@ def main():
                 # ── Actor update (model-based, gradient through propagator) ─
                 # Actor update
                 set_requires_grad(critic, False)
-                a_pred = actor(s)
-                actor_loss = -critic(s, a_pred).mean()   # Q(s, π(s))
+                a_pred = actor(s_nn)
+                actor_loss = -critic(s_nn, normalize_action(a_pred)).mean()   # Q(s, π(s))
                 actor_opt.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(actor.parameters(), GRAD_CLIP_NORM)
@@ -223,10 +236,11 @@ def main():
                 total_actor_loss  += actor_loss.item()
                 update_count      += 1
 
-            current_J = critic(next_state, action.detach())
+            current_J = critic(next_state_nn, normalize_action(action.detach()))
             total_J  += current_J.item()
 
             state = next_state
+            state_nn = next_state_nn
 
             if terminated or truncated:
                 break
@@ -244,8 +258,9 @@ def main():
             dock_rate       = np.mean(episode_docked[-DOCK_RATE_WINDOW:]) * 100
             avg_critic_loss = total_critic_loss / update_count if update_count else 0.0
             avg_actor_loss  = total_actor_loss  / update_count if update_count else 0.0
+            avg_dv_per_step = total_delta_v / n
             print(f"{episode:>6} | {n:>5} | {total_reward:>9.2f} | {total_r_pos/n:>8.2f} | "
-                  f"{total_r_fuel/n:>8.2f} | {total_delta_v:>7.3f} | "
+                  f"{avg_dv_per_step:>8.3f} | {total_delta_v:>7.3f} | "
                   f"{avg_critic_loss:>9.4f} | {avg_actor_loss:>9.4f} | "
                   f"{total_J/n:>8.3f} | {dock_rate:>5.1f}% | "
                   f"{1000 * episode_seconds / n:>8.2f}")

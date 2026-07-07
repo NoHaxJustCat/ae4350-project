@@ -11,6 +11,7 @@ from libs.constants import (
 )
 from libs.actor import Actor
 from libs.critic import Critic
+from libs.normalization import normalize_state
 import torch
 import matplotlib.pyplot as plt
 from libs.trajectory import plot_trajectory
@@ -32,11 +33,12 @@ with torch.no_grad():
     env.state = np.array(ENV_INITIAL_STATE_VBAR, dtype=np.float64)
     env.elapsed_time = 0.0
     state = torch.tensor(env.state, dtype=torch.float32)
+    state_nn = normalize_state(state)
     trajectory = [env.state.copy()]
     total_reward = 0.0
 
     for step in range(MAX_STEPS):
-        action = actor(state)
+        action = actor(state_nn)
         action_np = np.clip(action.numpy(), -env.max_dv, env.max_dv)
         total_dv += np.linalg.norm(action_np)
 
@@ -58,6 +60,7 @@ with torch.no_grad():
         print(f"{step+1:>4} | {pos_err:>8.3f} | {vel_err:>8.4f} | {action_norm:>11.5f} | {reward:>8.3f} | {str(info['docked']):>6} | {str(terminated or truncated):>6} | {note}")
 
         state = torch.tensor(next_state, dtype=torch.float32)
+        state_nn = normalize_state(state)
         trajectory.append(next_state.copy())
         total_reward += reward
 
