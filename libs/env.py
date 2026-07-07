@@ -57,7 +57,8 @@ class CWRendezvousEnv(gym.Env):
         A[5, 2] = 3 * omega ** 2
         A[5, 3] = -2 * omega
         self.STM = torch.tensor(expm(A * dt), dtype=torch.float32)  # constant, precomputed 
-        self.STM_np = expm(A * dt)                       # for the numpy env step
+        self.STM_np = expm(A * dt)
+        self.STM_T = self.STM.t().contiguous()                       # for the numpy env step
 
         # Observation: [x, y, z, xdot, ydot, zdot] -- continuous, unbounded
         # (bounding it artificially isn't physically meaningful here, since
@@ -73,16 +74,16 @@ class CWRendezvousEnv(gym.Env):
 
         self.state = None
 
-    def propagate_torch(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """Differentiable CW propagation for actor training (HDP model step)."""
-        v_new = state[3:6] + action
-        s0 = torch.cat([state[0:3], v_new])
-        stm = self.STM
-        if stm.device != state.device or stm.dtype != state.dtype:
-            stm = stm.to(device=state.device, dtype=state.dtype)
-            self.STM = stm
-        return stm @ s0
+    def _ensure_stm(self, device, dtype):
+        if self.STM.device != device or self.STM.dtype != dtype:
+            self.STM = self.STM.to(device=device, dtype=dtype)
+            self.STM_T = self.STM.t().contiguous()
 
+    def propagate_torch(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        self._ensure_stm(state.device, state.dtype)
+        v_new = state[..., 3:6] + action
+        s0    = torch.cat([state[..., 0:3], v_new], dim=-1)
+        return torch.nn.functional.linear(s0, self.STM_T)
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
@@ -127,15 +128,17 @@ class CWRendezvousEnv(gym.Env):
         docked = pos_error < self.pos_tolerance
         out_of_bounds = pos_error > self.boundary
         timeout = self.elapsed_time > self.timeout
+
+        delta = prev_pos_error - pos_error
         
-        terminated = bool(docked or out_of_bounds)
+        terminated = bool(docked or out_of_bounds or delta < 0)
         truncated = bool(timeout)
         
         # --- REWARD COMPONENTS ---
         
         # 1. Distance progress (DENSE - always active)
         # Positive = getting closer, Negative = getting farther
-        reward_pos = ENV_SHAPING_COEFF * (prev_pos_error - pos_error)
+        reward_pos = ENV_SHAPING_COEFF * delta
         
         # 2. Velocity progress (helps learn braking)
         # reward_vel = 1.0 * (prev_vel_error - vel_error)
@@ -146,8 +149,8 @@ class CWRendezvousEnv(gym.Env):
         # 4. Terminal rewards (clear success vs failure signals)
         if docked:
             reward_terminal = ENV_BONUS - ENV_VEL_COEFF * vel_error  # Bonus, penalize crash speed
-        elif out_of_bounds:
-            reward_terminal = -200.0  # Clear failure
+        elif out_of_bounds or delta < 0:
+            reward_terminal = -200.0  # Failure for not approaching
         elif truncated:
             reward_terminal = -50.0  # Mild failure (didn't crash, just slow)
         else:
