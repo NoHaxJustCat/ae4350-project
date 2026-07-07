@@ -115,8 +115,10 @@ def main():
     episode_critic_losses = []
     episode_actor_losses  = []
     episode_docked       = []
+    episode_r_pos_totals  = []   # per-episode total r_pos (not per-step average)
+    episode_r_fuel_totals = []   # per-episode total r_fuel (not per-step average)
 
-    print(f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | {'dv/step':>8} | "
+    print(f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | {'r_fuel':>8} | "
       f"{'dv':>7} | {'c_loss':>9} | {'a_loss':>9} | {'J_mean':>8} | {'docked':>6} | "
       f"{'ms/step':>8}")
     print("-" * 110)
@@ -143,13 +145,26 @@ def main():
 
         for step in range(MAX_STEPS):
             action = actor(state_nn).detach()
-            total_delta_v += torch.linalg.norm(action).item()
 
             next_state, reward, terminated, truncated, info = env.step(action.numpy())
             next_state = torch.tensor(next_state, dtype=torch.float32)
             next_state_nn = normalize_state(next_state)
             episode_states.append(next_state.detach().numpy().copy())
             reward_t = torch.tensor([reward], dtype=torch.float32)
+
+            # The env may clip/budget-cap the actor's raw commanded action —
+            # `applied_action` is what actually produced this transition, and
+            # is what must be stored/used everywhere below (buffer, on-policy
+            # update, Q(s,a) bookkeeping). Using the raw `action` instead would
+            # train the critic on (s, a, s') tuples where `a` didn't really
+            # cause `s'`, which is wrong once the fuel budget is low/exhausted.
+            applied_action = torch.tensor(info["applied_action"], dtype=torch.float32)
+
+            # Use the env's actually-applied delta-v (post clip/budget-cap),
+            # not the actor's raw commanded action — otherwise this can sum
+            # to far more than the dv_budget once the budget is exhausted,
+            # since the actor keeps "requesting" burns that the env zeroes out.
+            total_delta_v += info["delta_v"]
 
             total_reward += reward
             total_r_pos  += info["reward_pos"]
@@ -161,7 +176,7 @@ def main():
             if USE_REPLAY_BUFFER:
                 buffer.append((
                     state.numpy().copy(),
-                    action.numpy().copy(),
+                    applied_action.numpy().copy(),
                     reward,
                     next_state.numpy().copy(),
                     terminated or truncated,
@@ -186,7 +201,7 @@ def main():
                 else:
                     # On-policy: single transition, shapes match batch API
                     s    = state.unsqueeze(0)
-                    a    = action.unsqueeze(0)
+                    a    = applied_action.unsqueeze(0)
                     r    = reward_t.unsqueeze(0)
                     s2   = next_state.unsqueeze(0)
                     done = torch.tensor([[terminated or truncated]], dtype=torch.float32)
@@ -236,7 +251,7 @@ def main():
                 total_actor_loss  += actor_loss.item()
                 update_count      += 1
 
-            current_J = critic(next_state_nn, normalize_action(action.detach()))
+            current_J = critic(next_state_nn, normalize_action(applied_action.detach()))
             total_J  += current_J.item()
 
             state = next_state
@@ -253,14 +268,19 @@ def main():
         episode_critic_losses.append(total_critic_loss / update_count if update_count else 0.0)
         episode_actor_losses.append(total_actor_loss  / update_count if update_count else 0.0)
         episode_docked.append(docked)
+        episode_r_pos_totals.append(total_r_pos)
+        episode_r_fuel_totals.append(total_r_fuel)
 
         if episode % LOG_EVERY == 0:
             dock_rate       = np.mean(episode_docked[-DOCK_RATE_WINDOW:]) * 100
             avg_critic_loss = total_critic_loss / update_count if update_count else 0.0
             avg_actor_loss  = total_actor_loss  / update_count if update_count else 0.0
-            avg_dv_per_step = total_delta_v / n
-            print(f"{episode:>6} | {n:>5} | {total_reward:>9.2f} | {total_r_pos/n:>8.2f} | "
-                  f"{avg_dv_per_step:>8.3f} | {total_delta_v:>7.3f} | "
+            # Average of each episode's TOTAL r_pos / r_fuel over the last
+            # LOG_EVERY episodes (not the per-step average within one episode).
+            avg_r_pos_total  = np.mean(episode_r_pos_totals[-LOG_EVERY:])
+            avg_r_fuel_total = np.mean(episode_r_fuel_totals[-LOG_EVERY:])
+            print(f"{episode:>6} | {n:>5} | {total_reward:>9.2f} | {avg_r_pos_total:>8.2f} | "
+                  f"{avg_r_fuel_total:>8.2f} | {total_delta_v:>7.3f} | "
                   f"{avg_critic_loss:>9.4f} | {avg_actor_loss:>9.4f} | "
                   f"{total_J/n:>8.3f} | {dock_rate:>5.1f}% | "
                   f"{1000 * episode_seconds / n:>8.2f}")
