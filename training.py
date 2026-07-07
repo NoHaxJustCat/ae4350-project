@@ -38,8 +38,8 @@ from libs.trajectory import plot_trajectory
 
 # ── Feature flags ────────────────────────────────────────────────────────────
 USE_REPLAY_BUFFER  = True   # experience replay (random mini-batch updates)
-USE_ACTOR_TARGET   = True   # target actor network (soft-updated with TAU)
-USE_CRITIC_TARGET  = True   # target critic network (soft-updated with TAU)
+USE_ACTOR_TARGET   = False   # target actor network (soft-updated with TAU)
+USE_CRITIC_TARGET  = False   # target critic network (soft-updated with TAU)
 # Note: USE_ACTOR_TARGET / USE_CRITIC_TARGET only affect target *usage*;
 #       when False the online network is used in its place.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -209,11 +209,10 @@ def main():
                             p_tgt.data.add_(TAU * p.data)
 
                 # ── Actor update (model-based, gradient through propagator) ─
+                # Actor update
                 set_requires_grad(critic, False)
-                a_pred  = actor(s)
-                s2_pred = env.propagate_torch(s, a_pred)
-                a2_pred = actor(s2_pred)           # grad flows through both
-                actor_loss = -critic(s2_pred, a2_pred).mean()
+                a_pred = actor(s)
+                actor_loss = -critic(s, a_pred).mean()   # Q(s, π(s))
                 actor_opt.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(actor.parameters(), GRAD_CLIP_NORM)

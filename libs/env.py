@@ -104,7 +104,7 @@ class CWRendezvousEnv(gym.Env):
         )
         
         self.best_distance = np.linalg.norm(self.state[0:3])
-
+        self.step_count = 0  # in reset()
         self.elapsed_time = 0.0
 
         observation = self.state.copy()
@@ -130,8 +130,9 @@ class CWRendezvousEnv(gym.Env):
         timeout = self.elapsed_time > self.timeout
 
         delta = prev_pos_error - pos_error
-        
-        terminated = bool(docked or out_of_bounds or delta < 0)
+        self.step_count += 1
+        going_wrong_way = (delta < 0) and (self.step_count > 20)
+        terminated = bool(docked or out_of_bounds or going_wrong_way)
         truncated = bool(timeout)
         
         # --- REWARD COMPONENTS ---
@@ -149,8 +150,8 @@ class CWRendezvousEnv(gym.Env):
         # 4. Terminal rewards (clear success vs failure signals)
         if docked:
             reward_terminal = ENV_BONUS - ENV_VEL_COEFF * vel_error  # Bonus, penalize crash speed
-        elif out_of_bounds or delta < 0:
-            reward_terminal = -200.0  # Failure for not approaching
+        elif out_of_bounds or going_wrong_way:
+            reward_terminal = -100.0  # Failure for not approaching
         elif truncated:
             reward_terminal = -50.0  # Mild failure (didn't crash, just slow)
         else:
