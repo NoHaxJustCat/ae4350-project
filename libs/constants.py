@@ -23,13 +23,13 @@ ENV_MAX_DIR_CHANGE = 4
 
 # --- Training defaults ---
 GAMMA = 0.97
-NUM_EPISODES = 5000
+NUM_EPISODES = 15000
 MAX_STEPS = int(ENV_TIMEOUT/ENV_DT)
 ACTOR_LR = 1e-5
 CRITIC_LR = 1e-3
 GRAD_CLIP_NORM = 1.0
 LOG_EVERY = 10
-TAU = 0.005  # soft update rate — add to constants.py
+TAU = 0.008  # soft update rate — add to constants.py
 REPLAY_BUFFER_SIZE = 100_000
 BATCH_SIZE = 64
 MIN_BUFFER = 1000  # don't train until buffer has this many samples

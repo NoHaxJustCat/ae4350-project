@@ -171,6 +171,9 @@ class CWRendezvousEnv(gym.Env):
         else:
             reward_terminal = 0.0
 
+        if pos_error < 5 * self.pos_tolerance:
+            reward_terminal += 0.25 * ENV_BONUS
+
         reward = reward_pos + reward_fuel + reward_terminal
 
         observation = self.state.copy()
