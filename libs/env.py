@@ -199,14 +199,15 @@ class CWRendezvousEnv(gym.Env):
         )
 
     def _advance_curriculum(self):
-        if not self.curriculum_enabled:
-            return
-        self.curriculum_distance = min(
-            self.curriculum_distance + self.curriculum_increment,
-            self.curriculum_max_distance,
-        )
-        # Signal to training loop that buffer should be flushed
-        self.curriculum_advanced = True
+        # if not self.curriculum_enabled:
+        #     return
+        # self.curriculum_distance = min(
+        #     self.curriculum_distance + self.curriculum_increment,
+        #     self.curriculum_max_distance,
+        # )
+        # # Signal to training loop that buffer should be flushed
+        # self.curriculum_advanced = True
+        return
 
     # ── Observation ──────────────────────────────────────────────────────────
 
@@ -241,7 +242,6 @@ class CWRendezvousEnv(gym.Env):
 
         self.best_distance   = np.linalg.norm(self.state[:half])
         self.step_count      = 0
-        self.wrong_way_counter = 0
         self.elapsed_time    = 0.0
         self.dv_used         = 0.0
         self.curriculum_advanced = False   # ← add this

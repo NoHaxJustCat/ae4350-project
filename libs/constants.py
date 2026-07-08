@@ -29,7 +29,7 @@ ENV_MAX_DV = ENV_DV_BUDGET/2
 
 # --- Curriculum learning defaults ---
 ENV_CURRICULUM_ENABLED = True
-ENV_CURRICULUM_START_DISTANCE = 2.0   # starting distance [m]
+ENV_CURRICULUM_START_DISTANCE = 10.0   # starting distance [m]
 ENV_CURRICULUM_MAX_DISTANCE = 100.0    # final distance [m] (matches ENV_INITIAL_STATE_VBAR norm)
 ENV_CURRICULUM_INCREMENT = 2.0         # distance added per successful dock [m]
 
@@ -37,13 +37,13 @@ ENV_CURRICULUM_INCREMENT = 2.0         # distance added per successful dock [m]
 GAMMA = 0.97
 NUM_EPISODES = 50000
 MAX_STEPS = int(ENV_TIMEOUT/ENV_DT) + 1
-ACTOR_LR = 1e-5
-CRITIC_LR = 1e-4
+ACTOR_LR = 1e-4
+CRITIC_LR = 1e-3
 GRAD_CLIP_NORM = 1.0
-LOG_EVERY = 1
-TAU = 0.01  # soft update rate — add to constants.py
-BATCH_SIZE = 256
-MIN_BUFFER = 1000
+LOG_EVERY = 10
+TAU = 0.005  # soft update rate — add to constants.py
+BATCH_SIZE = 128
+MIN_BUFFER = 2500
 REPLAY_BUFFER_SIZE = 50_000
 # --- Evaluation / plotting defaults ---
 SMOOTHING_WINDOW = 20
