@@ -291,13 +291,10 @@ class CWRendezvousEnv(gym.Env):
 
         if docked:
             reward_terminal = ENV_BONUS - ENV_VEL_COEFF * vel_error
-            print("OOB =", out_of_bounds, "Timeout =", timeout, "Docked =", docked)
         elif out_of_bounds:
             reward_terminal = 0.0
-            print("OOB =", out_of_bounds, "Timeout =", timeout, "Docked =", docked)
         elif truncated: # must penalize otherwise it elarns that the timeout is great compared to going left!
             reward_terminal = - ENV_SHAPING_COEFF * (self.excursion_limit - pos_error) / self.curriculum_distance
-            print("OOB =", out_of_bounds, "Timeout =", timeout, "Docked =", docked)
         else:
             reward_terminal = 0.0
 

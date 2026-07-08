@@ -39,8 +39,8 @@ from libs.normalization import normalize_action, normalize_state
 from libs.trajectory import plot_trajectory
 
 # ── Feature flags ────────────────────────────────────────────────────────────
-USE_REPLAY_BUFFER  = True
-USE_ACTOR_TARGET   = True
+USE_REPLAY_BUFFER  = False
+USE_ACTOR_TARGET   = False
 USE_CRITIC_TARGET  = True
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -142,11 +142,13 @@ def main():
         docked            = False
 
         for step in range(MAX_STEPS):
-            # after
             if USE_REPLAY_BUFFER and buffer is not None and len(buffer) < MIN_BUFFER:
                 action = torch.tensor(env.action_space.sample() * 0.1, dtype=torch.float32)
             else:
+                # noise_scale = max(0.01, 0.1 * (1 - episode / NUM_EPISODES))
                 action = actor(state_nn).detach()
+                # action += torch.tensor(np.random.normal(0, noise_scale, size=action.shape), dtype=torch.float32)
+                # action = action.clamp(-env.max_dv, env.max_dv)
 
             next_state, reward, terminated, truncated, info = env.step(action.numpy())
             next_state    = torch.tensor(next_state, dtype=torch.float32)

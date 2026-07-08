@@ -1,9 +1,8 @@
 <#
 .SYNOPSIS
-    Copies the whole project to aurora-server, creates/uses a conda env,
+    Syncs the project to aurora-server, creates/uses a conda env,
     runs training (blocking, with live logs), then pulls back out/ and trained/.
-    While training runs, periodically pulls back the latest trajectory PNG
-    so you can watch progress without waiting for the run to finish.
+    While training runs, periodically pulls back the latest trajectory PNG.
 .USAGE
     .\deploy_train.ps1
 #>
@@ -20,35 +19,30 @@ $PythonVersion   = "3.11"
 $TrainCommand    = "python -u training.py"
 $ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results", "tmp",
                      "__pycache__", ".venv", "venv")
-$PollIntervalSeconds = 20   # how often to pull the latest trajectory PNG while training runs
+$PollIntervalSeconds = 20
 #############################################
 
-# ── 1. Stage ─────────────────────────────────────────────────────────────────
-Write-Host "`n==> [1/4] Staging local files..." -ForegroundColor Cyan
-$StagingDir = Join-Path $env:TEMP "hdp_stage_$(Get-Random)"
+# ── 1. Sync ───────────────────────────────────────────────────────────────────
+Write-Host "`n==> [1/4] Syncing to ${RemoteHost}:~/${RemoteSubfolder}/" -ForegroundColor Cyan
+ssh $RemoteHost "mkdir -p ~/${RemoteSubfolder}/out ~/${RemoteSubfolder}/trained"
+
+$StagingDir = Join-Path $env:TEMP "hdp_stage"
 New-Item -ItemType Directory -Force -Path $StagingDir | Out-Null
-$roboArgs = @(".", $StagingDir, "/E", "/NFL", "/NDL", "/NJH", "/NJS", "/NP")
+
+$roboArgs = @(".", $StagingDir, "/E", "/XO", "/NFL", "/NDL", "/NJH", "/NJS", "/NP")
 foreach ($ex in $ExcludeNames) { $roboArgs += @("/XD", $ex) }
 robocopy @roboArgs | Out-Null
-if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE)" }
 
-# ── 2. Upload ─────────────────────────────────────────────────────────────────
-Write-Host "`n==> [2/4] Uploading to ${RemoteHost}:~/${RemoteSubfolder}/" -ForegroundColor Cyan
-ssh $RemoteHost "mkdir -p ~/${RemoteSubfolder}/out ~/${RemoteSubfolder}/trained"
 scp -r "$StagingDir\*" "${RemoteHost}:~/${RemoteSubfolder}/"
 Remove-Item -Recurse -Force $StagingDir
-Write-Host "    Upload complete."
+Write-Host "    Sync complete."
 
-# ── 3. Remote: setup + train (ONE ssh session, live output) ──────────────────
-Write-Host "`n==> [3/4] Remote setup + training (live logs below)" -ForegroundColor Cyan
+# ── 2. Remote: setup + train ──────────────────────────────────────────────────
+Write-Host "`n==> [2/4] Remote setup + training (live logs below)" -ForegroundColor Cyan
 Write-Host "    SSH session open — do not close this window.`n" -ForegroundColor Yellow
 
-# Write the remote bash script to a temp file so we avoid all heredoc
-# escaping issues between PowerShell and bash
 $remoteSh = Join-Path $env:TEMP "hdp_remote_$(Get-Random).sh"
 
-# Use single-quoted here-string (@' '@) so PowerShell does NOT expand any $
-# Then inject PS variables explicitly via string replacement afterwards
 $bashScript = @'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -115,13 +109,11 @@ echo " Training finished -- $(date)"
 echo "========================================="
 '@
 
-# Now inject PowerShell variable values into the placeholders
 $bashScript = $bashScript.Replace("__SUBFOLDER__", $RemoteSubfolder)
 $bashScript = $bashScript.Replace("__CONDAENV__",  $CondaEnvName)
 $bashScript = $bashScript.Replace("__PYVER__",     $PythonVersion)
 $bashScript = $bashScript.Replace("__TRAINCMD__",  $TrainCommand)
 
-# Write as UTF-8 no BOM, Unix line endings
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 $unixScript = $bashScript -replace "`r`n", "`n"
 [System.IO.File]::WriteAllText($remoteSh, $unixScript, $utf8NoBom)
@@ -129,12 +121,10 @@ $unixScript = $bashScript -replace "`r`n", "`n"
 scp "$remoteSh" "${RemoteHost}:~/${RemoteSubfolder}/_run.sh"
 Remove-Item -Force $remoteSh
 
-# Make sure the local tmp\ folder exists before the poller starts writing to it
 New-Item -ItemType Directory -Force -Path ".\tmp" | Out-Null
 $LocalTmpDir = (Resolve-Path ".\tmp").Path
 
-# ── Background poller: pulls the latest trajectory PNG every $PollIntervalSeconds
-#    while the (blocking, foreground) training session below is still running.
+# ── 3. Background poller ──────────────────────────────────────────────────────
 $pollJob = Start-Job -ScriptBlock {
     param($RemoteHost, $RemoteSubfolder, $LocalTmpDir, $Interval)
     while ($true) {
@@ -151,7 +141,6 @@ try {
     $trainExitCode = $LASTEXITCODE
 }
 finally {
-    # Stop the poller as soon as the training session ends, one way or another
     Stop-Job $pollJob -ErrorAction SilentlyContinue | Out-Null
     Remove-Job $pollJob -ErrorAction SilentlyContinue | Out-Null
 }
@@ -162,20 +151,14 @@ if ($trainExitCode -ne 0) {
 }
 
 # ── 4. Retrieve results ───────────────────────────────────────────────────────
-Write-Host "`n==> [4/4] Retrieving out/ and trained/ ..." -ForegroundColor Cyan
+Write-Host "`n==> [4/4] Retrieving out/, trained/, tmp/ ..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path ".\out"     | Out-Null
 New-Item -ItemType Directory -Force -Path ".\trained" | Out-Null
-New-Item -ItemType Directory -Force -Path ".\tmp" | Out-Null
+New-Item -ItemType Directory -Force -Path ".\tmp"     | Out-Null
 
-scp -r "${RemoteHost}:~/${RemoteSubfolder}/out/*"     ".\out\"     2>$null
-if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: out/ was empty." -ForegroundColor Yellow }
-
-scp -r "${RemoteHost}:~/${RemoteSubfolder}/trained/*" ".\trained\" 2>$null
-if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: trained/ was empty." -ForegroundColor Yellow }
-
-
-scp -r "${RemoteHost}:~/${RemoteSubfolder}/tmp/*" ".\tmp\" 2>$null
-if ($LASTEXITCODE -ne 0) { Write-Host "  WARN: tmp/ was empty." -ForegroundColor Yellow }
+rsync -az "${RemoteHost}:~/${RemoteSubfolder}/out/"     ".\out\"
+rsync -az "${RemoteHost}:~/${RemoteSubfolder}/trained/" ".\trained\"
+rsync -az "${RemoteHost}:~/${RemoteSubfolder}/tmp/"     ".\tmp\"
 
 Write-Host "`n==> All done." -ForegroundColor Green
 Write-Host "`n--- out\ ---"
@@ -183,4 +166,4 @@ Get-ChildItem ".\out"     -ErrorAction SilentlyContinue | Format-Table Name, Len
 Write-Host "--- trained\ ---"
 Get-ChildItem ".\trained" -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime
 Write-Host "--- tmp\ ---"
-Get-ChildItem ".\tmp" -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime
+Get-ChildItem ".\tmp"     -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime

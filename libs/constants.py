@@ -34,7 +34,7 @@ ENV_CURRICULUM_MAX_DISTANCE = 100.0    # final distance [m] (matches ENV_INITIAL
 ENV_CURRICULUM_INCREMENT = 2.0         # distance added per successful dock [m]
 
 # --- Training defaults ---
-GAMMA = 0.96
+GAMMA = 0.97
 NUM_EPISODES = 50000
 MAX_STEPS = int(ENV_TIMEOUT/ENV_DT) + 1
 ACTOR_LR = 1e-5
@@ -42,7 +42,7 @@ CRITIC_LR = 1e-3
 GRAD_CLIP_NORM = 1.0
 LOG_EVERY = 1
 TAU = 0.005  # soft update rate — add to constants.py
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 MIN_BUFFER = 1000
 REPLAY_BUFFER_SIZE = 50_000
 # --- Evaluation / plotting defaults ---
