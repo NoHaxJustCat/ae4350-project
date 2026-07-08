@@ -17,6 +17,7 @@ from libs.constants import (
     CRITIC_LR,
     DIAGNOSTICS_PLOT_PATH,
     DOCK_RATE_WINDOW,
+    ENV_MAX_DV,
     GAMMA,
     GRAD_CLIP_NORM,
     BATCH_SIZE,
@@ -38,11 +39,9 @@ from libs.normalization import normalize_action, normalize_state
 from libs.trajectory import plot_trajectory
 
 # ── Feature flags ────────────────────────────────────────────────────────────
-USE_REPLAY_BUFFER  = True   # experience replay (random mini-batch updates)
-USE_ACTOR_TARGET   = True   # target actor network (soft-updated with TAU)
-USE_CRITIC_TARGET  = True   # target critic network (soft-updated with TAU)
-# Note: USE_ACTOR_TARGET / USE_CRITIC_TARGET only affect target *usage*;
-#       when False the online network is used in its place.
+USE_REPLAY_BUFFER  = True
+USE_ACTOR_TARGET   = True
+USE_CRITIC_TARGET  = True
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -87,13 +86,10 @@ def main():
     actor  = Actor(max_action=env.max_dv)
     critic = Critic()
 
-    # Critic target — always built, but only soft-updated / queried when the
-    # flag is set; otherwise the online critic doubles as its own target.
     critic_target = deepcopy(critic)
     for p in critic_target.parameters():
         p.requires_grad_(False)
 
-    # Actor target — same pattern.
     actor_target = deepcopy(actor)
     for p in actor_target.parameters():
         p.requires_grad_(False)
@@ -109,19 +105,19 @@ def main():
     shutil.rmtree(tmp_dir, ignore_errors=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    episode_rewards      = []
-    episode_steps        = []
-    episode_delta_vs     = []
+    episode_rewards       = []
+    episode_steps         = []
+    episode_delta_vs      = []
     episode_critic_losses = []
     episode_actor_losses  = []
-    episode_docked       = []
-    episode_r_pos_totals  = []   # per-episode total r_pos (not per-step average)
-    episode_r_fuel_totals = []   # per-episode total r_fuel (not per-step average)
+    episode_docked        = []
+    episode_r_pos_totals  = []
+    episode_r_fuel_totals = []
 
-    print(f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | {'r_fuel':>8} | "
+    print(f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | {'r_fuel':>8} | {'r_term':>8} | "
       f"{'dv':>7} | {'c_loss':>9} | {'a_loss':>9} | {'J_mean':>8} | {'docked':>6} | "
       f"{'ms/step':>8}")
-    print("-" * 110)
+    print("-" * 120)    
 
     for episode in range(NUM_EPISODES):
         episode_start = time.perf_counter()
@@ -131,13 +127,14 @@ def main():
         state_nn = normalize_state(state)
         with torch.no_grad():
             prev_J = critic(state_nn, actor(state_nn).detach())
-        episode_states = [state.detach().numpy().copy()]
+        episode_states  = [state.detach().numpy().copy()]
         episode_actions = []
 
         total_reward      = 0.0
         total_delta_v     = 0.0
         total_r_pos       = 0.0
         total_r_fuel      = 0.0
+        total_r_terminal  = 0.0
         total_critic_loss = 0.0
         total_actor_loss  = 0.0
         total_J           = 0.0
@@ -145,52 +142,61 @@ def main():
         docked            = False
 
         for step in range(MAX_STEPS):
-            action = actor(state_nn).detach()
+            # after
+            if USE_REPLAY_BUFFER and buffer is not None and len(buffer) < MIN_BUFFER:
+                action = torch.tensor(env.action_space.sample() * 0.1, dtype=torch.float32)
+            else:
+                action = actor(state_nn).detach()
 
             next_state, reward, terminated, truncated, info = env.step(action.numpy())
-            next_state = torch.tensor(next_state, dtype=torch.float32)
+            next_state    = torch.tensor(next_state, dtype=torch.float32)
             next_state_nn = normalize_state(next_state)
             episode_states.append(next_state.detach().numpy().copy())
             reward_t = torch.tensor([reward], dtype=torch.float32)
 
-            # The env may clip/budget-cap the actor's raw commanded action —
-            # `applied_action` is what actually produced this transition, and
-            # is what must be stored/used everywhere below (buffer, on-policy
-            # update, Q(s,a) bookkeeping). Using the raw `action` instead would
-            # train the critic on (s, a, s') tuples where `a` didn't really
-            # cause `s'`, which is wrong once the fuel budget is low/exhausted.
+            if env.curriculum_advanced:
+                # buffer.clear()
+                env.curriculum_advanced = False
+                print(f"  → curriculum advanced to {env.curriculum_distance:.1f}m")
+
             applied_action = torch.tensor(info["applied_action"], dtype=torch.float32)
-            episode_actions.append(info["applied_action"].copy())
 
-            # Use the env's actually-applied delta-v (post clip/budget-cap),
-            # not the actor's raw commanded action — otherwise this can sum
-            # to far more than the dv_budget once the budget is exhausted,
-            # since the actor keeps "requesting" burns that the env zeroes out.
+            # Only record burns that actually happened — zero-action transitions
+            # (budget exhausted) are meaningless for the plot and add visual noise.
+            if not info["budget_exhausted"]:
+                episode_actions.append(info["applied_action"].copy())
+            else:
+                episode_actions.append(np.zeros_like(info["applied_action"]))
+
             total_delta_v += info["delta_v"]
-
-            total_reward += reward
-            total_r_pos  += info["reward_pos"]
-            total_r_fuel += info["reward_fuel"]
+            total_reward  += reward
+            total_r_pos   += info["reward_pos"]
+            total_r_fuel  += info["reward_fuel"]
+            total_r_terminal  += info["reward_terminal"]
             if info["docked"]:
                 docked = True
 
             # ── Replay buffer ─────────────────────────────────────────────
+            # Skip budget-exhausted transitions: the action is always zero
+            # regardless of what the actor commanded, so these transitions
+            # carry no policy-relevant information and only dilute the buffer.
             if USE_REPLAY_BUFFER:
-                buffer.append((
-                    state.numpy().copy(),
-                    applied_action.numpy().copy(),
-                    reward,
-                    next_state.numpy().copy(),
-                    terminated or truncated,
-                ))
+                if not info["budget_exhausted"]:
+                    buffer.append((
+                        state.numpy().copy(),
+                        applied_action.numpy().copy(),
+                        reward,
+                        next_state.numpy().copy(),
+                        terminated or truncated,
+                    ))
                 ready = len(buffer) >= MIN_BUFFER
             else:
-                ready = True  # always update on-policy
+                ready = True
 
-            # ── Sample a batch (or use the current transition on-policy) ──
+            # ── Sample a batch ────────────────────────────────────────────
             if ready:
                 if USE_REPLAY_BUFFER:
-                    batch      = random.sample(buffer, BATCH_SIZE)
+                    batch = random.sample(buffer, BATCH_SIZE)
                     s, a, r, s2, done = zip(*batch)
                     s    = torch.tensor(np.array(s),    dtype=torch.float32)
                     a    = torch.tensor(np.array(a),    dtype=torch.float32)
@@ -201,7 +207,6 @@ def main():
                     a_nn  = normalize_action(a)
                     s2_nn = normalize_state(s2)
                 else:
-                    # On-policy: single transition, shapes match batch API
                     s    = state.unsqueeze(0)
                     a    = applied_action.unsqueeze(0)
                     r    = reward_t.unsqueeze(0)
@@ -213,13 +218,13 @@ def main():
 
                 # ── Critic update ─────────────────────────────────────────
                 with torch.no_grad():
-                    a2_next  = actor_target(s2_nn) if USE_ACTOR_TARGET  else actor(s2_nn)
-                    q_next   = (
+                    a2_next = actor_target(s2_nn) if USE_ACTOR_TARGET else actor(s2_nn)
+                    q_next  = (
                         critic_target(s2_nn, normalize_action(a2_next))
                         if USE_CRITIC_TARGET
                         else critic(s2_nn, normalize_action(a2_next))
                     )
-                    target   = r + GAMMA * (1 - done) * q_next
+                    target = r + GAMMA * (1 - done) * q_next
 
                 critic_loss = torch.mean((critic(s_nn, a_nn) - target) ** 2)
                 critic_opt.zero_grad()
@@ -238,11 +243,10 @@ def main():
                             p_tgt.data.mul_(1 - TAU)
                             p_tgt.data.add_(TAU * p.data)
 
-                # ── Actor update (model-based, gradient through propagator) ─
-                # Actor update
+                # ── Actor update ──────────────────────────────────────────
                 set_requires_grad(critic, False)
-                a_pred = actor(s_nn)
-                actor_loss = -critic(s_nn, normalize_action(a_pred)).mean()   # Q(s, π(s))
+                a_pred     = actor(s_nn)
+                actor_loss = -critic(s_nn, normalize_action(a_pred)).mean()
                 actor_opt.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(actor.parameters(), GRAD_CLIP_NORM)
@@ -256,7 +260,7 @@ def main():
             current_J = critic(next_state_nn, normalize_action(applied_action.detach()))
             total_J  += current_J.item()
 
-            state = next_state
+            state    = next_state
             state_nn = next_state_nn
 
             if terminated or truncated:
@@ -268,32 +272,34 @@ def main():
         episode_steps.append(n)
         episode_delta_vs.append(total_delta_v)
         episode_critic_losses.append(total_critic_loss / update_count if update_count else 0.0)
-        episode_actor_losses.append(total_actor_loss  / update_count if update_count else 0.0)
+        episode_actor_losses.append(total_actor_loss   / update_count if update_count else 0.0)
         episode_docked.append(docked)
         episode_r_pos_totals.append(total_r_pos)
         episode_r_fuel_totals.append(total_r_fuel)
 
         if episode % LOG_EVERY == 0:
-            dock_rate       = np.mean(episode_docked[-DOCK_RATE_WINDOW:]) * 100
-            avg_critic_loss = total_critic_loss / update_count if update_count else 0.0
-            avg_actor_loss  = total_actor_loss  / update_count if update_count else 0.0
-            # Average of each episode's TOTAL r_pos / r_fuel over the last
-            # LOG_EVERY episodes (not the per-step average within one episode).
+            dock_rate        = np.mean(episode_docked[-DOCK_RATE_WINDOW:]) * 100
+            avg_critic_loss  = total_critic_loss / update_count if update_count else 0.0
+            avg_actor_loss   = total_actor_loss  / update_count if update_count else 0.0
             avg_r_pos_total  = np.mean(episode_r_pos_totals[-LOG_EVERY:])
             avg_r_fuel_total = np.mean(episode_r_fuel_totals[-LOG_EVERY:])
             print(f"{episode:>6} | {n:>5} | {total_reward:>9.2f} | {avg_r_pos_total:>8.2f} | "
-                  f"{avg_r_fuel_total:>8.2f} | {total_delta_v:>7.3f} | "
-                  f"{avg_critic_loss:>9.4f} | {avg_actor_loss:>9.4f} | "
-                  f"{total_J/n:>8.3f} | {dock_rate:>5.1f}% | "
-                  f"{1000 * episode_seconds / n:>8.2f}")
+                f"{avg_r_fuel_total:>8.2f} | {total_r_terminal:>8.2f} | {total_delta_v:>7.3f} | "
+                f"{avg_critic_loss:>9.4f} | {avg_actor_loss:>9.4f} | "
+                f"{total_J/n:>8.3f} | {dock_rate:>5.1f}% | "
+                f"{1000 * episode_seconds / n:>8.2f}")
 
         if (episode + 1) % LOG_EVERY == 0:
             episode_tag = f"ep_{episode + 1:04d}"
-            traj_path = tmp_dir / f"{episode_tag}.png"
-            plot_trajectory(episode_states, episode_actions, str(traj_path))
-            # Fixed filename, overwritten every LOG_EVERY episodes — lets an
-            # external poller (e.g. the deploy script) grab "whatever's most
-            # recent" without needing to know the current episode number.
+            traj_path   = tmp_dir / f"{episode_tag}.png"
+            # min_dv_display: only draw burns >= 1% of max_dv so post-budget
+            # zero-action steps don't clutter the plot.
+            plot_trajectory(
+                episode_states,
+                episode_actions,
+                str(traj_path),
+                min_dv_display=ENV_MAX_DV * 0.01,
+            )
             shutil.copy(traj_path, tmp_dir / "latest_trajectory.png")
             np.savez(
                 tmp_dir / f"{episode_tag}.npz",
@@ -310,11 +316,11 @@ def main():
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     fig.suptitle("HDP Training Diagnostics", fontsize=14)
 
-    plot_with_smooth(axes[0, 0], episode_rewards,       "reward",      "tab:blue",   "Total reward",        "reward")
-    plot_with_smooth(axes[0, 1], episode_delta_vs,      "delta-v",     "tab:orange", "Total delta-V",       "m/s")
-    plot_with_smooth(axes[0, 2], episode_steps,         "steps",       "tab:green",  "Episode length",      "steps")
-    plot_with_smooth(axes[1, 0], episode_critic_losses, "critic loss", "tab:red",    "Critic loss (avg)",   "MSE")
-    plot_with_smooth(axes[1, 1], episode_actor_losses,  "actor loss",  "tab:purple", "Actor loss (avg)",    "loss")
+    plot_with_smooth(axes[0, 0], episode_rewards,       "reward",      "tab:blue",   "Total reward",      "reward")
+    plot_with_smooth(axes[0, 1], episode_delta_vs,      "delta-v",     "tab:orange", "Total delta-V",     "m/s")
+    plot_with_smooth(axes[0, 2], episode_steps,         "steps",       "tab:green",  "Episode length",    "steps")
+    plot_with_smooth(axes[1, 0], episode_critic_losses, "critic loss", "tab:red",    "Critic loss (avg)", "MSE")
+    plot_with_smooth(axes[1, 1], episode_actor_losses,  "actor loss",  "tab:purple", "Actor loss (avg)",  "loss")
 
     dock_rate = [
         np.mean(episode_docked[max(0, i - DOCK_RATE_WINDOW):i + 1]) * 100

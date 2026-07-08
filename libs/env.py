@@ -203,6 +203,8 @@ class CWRendezvousEnv(gym.Env):
             self.curriculum_distance + self.curriculum_increment,
             self.curriculum_max_distance,
         )
+        # Signal to training loop that buffer should be flushed
+        self.curriculum_advanced = True
 
     # ── Observation ──────────────────────────────────────────────────────────
 
@@ -239,6 +241,7 @@ class CWRendezvousEnv(gym.Env):
         self.wrong_way_counter = 0
         self.elapsed_time    = 0.0
         self.dv_used         = 0.0
+        self.curriculum_advanced = False   # ← add this
 
         observation = self._build_observation()
         info = {"curriculum_distance": self.curriculum_distance}
@@ -268,7 +271,8 @@ class CWRendezvousEnv(gym.Env):
 
         pos_error  = np.linalg.norm(self.state[:half])
         vel_error  = np.linalg.norm(self.state[half:])
-        excursion  = np.linalg.norm(self.state[:half] - self.start_pos)
+        # was: excursion = np.linalg.norm(self.state[:half] - self.start_pos)
+        excursion = pos_error
 
         docked        = pos_error < self.pos_tolerance
         out_of_bounds = excursion > self.excursion_limit
@@ -282,15 +286,18 @@ class CWRendezvousEnv(gym.Env):
             self._advance_curriculum()
 
         # --- Reward ---
-        reward_pos  = ENV_SHAPING_COEFF * delta
+        reward_pos  = ENV_SHAPING_COEFF * delta / self.curriculum_distance
         reward_fuel = -ENV_FUEL_COEFF * np.linalg.norm(action)
 
         if docked:
             reward_terminal = ENV_BONUS - ENV_VEL_COEFF * vel_error
+            print("OOB =", out_of_bounds, "Timeout =", timeout, "Docked =", docked)
         elif out_of_bounds:
-            reward_terminal = -0.0
-        elif truncated:
             reward_terminal = 0.0
+            print("OOB =", out_of_bounds, "Timeout =", timeout, "Docked =", docked)
+        elif truncated: # must penalize otherwise it elarns that the timeout is great compared to going left!
+            reward_terminal = - ENV_SHAPING_COEFF * (self.excursion_limit - pos_error) / self.curriculum_distance
+            print("OOB =", out_of_bounds, "Timeout =", timeout, "Docked =", docked)
         else:
             reward_terminal = 0.0
 
