@@ -2,6 +2,8 @@
 .SYNOPSIS
     Copies the whole project to aurora-server, creates/uses a conda env,
     runs training (blocking, with live logs), then pulls back out/ and trained/.
+    While training runs, periodically pulls back the latest trajectory PNG
+    so you can watch progress without waiting for the run to finish.
 .USAGE
     .\deploy_train.ps1
 #>
@@ -18,6 +20,7 @@ $PythonVersion   = "3.11"
 $TrainCommand    = "python -u training.py"
 $ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results", "tmp",
                      "__pycache__", ".venv", "venv")
+$PollIntervalSeconds = 20   # how often to pull the latest trajectory PNG while training runs
 #############################################
 
 # ── 1. Stage ─────────────────────────────────────────────────────────────────
@@ -125,11 +128,37 @@ $unixScript = $bashScript -replace "`r`n", "`n"
 
 scp "$remoteSh" "${RemoteHost}:~/${RemoteSubfolder}/_run.sh"
 Remove-Item -Force $remoteSh
-ssh $RemoteHost "bash ~/${RemoteSubfolder}/_run.sh"
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "`nERROR: remote script exited with code $LASTEXITCODE" -ForegroundColor Red
-    exit $LASTEXITCODE
+# Make sure the local tmp\ folder exists before the poller starts writing to it
+New-Item -ItemType Directory -Force -Path ".\tmp" | Out-Null
+$LocalTmpDir = (Resolve-Path ".\tmp").Path
+
+# ── Background poller: pulls the latest trajectory PNG every $PollIntervalSeconds
+#    while the (blocking, foreground) training session below is still running.
+$pollJob = Start-Job -ScriptBlock {
+    param($RemoteHost, $RemoteSubfolder, $LocalTmpDir, $Interval)
+    while ($true) {
+        scp "${RemoteHost}:~/${RemoteSubfolder}/tmp/latest_trajectory.png" `
+            (Join-Path $LocalTmpDir "latest_trajectory.png") 2>$null
+        Start-Sleep -Seconds $Interval
+    }
+} -ArgumentList $RemoteHost, $RemoteSubfolder, $LocalTmpDir, $PollIntervalSeconds
+
+Write-Host "    Live trajectory polling started -> .\tmp\latest_trajectory.png (every ${PollIntervalSeconds}s)`n" -ForegroundColor DarkGray
+
+try {
+    ssh $RemoteHost "bash ~/${RemoteSubfolder}/_run.sh"
+    $trainExitCode = $LASTEXITCODE
+}
+finally {
+    # Stop the poller as soon as the training session ends, one way or another
+    Stop-Job $pollJob -ErrorAction SilentlyContinue | Out-Null
+    Remove-Job $pollJob -ErrorAction SilentlyContinue | Out-Null
+}
+
+if ($trainExitCode -ne 0) {
+    Write-Host "`nERROR: remote script exited with code $trainExitCode" -ForegroundColor Red
+    exit $trainExitCode
 }
 
 # ── 4. Retrieve results ───────────────────────────────────────────────────────
@@ -153,5 +182,5 @@ Write-Host "`n--- out\ ---"
 Get-ChildItem ".\out"     -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime
 Write-Host "--- trained\ ---"
 Get-ChildItem ".\trained" -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime
-Write-Host "--- tmo\ ---"
+Write-Host "--- tmp\ ---"
 Get-ChildItem ".\tmp" -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime

@@ -1,4 +1,13 @@
 import numpy as np
+MODE_2D: bool = True
+
+# Derived convenience constants (do not edit these directly)
+# Physical state dim: 4 (2D) or 6 (3D)
+PHYS_STATE_DIM: int = 4 if MODE_2D else 6
+# Observation dim = physical state + dv_remaining scalar
+OBS_DIM:    int = PHYS_STATE_DIM + 1       # 5 (2D) or 7 (3D)
+ACTION_DIM: int = 2 if MODE_2D else 3
+
 # --- Orbit / physics constants ---
 EARTH_MU = 3.986 * 10 ** 14  # m^3 / s^2
 ORBIT_RADIUS = (6378 + 600) * 10 ** 3  # m
@@ -20,7 +29,7 @@ ENV_DV_BUDGET = 0.05
 
 # --- Curriculum learning defaults ---
 ENV_CURRICULUM_ENABLED = True
-ENV_CURRICULUM_START_DISTANCE = 3.0   # starting distance [m]
+ENV_CURRICULUM_START_DISTANCE = 2.0   # starting distance [m]
 ENV_CURRICULUM_MAX_DISTANCE = 100.0    # final distance [m] (matches ENV_INITIAL_STATE_VBAR norm)
 ENV_CURRICULUM_INCREMENT = 1.0         # distance added per successful dock [m]
 
@@ -29,7 +38,7 @@ GAMMA = 0.95
 NUM_EPISODES = 50000
 MAX_STEPS = int(ENV_TIMEOUT/ENV_DT)
 ACTOR_LR = 1e-5
-CRITIC_LR = 1e-3
+CRITIC_LR = 3e-4
 GRAD_CLIP_NORM = 1.0
 LOG_EVERY = 10
 TAU = 0.005  # soft update rate — add to constants.py

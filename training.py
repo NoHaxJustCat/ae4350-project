@@ -132,6 +132,7 @@ def main():
         with torch.no_grad():
             prev_J = critic(state_nn, actor(state_nn).detach())
         episode_states = [state.detach().numpy().copy()]
+        episode_actions = []
 
         total_reward      = 0.0
         total_delta_v     = 0.0
@@ -159,6 +160,7 @@ def main():
             # train the critic on (s, a, s') tuples where `a` didn't really
             # cause `s'`, which is wrong once the fuel budget is low/exhausted.
             applied_action = torch.tensor(info["applied_action"], dtype=torch.float32)
+            episode_actions.append(info["applied_action"].copy())
 
             # Use the env's actually-applied delta-v (post clip/budget-cap),
             # not the actor's raw commanded action — otherwise this can sum
@@ -285,9 +287,14 @@ def main():
                   f"{total_J/n:>8.3f} | {dock_rate:>5.1f}% | "
                   f"{1000 * episode_seconds / n:>8.2f}")
 
-        if (episode + 1) % 50 == 0:
+        if (episode + 1) % LOG_EVERY == 0:
             episode_tag = f"ep_{episode + 1:04d}"
-            plot_trajectory(episode_states, str(tmp_dir / f"{episode_tag}.png"))
+            traj_path = tmp_dir / f"{episode_tag}.png"
+            plot_trajectory(episode_states, episode_actions, str(traj_path))
+            # Fixed filename, overwritten every LOG_EVERY episodes — lets an
+            # external poller (e.g. the deploy script) grab "whatever's most
+            # recent" without needing to know the current episode number.
+            shutil.copy(traj_path, tmp_dir / "latest_trajectory.png")
             np.savez(
                 tmp_dir / f"{episode_tag}.npz",
                 states=np.array(episode_states),
