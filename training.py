@@ -39,8 +39,8 @@ from libs.trajectory import plot_trajectory
 
 # ── Feature flags ────────────────────────────────────────────────────────────
 USE_REPLAY_BUFFER  = True   # experience replay (random mini-batch updates)
-USE_ACTOR_TARGET   = False   # target actor network (soft-updated with TAU)
-USE_CRITIC_TARGET  = False   # target critic network (soft-updated with TAU)
+USE_ACTOR_TARGET   = True   # target actor network (soft-updated with TAU)
+USE_CRITIC_TARGET  = True   # target critic network (soft-updated with TAU)
 # Note: USE_ACTOR_TARGET / USE_CRITIC_TARGET only affect target *usage*;
 #       when False the online network is used in its place.
 # ─────────────────────────────────────────────────────────────────────────────

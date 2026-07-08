@@ -288,9 +288,9 @@ class CWRendezvousEnv(gym.Env):
         if docked:
             reward_terminal = ENV_BONUS - ENV_VEL_COEFF * vel_error
         elif out_of_bounds:
-            reward_terminal = -100.0
+            reward_terminal = -0.0
         elif truncated:
-            reward_terminal = -50.0
+            reward_terminal = 0.0
         else:
             reward_terminal = 0.0
 
