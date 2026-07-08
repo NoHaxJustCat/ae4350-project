@@ -41,7 +41,7 @@ from libs.trajectory import plot_trajectory
 # ── Feature flags ────────────────────────────────────────────────────────────
 USE_REPLAY_BUFFER  = False
 USE_ACTOR_TARGET   = False
-USE_CRITIC_TARGET  = True
+USE_CRITIC_TARGET  = False
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -114,10 +114,10 @@ def main():
     episode_r_pos_totals  = []
     episode_r_fuel_totals = []
 
-    print(f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | {'r_fuel':>8} | {'r_term':>8} | "
+    print(f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | {'r_fuel':>8} | {'r_term':>8} | {'r_mile':>8} | "
       f"{'dv':>7} | {'c_loss':>9} | {'a_loss':>9} | {'J_mean':>8} | {'docked':>6} | "
       f"{'ms/step':>8}")
-    print("-" * 120)    
+    print("-" * 130) 
 
     for episode in range(NUM_EPISODES):
         episode_start = time.perf_counter()
@@ -125,8 +125,6 @@ def main():
         state, _ = env.reset()
         state = torch.tensor(state, dtype=torch.float32)
         state_nn = normalize_state(state)
-        with torch.no_grad():
-            prev_J = critic(state_nn, actor(state_nn).detach())
         episode_states  = [state.detach().numpy().copy()]
         episode_actions = []
 
@@ -135,6 +133,7 @@ def main():
         total_r_pos       = 0.0
         total_r_fuel      = 0.0
         total_r_terminal  = 0.0
+        total_r_milestone = 0.0 
         total_critic_loss = 0.0
         total_actor_loss  = 0.0
         total_J           = 0.0
@@ -145,7 +144,7 @@ def main():
             if USE_REPLAY_BUFFER and buffer is not None and len(buffer) < MIN_BUFFER:
                 action = torch.tensor(env.action_space.sample() * 0.1, dtype=torch.float32)
             else:
-                # noise_scale = max(0.01, 0.1 * (1 - episode / NUM_EPISODES))
+                # noise_scale = max(0.0, 0.1 * (1 - episode / NUM_EPISODES / 20))
                 action = actor(state_nn).detach()
                 # action += torch.tensor(np.random.normal(0, noise_scale, size=action.shape), dtype=torch.float32)
                 # action = action.clamp(-env.max_dv, env.max_dv)
@@ -175,6 +174,7 @@ def main():
             total_r_pos   += info["reward_pos"]
             total_r_fuel  += info["reward_fuel"]
             total_r_terminal  += info["reward_terminal"]
+            total_r_milestone += info["reward_milestone"] 
             if info["docked"]:
                 docked = True
 
@@ -286,11 +286,10 @@ def main():
             avg_r_pos_total  = np.mean(episode_r_pos_totals[-LOG_EVERY:])
             avg_r_fuel_total = np.mean(episode_r_fuel_totals[-LOG_EVERY:])
             print(f"{episode:>6} | {n:>5} | {total_reward:>9.2f} | {avg_r_pos_total:>8.2f} | "
-                f"{avg_r_fuel_total:>8.2f} | {total_r_terminal:>8.2f} | {total_delta_v:>7.3f} | "
+                f"{avg_r_fuel_total:>8.2f} | {total_r_terminal:>8.2f} | {total_r_milestone:>8.2f} | {total_delta_v:>7.3f} | "
                 f"{avg_critic_loss:>9.4f} | {avg_actor_loss:>9.4f} | "
                 f"{total_J/n:>8.3f} | {dock_rate:>5.1f}% | "
                 f"{1000 * episode_seconds / n:>8.2f}")
-
         if (episode + 1) % LOG_EVERY == 0:
             episode_tag = f"ep_{episode + 1:04d}"
             traj_path   = tmp_dir / f"{episode_tag}.png"

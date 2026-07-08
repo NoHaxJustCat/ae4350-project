@@ -119,6 +119,8 @@ class CWRendezvousEnv(gym.Env):
         # --- Curriculum ---
         self.curriculum_enabled = curriculum_enabled
         self.curriculum_increment = curriculum_increment
+        self._dock_streak = 0
+        self.curriculum_advance_threshold = 3  # require 3 consecutive docks
 
         # Build initial state from constants (always a 6-D spec; we slice below)
         base_pos_full = np.asarray(ENV_INITIAL_STATE_VBAR[0:3], dtype=np.float64)
@@ -217,6 +219,7 @@ class CWRendezvousEnv(gym.Env):
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
 
+
         if self.curriculum_enabled:
             self.state = self._initial_state_for_curriculum()
             self.excursion_limit = min(
@@ -242,6 +245,7 @@ class CWRendezvousEnv(gym.Env):
         self.elapsed_time    = 0.0
         self.dv_used         = 0.0
         self.curriculum_advanced = False   # ← add this
+        self.episode_curriculum_distance = self.curriculum_distance  # ← add this
 
         observation = self._build_observation()
         info = {"curriculum_distance": self.curriculum_distance}
@@ -283,7 +287,10 @@ class CWRendezvousEnv(gym.Env):
         truncated  = bool(timeout)
 
         if docked:
-            self._advance_curriculum()
+            self._dock_streak += 1
+            if self._dock_streak >= self.curriculum_advance_threshold:
+                self._advance_curriculum()
+                self._dock_streak = 0
 
         # --- Reward ---
         reward_pos  = ENV_SHAPING_COEFF * delta / self.curriculum_distance
@@ -298,7 +305,14 @@ class CWRendezvousEnv(gym.Env):
         else:
             reward_terminal = 0.0
 
-        reward = reward_pos + reward_fuel + reward_terminal
+        if pos_error < self.best_distance:
+            improvement = self.best_distance - pos_error
+            reward_milestone = ENV_SHAPING_COEFF * improvement / self.episode_curriculum_distance
+            self.best_distance = pos_error
+        else:
+            reward_milestone = 0.0
+
+        reward = reward_pos + reward_fuel + reward_terminal + reward_milestone
 
         observation = self._build_observation()
         info = {
@@ -307,6 +321,7 @@ class CWRendezvousEnv(gym.Env):
             "reward_pos":      reward_pos,
             "reward_fuel":     reward_fuel,
             "reward_terminal": reward_terminal,
+            "reward_milestone":reward_milestone, 
             "vel_error":       vel_error,
             "delta_v":         np.linalg.norm(action),
             "applied_action":  action.copy(),
