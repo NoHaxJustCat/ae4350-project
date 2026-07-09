@@ -6,6 +6,7 @@ from libs.constants import (
     ENV_BONUS,
     ENV_BOUNDARY,
     ENV_DT,
+    ENV_FUEL_COEFF,
     ENV_MAX_DV,
     ENV_POS_TOLERANCE,
     ENV_TIMEOUT,
@@ -72,12 +73,16 @@ class CWRendezvousEnv(gym.Env):
         2-D : [dvx, dvz]   (2-dim)
         3-D : [dvx, dvy, dvz]   (3-dim)
 
-    Reward is intentionally barebones: dense distance-shaping every step
-    plus a docking bonus, nothing else. No fuel penalty and no milestone
-    bookkeeping — those were the source of repeated reward-exploit
-    debugging (fast-burn-to-ceiling loops, reward discontinuities). Fuel
-    efficiency is judged at eval time against the classical reference Δv
-    formulas (libs/reference.py) instead of being trained into the reward.
+    Reward is intentionally barebones: dense distance-shaping every step,
+    a docking bonus, and a plain per-step fuel cost — nothing else. No
+    milestone bookkeeping, no dv ceiling/truncation tied to fuel, no malus
+    — those were the source of repeated reward-exploit debugging
+    (fast-burn-to-ceiling loops, reward discontinuities). ENV_FUEL_COEFF is
+    sized small on purpose (see constants.py): a barebones no-fuel-penalty
+    run reached 90-100% dock rate while burning ~50 m/s per episode
+    (~4000x the classical reference optimum), so the coefficient only needs
+    to be large enough to bias the policy toward spending less, never large
+    enough to make failing to dock look better than a wasteful dock.
 
     Scenario (2-D only, selects the initial-condition family; see
     CLAUDE.md goals 1 & 2). Sign/quadrant is randomized every reset() so a
@@ -96,6 +101,7 @@ class CWRendezvousEnv(gym.Env):
         timeout: float = ENV_TIMEOUT,
         pos_tolerance: float = ENV_POS_TOLERANCE,
         vel_coeff: float = ENV_VEL_COEFF,
+        fuel_coeff: float = ENV_FUEL_COEFF,
         bonus: float = ENV_BONUS,
         scenario: str = SCENARIO,
         curriculum_enabled: bool = ENV_CURRICULUM_ENABLED,
@@ -127,6 +133,7 @@ class CWRendezvousEnv(gym.Env):
         self.timeout = timeout
         self.pos_tolerance = pos_tolerance
         self.vel_coeff = vel_coeff
+        self.fuel_coeff = fuel_coeff
         self.bonus = bonus
 
         # --- Curriculum ---
@@ -240,10 +247,12 @@ class CWRendezvousEnv(gym.Env):
         terminated = bool(docked or out_of_bounds)
         truncated  = bool(timeout)
 
-        # --- Reward: dense distance-shaping + docking bonus, nothing else.
+        # --- Reward: dense distance-shaping + docking bonus + a plain,
+        # smooth per-step fuel cost. No ceiling, no truncation tied to it.
         reward_pos      = ENV_SHAPING_COEFF * delta / self.curriculum_distance
+        reward_fuel     = -self.fuel_coeff * np.linalg.norm(action)
         reward_terminal = (self.bonus - self.vel_coeff * vel_error) if docked else 0.0
-        reward = reward_pos + reward_terminal
+        reward = reward_pos + reward_fuel + reward_terminal
 
         observation = self._build_observation()
         info = {
@@ -251,6 +260,7 @@ class CWRendezvousEnv(gym.Env):
             "distance":        pos_error,
             "docked":          docked,
             "reward_pos":      reward_pos,
+            "reward_fuel":     reward_fuel,
             "reward_terminal": reward_terminal,
             "vel_error":       vel_error,
             "delta_v":         np.linalg.norm(action),

@@ -219,12 +219,18 @@ class CurriculumCallback(BaseCallback):
     Advance-only used to be a trap: with no way back down, a stage the
     current policy genuinely can't clear yet (dock rate stuck under
     threshold, e.g. the cur_d=35 stall) freezes curriculum_distance for the
-    rest of the run — the remaining timestep budget trains on a plateaued
-    stage instead of ever making further progress. If `stall_patience`
-    episodes pass with the dock rate never clearing the threshold (so no
-    advance fires), distance now steps back down by one increment instead,
-    letting the policy consolidate at an easier stage and re-attempt the
-    climb rather than sitting wedged.
+    rest of the run. If `stall_patience` consecutive full windows come in
+    below the dock-rate threshold, distance now steps back down by one
+    increment instead, letting the policy consolidate at an easier stage.
+
+    Keyed off the dock rate of each completed window, NOT "episodes since
+    the last advance" — an earlier version used the latter and had a bug:
+    once curriculum_distance reached max_distance, the advance branch's own
+    guard (distance < max_distance) permanently blocked it from firing, so
+    its counter reset never happened again and it force-regressed after 60
+    episodes regardless of dock rate — including at a sustained 100% dock
+    rate, since "stalled" and "already at the ceiling with nothing left to
+    advance to" aren't the same thing.
     """
 
     def __init__(self, n_envs: int, increment: float, max_distance: float,
@@ -236,10 +242,10 @@ class CurriculumCallback(BaseCallback):
         self.max_distance = max_distance
         self.min_distance = min_distance
         self.dock_rate_threshold = dock_rate_threshold
-        self.stall_patience_episodes = stall_patience * window
+        self.stall_patience = stall_patience
         self._recent_docks = deque(maxlen=window)
         self.curriculum_distance = None
-        self._episodes_since_change = 0
+        self._stalled_windows = 0
 
     def _on_training_start(self) -> None:
         self.curriculum_distance = self.training_env.get_attr("curriculum_distance")[0]
@@ -258,25 +264,28 @@ class CurriculumCallback(BaseCallback):
         for i in range(self.n_envs):
             if dones[i]:
                 self._recent_docks.append(bool(infos[i].get("docked", False)))
-                self._episodes_since_change += 1
 
-        ready = len(self._recent_docks) == self._recent_docks.maxlen
-        if (ready and np.mean(self._recent_docks) >= self.dock_rate_threshold
-                and self.curriculum_distance < self.max_distance):
-            self.curriculum_distance = min(self.curriculum_distance + self.increment, self.max_distance)
-            self.training_env.env_method("set_curriculum_distance", self.curriculum_distance)
+        if len(self._recent_docks) < self._recent_docks.maxlen:
+            return True
+
+        dock_rate = np.mean(self._recent_docks)
+        if dock_rate >= self.dock_rate_threshold:
+            self._stalled_windows = 0
+            if self.curriculum_distance < self.max_distance:
+                self.curriculum_distance = min(self.curriculum_distance + self.increment, self.max_distance)
+                self.training_env.env_method("set_curriculum_distance", self.curriculum_distance)
+                print(f"[curriculum] dock rate >= {self.dock_rate_threshold:.0%} -> "
+                      f"advancing to {self.curriculum_distance:.1f} m")
             self._recent_docks.clear()
-            self._episodes_since_change = 0
-            print(f"[curriculum] dock rate >= {self.dock_rate_threshold:.0%} -> "
-                  f"advancing to {self.curriculum_distance:.1f} m")
-        elif (self._episodes_since_change >= self.stall_patience_episodes
-                and self.curriculum_distance > self.min_distance):
-            self.curriculum_distance = max(self.curriculum_distance - self.increment, self.min_distance)
-            self.training_env.env_method("set_curriculum_distance", self.curriculum_distance)
+        else:
+            self._stalled_windows += 1
+            if self._stalled_windows >= self.stall_patience and self.curriculum_distance > self.min_distance:
+                self.curriculum_distance = max(self.curriculum_distance - self.increment, self.min_distance)
+                self.training_env.env_method("set_curriculum_distance", self.curriculum_distance)
+                print(f"[curriculum] dock rate < {self.dock_rate_threshold:.0%} for "
+                      f"{self.stall_patience} windows -> regressing to {self.curriculum_distance:.1f} m")
+                self._stalled_windows = 0
             self._recent_docks.clear()
-            self._episodes_since_change = 0
-            print(f"[curriculum] stalled for {self.stall_patience_episodes} episodes -> "
-                  f"regressing to {self.curriculum_distance:.1f} m")
         return True
 
 

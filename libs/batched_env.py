@@ -52,6 +52,7 @@ from libs.constants import (
     ENV_CURRICULUM_MAX_DISTANCE,
     ENV_CURRICULUM_START_DISTANCE,
     ENV_DT,
+    ENV_FUEL_COEFF,
     ENV_MAX_DV,
     ENV_POS_TOLERANCE,
     ENV_SHAPING_COEFF,
@@ -84,6 +85,7 @@ class BatchedCWVecEnv(VecEnv):
         timeout: float = ENV_TIMEOUT,
         pos_tolerance: float = ENV_POS_TOLERANCE,
         vel_coeff: float = ENV_VEL_COEFF,
+        fuel_coeff: float = ENV_FUEL_COEFF,
         bonus: float = ENV_BONUS,
         curriculum_enabled: bool = ENV_CURRICULUM_ENABLED,
         curriculum_start_distance: float = ENV_CURRICULUM_START_DISTANCE,
@@ -110,6 +112,7 @@ class BatchedCWVecEnv(VecEnv):
         self.timeout = timeout
         self.pos_tolerance = pos_tolerance
         self.vel_coeff = vel_coeff
+        self.fuel_coeff = fuel_coeff
         self.bonus = bonus
 
         self.curriculum_enabled = curriculum_enabled
@@ -254,10 +257,12 @@ class BatchedCWVecEnv(VecEnv):
         truncated = timeout
 
         # --- reward (verbatim from CWRendezvousEnv.step): dense
-        # distance-shaping + docking bonus, nothing else.
+        # distance-shaping + docking bonus + a plain, smooth per-step fuel
+        # cost. No ceiling, no truncation tied to it.
         reward_pos = ENV_SHAPING_COEFF * delta / self.curriculum_distance
+        reward_fuel = -self.fuel_coeff * dv_norm
         reward_terminal = np.where(docked, self.bonus - self.vel_coeff * vel_error, 0.0)
-        reward = reward_pos + reward_terminal
+        reward = reward_pos + reward_fuel + reward_terminal
         dones = terminated | truncated
 
         # Monitor accounting (float64 running sum == Monitor's sum of floats).
@@ -273,6 +278,7 @@ class BatchedCWVecEnv(VecEnv):
         dist_l = pos_error.tolist()
         dock_l = docked.tolist()
         rpos_l = reward_pos.tolist()
+        rfuel_l = reward_fuel.tolist()
         rterm_l = reward_terminal.tolist()
         verr_l = vel_error.tolist()
         dvn_l = dv_norm.tolist()
@@ -288,6 +294,7 @@ class BatchedCWVecEnv(VecEnv):
                 "distance": dist_l[i],
                 "docked": dock_l[i],
                 "reward_pos": rpos_l[i],
+                "reward_fuel": rfuel_l[i],
                 "reward_terminal": rterm_l[i],
                 "vel_error": verr_l[i],
                 "delta_v": dvn_l[i],

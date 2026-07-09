@@ -24,6 +24,18 @@ ENV_POS_TOLERANCE = 1.0
 ENV_VEL_COEFF = 10.0
 ENV_SHAPING_COEFF = 10.0
 ENV_BONUS = 50.0
+# Fuel penalty coefficient — plain per-step cost (-fuel_coeff * ||action||),
+# nothing else attached to it (no ceiling, no truncation, no malus; those
+# combinations were the actual source of every reward exploit found this
+# project). Sized from measurement, not guesswork: a barebones
+# no-fuel-penalty run reached 90-100% dock rate while burning ~50 m/s per
+# episode (vs. a ~0.0115 m/s classical-reference optimum at 100 m — ~4000x
+# over). At this coefficient that habit costs -5 against a +50 dock bonus
+# (still clearly profitable, won't crater dock rate), while cost at the
+# reference optimum is ~0.001 (negligible, doesn't block the policy from
+# approaching it). Re-derive from the diagnostics r_fuel/dv trend if dock
+# rate drops after enabling this — it means the coefficient is too high.
+ENV_FUEL_COEFF = 0.1
 
 # Physical per-burn actuator cap (m/s). Independent of any fuel budget —
 # sized to comfortably cover a single optimal impulse for the largest

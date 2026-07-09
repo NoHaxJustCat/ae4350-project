@@ -1,9 +1,9 @@
 """
 Exploits the exact mirror symmetry of the CW rendezvous MDP.
 
-CW dynamics are linear and every reward term (reward_pos, reward_terminal)
-is built from norms / abs() values, so the whole MDP is invariant under the
-joint transform:
+CW dynamics are linear and every reward term (reward_pos, reward_fuel,
+reward_terminal) is built from norms / abs() values, so the whole MDP is
+invariant under the joint transform:
     (position, velocity, action) -> -(position, velocity, action)
 (dv_used is a scalar magnitude and is left untouched by the mirror.)
 
