@@ -85,7 +85,7 @@ conda activate "$CONDA_ENV"
 # install deps
 echo "[setup] Installing Python packages..."
 pip install --upgrade pip
-pip install torch numpy matplotlib "gymnasium[classic-control]" scipy
+pip install stable_baselines3 torch numpy matplotlib "gymnasium[classic-control]" scipy
 
 for req in "$REMOTE_DIR/requirements.txt" "$REMOTE_DIR/libs/requirements.txt"; do
     if [ -f "$req" ]; then

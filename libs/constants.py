@@ -31,14 +31,14 @@ ENV_MAX_DV = ENV_DV_BUDGET/2
 ENV_CURRICULUM_ENABLED = True
 ENV_CURRICULUM_START_DISTANCE = 10.0   # starting distance [m]
 ENV_CURRICULUM_MAX_DISTANCE = 100.0    # final distance [m] (matches ENV_INITIAL_STATE_VBAR norm)
-ENV_CURRICULUM_INCREMENT = 2.0         # distance added per successful dock [m]
+ENV_CURRICULUM_INCREMENT = 5.0         # distance added per successful dock [m]
 
 # --- Training defaults ---
 GAMMA = 0.97
 NUM_EPISODES = 50000
 MAX_STEPS = int(ENV_TIMEOUT/ENV_DT) + 1
 ACTOR_LR = 1e-4
-CRITIC_LR = 1e-3
+CRITIC_LR = 1e-4
 GRAD_CLIP_NORM = 1.0
 LOG_EVERY = 10
 TAU = 0.005  # soft update rate — add to constants.py
