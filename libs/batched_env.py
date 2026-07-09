@@ -33,8 +33,6 @@ fraction of the win and this keeps every existing consumer untouched.
 Curriculum: curriculum_distance is ONE shared python float here (no per-row
 copy to drift), so CurriculumCallback's
 env_method("set_curriculum_distance", d) is a single attribute write.
-episode_curriculum_distance stays per-row (frozen at each row's reset),
-matching the single env.
 """
 
 import time
@@ -54,15 +52,11 @@ from libs.constants import (
     ENV_CURRICULUM_MAX_DISTANCE,
     ENV_CURRICULUM_START_DISTANCE,
     ENV_DT,
-    ENV_DV_CEILING_FLOOR,
-    ENV_DV_CEILING_MULT,
-    ENV_FUEL_COEFF,
     ENV_MAX_DV,
     ENV_POS_TOLERANCE,
     ENV_SHAPING_COEFF,
     ENV_TIMEOUT,
     ENV_VEL_COEFF,
-    ENV_VEL_TOLERANCE,
     MODE_2D,
     OBS_DIM,
     OMEGA,
@@ -72,7 +66,6 @@ from libs.constants import (
 )
 from libs.env import _build_stm_2d
 from libs.normalization import STATE_SCALE, NormalizedObsEnv
-from libs.reference import reference_dv_for_scenario
 from libs.symmetry import CanonicalizeDirectionEnv
 
 
@@ -90,12 +83,8 @@ class BatchedCWVecEnv(VecEnv):
         boundary: float = ENV_BOUNDARY,
         timeout: float = ENV_TIMEOUT,
         pos_tolerance: float = ENV_POS_TOLERANCE,
-        vel_tolerance: float = ENV_VEL_TOLERANCE,
         vel_coeff: float = ENV_VEL_COEFF,
-        fuel_coeff: float = ENV_FUEL_COEFF,
         bonus: float = ENV_BONUS,
-        dv_ceiling_mult: float = ENV_DV_CEILING_MULT,
-        dv_ceiling_floor: float = ENV_DV_CEILING_FLOOR,
         curriculum_enabled: bool = ENV_CURRICULUM_ENABLED,
         curriculum_start_distance: float = ENV_CURRICULUM_START_DISTANCE,
         curriculum_max_distance: float = ENV_CURRICULUM_MAX_DISTANCE,
@@ -120,12 +109,8 @@ class BatchedCWVecEnv(VecEnv):
         self.curriculum_boundary_mult = curriculum_boundary_mult
         self.timeout = timeout
         self.pos_tolerance = pos_tolerance
-        self.vel_tolerance = vel_tolerance
         self.vel_coeff = vel_coeff
-        self.fuel_coeff = fuel_coeff
         self.bonus = bonus
-        self.dv_ceiling_mult = dv_ceiling_mult
-        self.dv_ceiling_floor = dv_ceiling_floor
 
         self.curriculum_enabled = curriculum_enabled
         self.curriculum_increment = curriculum_increment
@@ -154,14 +139,8 @@ class BatchedCWVecEnv(VecEnv):
         # --- batched physical + per-episode state (row i == env i) ---
         self.states = np.zeros((n, self.phys_dim), dtype=np.float64)
         self.dv_used = np.zeros(n, dtype=np.float64)
-        self.step_count = np.zeros(n, dtype=np.int64)
         self.elapsed_time = np.zeros(n, dtype=np.float64)
-        self.start_distance = np.zeros(n, dtype=np.float64)
-        self.best_distance = np.zeros(n, dtype=np.float64)
-        self.worst_distance = np.zeros(n, dtype=np.float64)
-        self.episode_curriculum_distance = np.full(n, self.curriculum_distance)
         self.excursion_limit = np.full(n, boundary, dtype=np.float64)
-        self.dv_ceiling = np.zeros(n, dtype=np.float64)
         self._forced_sign = np.full(n, np.nan)  # nan = sample randomly
 
         # CanonicalizeDirectionEnv state: which rows are currently mirrored.
@@ -208,22 +187,11 @@ class BatchedCWVecEnv(VecEnv):
             self.states[i, : self.half] = pos
             self.states[i, self.half:] = 0.0
 
-            sd = np.linalg.norm(pos)
-            self.start_distance[i] = sd
-            self.best_distance[i] = sd
-            self.worst_distance[i] = sd
-
-            dx, dz = abs(self.states[i, 0]), abs(self.states[i, 1])
-            ref_dv = reference_dv_for_scenario(self.scenario, dx, dz, self.omega)
-            self.dv_ceiling[i] = max(self.dv_ceiling_mult * ref_dv, self.dv_ceiling_floor)
-
         self.excursion_limit[idx] = min(
             self.base_boundary, cd * self.curriculum_boundary_mult
         )
-        self.step_count[idx] = 0
         self.elapsed_time[idx] = 0.0
         self.dv_used[idx] = 0.0
-        self.episode_curriculum_distance[idx] = cd
         self._ep_rew[idx] = 0.0
         self._ep_len[idx] = 0
 
@@ -266,7 +234,6 @@ class BatchedCWVecEnv(VecEnv):
         real = np.clip(real, -self.max_dv, self.max_dv)
 
         # --- physics + bookkeeping (verbatim from CWRendezvousEnv.step) ---
-        self.step_count += 1
         dv_norm = np.linalg.norm(real, axis=1)
         self.dv_used += dv_norm
 
@@ -277,57 +244,20 @@ class BatchedCWVecEnv(VecEnv):
 
         pos_error = np.linalg.norm(self.states[:, : self.half], axis=1)
         vel_error = np.linalg.norm(self.states[:, self.half:], axis=1)
-        excursion = pos_error
 
         docked = pos_error < self.pos_tolerance
-        out_of_bounds = excursion > self.excursion_limit
+        out_of_bounds = pos_error > self.excursion_limit
         timeout = self.elapsed_time > self.timeout
-        dv_ceiling_hit = (~docked) & (self.dv_used > self.dv_ceiling)
 
         delta = prev_pos_error - pos_error
         terminated = docked | out_of_bounds
-        truncated = timeout | dv_ceiling_hit
+        truncated = timeout
 
-        # --- reward (verbatim from CWRendezvousEnv.step) ---
+        # --- reward (verbatim from CWRendezvousEnv.step): dense
+        # distance-shaping + docking bonus, nothing else.
         reward_pos = ENV_SHAPING_COEFF * delta / self.curriculum_distance
-        reward_fuel = -self.fuel_coeff * dv_norm
-
-        reward_terminal = np.where(
-            docked,
-            self.bonus - self.vel_coeff * vel_error,
-            np.where(
-                out_of_bounds,
-                0.0,
-                np.where(
-                    truncated,
-                    -ENV_SHAPING_COEFF * (self.excursion_limit - pos_error)
-                    / self.curriculum_distance,
-                    0.0,
-                ),
-            ),
-        )
-
-        np.maximum(self.worst_distance, pos_error, out=self.worst_distance)
-
-        improved = pos_error < self.best_distance
-        never_improved_at_end = (
-            (terminated | truncated) & ~improved
-            & (self.best_distance >= self.start_distance)
-        )
-        reward_milestone = np.where(
-            improved,
-            ENV_SHAPING_COEFF * (self.best_distance - pos_error)
-            / self.episode_curriculum_distance,
-            np.where(
-                never_improved_at_end,
-                -ENV_SHAPING_COEFF * (self.worst_distance - self.start_distance)
-                / self.episode_curriculum_distance,
-                0.0,
-            ),
-        )
-        self.best_distance = np.where(improved, pos_error, self.best_distance)
-
-        reward = reward_pos + reward_fuel + reward_terminal + reward_milestone
+        reward_terminal = np.where(docked, self.bonus - self.vel_coeff * vel_error, 0.0)
+        reward = reward_pos + reward_terminal
         dones = terminated | truncated
 
         # Monitor accounting (float64 running sum == Monitor's sum of floats).
@@ -343,15 +273,10 @@ class BatchedCWVecEnv(VecEnv):
         dist_l = pos_error.tolist()
         dock_l = docked.tolist()
         rpos_l = reward_pos.tolist()
-        rfuel_l = reward_fuel.tolist()
         rterm_l = reward_terminal.tolist()
-        rmile_l = reward_milestone.tolist()
         verr_l = vel_error.tolist()
         dvn_l = dv_norm.tolist()
         dvu_l = self.dv_used.tolist()
-        dvc_l = self.dv_ceiling.tolist()
-        dvhit_l = dv_ceiling_hit.tolist()
-        exc_l = excursion.tolist()
         exlim_l = self.excursion_limit.tolist()
         term_l = terminated.tolist()
         trunc_l = truncated.tolist()
@@ -363,17 +288,12 @@ class BatchedCWVecEnv(VecEnv):
                 "distance": dist_l[i],
                 "docked": dock_l[i],
                 "reward_pos": rpos_l[i],
-                "reward_fuel": rfuel_l[i],
                 "reward_terminal": rterm_l[i],
-                "reward_milestone": rmile_l[i],
                 "vel_error": verr_l[i],
                 "delta_v": dvn_l[i],
                 "applied_action": real_copy[i],
                 "dv_used": dvu_l[i],
-                "dv_ceiling": dvc_l[i],
-                "dv_ceiling_hit": dvhit_l[i],
                 "curriculum_distance": cd,
-                "excursion": exc_l[i],
                 "excursion_limit": exlim_l[i],
                 "TimeLimit.truncated": trunc_l[i] and not term_l[i],
             }

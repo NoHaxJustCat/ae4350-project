@@ -6,16 +6,12 @@ from libs.constants import (
     ENV_BONUS,
     ENV_BOUNDARY,
     ENV_DT,
-    ENV_FUEL_COEFF,
     ENV_MAX_DV,
     ENV_POS_TOLERANCE,
     ENV_TIMEOUT,
     ENV_VEL_COEFF,
-    ENV_VEL_TOLERANCE,
     ENV_SHAPING_COEFF,
     OMEGA,
-    ENV_DV_CEILING_MULT,
-    ENV_DV_CEILING_FLOOR,
     ENV_CURRICULUM_ENABLED,
     ENV_CURRICULUM_START_DISTANCE,
     ENV_CURRICULUM_MAX_DISTANCE,
@@ -27,9 +23,7 @@ from libs.constants import (
     PHYS_STATE_DIM,
     OBS_DIM,
 )
-from libs.reference import reference_dv_for_scenario
 from scipy.linalg import expm
-import torch
 
 
 # ---------------------------------------------------------------------------
@@ -70,14 +64,20 @@ class CWRendezvousEnv(gym.Env):
     2-D state  : [x, z, ẋ, ż]           — V-bar / R-bar only (y = ẏ = 0)
     3-D state  : [x, y, z, ẋ, ẏ, ż]
 
-    Observation appends cumulative Δv used so far so the policy can
-    condition on how much fuel it has already spent:
+    Observation appends cumulative Δv used so far:
         2-D obs : [x, z, ẋ, ż, dv_used]           (5-dim)
         3-D obs : [x, y, z, ẋ, ẏ, ż, dv_used]     (7-dim)
 
     Action:
         2-D : [dvx, dvz]   (2-dim)
         3-D : [dvx, dvy, dvz]   (3-dim)
+
+    Reward is intentionally barebones: dense distance-shaping every step
+    plus a docking bonus, nothing else. No fuel penalty and no milestone
+    bookkeeping — those were the source of repeated reward-exploit
+    debugging (fast-burn-to-ceiling loops, reward discontinuities). Fuel
+    efficiency is judged at eval time against the classical reference Δv
+    formulas (libs/reference.py) instead of being trained into the reward.
 
     Scenario (2-D only, selects the initial-condition family; see
     CLAUDE.md goals 1 & 2). Sign/quadrant is randomized every reset() so a
@@ -95,13 +95,9 @@ class CWRendezvousEnv(gym.Env):
         boundary: float = ENV_BOUNDARY,
         timeout: float = ENV_TIMEOUT,
         pos_tolerance: float = ENV_POS_TOLERANCE,
-        vel_tolerance: float = ENV_VEL_TOLERANCE,
         vel_coeff: float = ENV_VEL_COEFF,
-        fuel_coeff: float = ENV_FUEL_COEFF,
         bonus: float = ENV_BONUS,
         scenario: str = SCENARIO,
-        dv_ceiling_mult: float = ENV_DV_CEILING_MULT,
-        dv_ceiling_floor: float = ENV_DV_CEILING_FLOOR,
         curriculum_enabled: bool = ENV_CURRICULUM_ENABLED,
         curriculum_start_distance: float = ENV_CURRICULUM_START_DISTANCE,
         curriculum_max_distance: float = ENV_CURRICULUM_MAX_DISTANCE,
@@ -130,12 +126,8 @@ class CWRendezvousEnv(gym.Env):
         self.curriculum_boundary_mult = curriculum_boundary_mult
         self.timeout = timeout
         self.pos_tolerance = pos_tolerance
-        self.vel_tolerance = vel_tolerance
         self.vel_coeff = vel_coeff
-        self.fuel_coeff = fuel_coeff
         self.bonus = bonus
-        self.dv_ceiling_mult = dv_ceiling_mult
-        self.dv_ceiling_floor = dv_ceiling_floor
 
         # --- Curriculum ---
         # NOTE: this env does NOT self-advance the curriculum anymore. With
@@ -156,13 +148,9 @@ class CWRendezvousEnv(gym.Env):
 
         # --- State Transition Matrix ---
         if self.mode_2d:
-            stm_np = _build_stm_2d(omega, dt)
+            self.STM_np = _build_stm_2d(omega, dt)
         else:
-            stm_np = _build_stm_full(omega, dt)
-
-        self.STM_np = stm_np
-        self.STM    = torch.tensor(stm_np, dtype=torch.float32)
-        self.STM_T  = self.STM.t().contiguous()
+            self.STM_np = _build_stm_full(omega, dt)
 
         # --- Gym spaces ---
         self.observation_space = spaces.Box(
@@ -174,23 +162,6 @@ class CWRendezvousEnv(gym.Env):
 
         self.state = None
         self._forced_sign = None
-
-    # ── Torch helpers ────────────────────────────────────────────────────────
-
-    def _ensure_stm(self, device, dtype):
-        if self.STM.device != device or self.STM.dtype != dtype:
-            self.STM   = self.STM.to(device=device, dtype=dtype)
-            self.STM_T = self.STM.t().contiguous()
-
-    def propagate_torch(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """Propagate the PHYSICAL state (4-dim 2D, 6-dim 3D) only.
-        Strip the obs dv_used column before calling."""
-        self._ensure_stm(state.device, state.dtype)
-        # velocity indices: last half of physical state
-        half = self.phys_dim // 2
-        v_new = state[..., half:] + action
-        s0 = torch.cat([state[..., :half], v_new], dim=-1)
-        return torch.nn.functional.linear(s0, self.STM_T)
 
     # ── Initial-condition sampling ───────────────────────────────────────────
 
@@ -239,29 +210,14 @@ class CWRendezvousEnv(gym.Env):
             self.base_boundary,
             self.curriculum_distance * self.curriculum_boundary_mult,
         )
-
-        # Position part is the first half of the physical state
-        half = self.phys_dim // 2
-        self.start_pos = self.state[:half].copy()
-
-        self.start_distance  = np.linalg.norm(self.state[:half])
-        self.best_distance   = self.start_distance
-        self.worst_distance  = self.start_distance
-        self.step_count      = 0
-        self.elapsed_time    = 0.0
-        self.dv_used         = 0.0
-        self.episode_curriculum_distance = self.curriculum_distance
-
-        dx, dz = (abs(self.state[0]), abs(self.state[1])) if self.mode_2d else (abs(self.state[0]), 0.0)
-        ref_dv = reference_dv_for_scenario(self.scenario, dx, dz, self.omega)
-        self.dv_ceiling = max(self.dv_ceiling_mult * ref_dv, self.dv_ceiling_floor)
+        self.elapsed_time = 0.0
+        self.dv_used      = 0.0
 
         observation = self._build_observation()
         info = {"curriculum_distance": self.curriculum_distance}
         return observation, info
 
     def step(self, action: np.ndarray):
-        self.step_count += 1
         action = np.clip(action, -self.max_dv, self.max_dv)
         self.dv_used += np.linalg.norm(action)
 
@@ -273,66 +229,21 @@ class CWRendezvousEnv(gym.Env):
         self.state = self.STM_np @ self.state
         self.elapsed_time += self.dt
 
-        pos_error  = np.linalg.norm(self.state[:half])
-        vel_error  = np.linalg.norm(self.state[half:])
-        excursion  = pos_error
+        pos_error = np.linalg.norm(self.state[:half])
+        vel_error = np.linalg.norm(self.state[half:])
 
-        docked          = pos_error < self.pos_tolerance
-        out_of_bounds   = excursion > self.excursion_limit
-        timeout         = self.elapsed_time > self.timeout
-        # Soft safety valve (NOT a hard action clip): once an episode has
-        # burned far more Δv than any sane strategy would need and still
-        # hasn't docked, stop wasting steps on it. Generous multiple/floor
-        # (see constants.py) means this never fires on a competent — even
-        # somewhat wasteful — trajectory.
-        dv_ceiling_hit  = (not docked) and (self.dv_used > self.dv_ceiling)
+        docked        = pos_error < self.pos_tolerance
+        out_of_bounds = pos_error > self.excursion_limit
+        timeout       = self.elapsed_time > self.timeout
 
         delta      = prev_pos_error - pos_error
         terminated = bool(docked or out_of_bounds)
-        truncated  = bool(timeout or dv_ceiling_hit)
+        truncated  = bool(timeout)
 
-        # --- Reward ---
-        reward_pos  = ENV_SHAPING_COEFF * delta / self.curriculum_distance
-        reward_fuel = -self.fuel_coeff * np.linalg.norm(action)
-
-        if docked:
-            reward_terminal = self.bonus - self.vel_coeff * vel_error
-        elif out_of_bounds:
-            reward_terminal = 0.0
-        elif truncated:  # penalize so the agent can't "hide" by running out the clock / burning wastefully
-            reward_terminal = -ENV_SHAPING_COEFF * (self.excursion_limit - pos_error) / self.curriculum_distance
-        else:
-            reward_terminal = 0.0
-
-        if pos_error > self.worst_distance:
-            self.worst_distance = pos_error
-
-        if pos_error < self.best_distance:
-            improvement = self.best_distance - pos_error
-            reward_milestone = ENV_SHAPING_COEFF * improvement / self.episode_curriculum_distance
-            self.best_distance = pos_error
-        elif (terminated or truncated) and self.best_distance >= self.start_distance:
-            # Never once improved on the starting distance this whole
-            # episode (mid-episode excursions away from the target are NOT
-            # penalized — only fires at the terminal step, so a trajectory
-            # that legitimately needs to move away first before it can
-            # approach is untouched as long as it improves on start_distance
-            # by the end). A prior version also charged the worst-case value
-            # of this malus to reward_fuel whenever dv_ceiling_hit fired —
-            # reverted: it created a hard reward discontinuity right at the
-            # ceiling boundary (crossing it cost a flat extra -10 regardless
-            # of margin) that a live run got stuck straddling for hundreds of
-            # episodes at zero dock rate. This malus alone, scaling smoothly
-            # with how far it actually drifted, is the only "gave up"
-            # deterrent now.
-            reward_milestone = (
-                -ENV_SHAPING_COEFF * (self.worst_distance - self.start_distance)
-                / self.episode_curriculum_distance
-            )
-        else:
-            reward_milestone = 0.0
-
-        reward = reward_pos + reward_fuel + reward_terminal + reward_milestone
+        # --- Reward: dense distance-shaping + docking bonus, nothing else.
+        reward_pos      = ENV_SHAPING_COEFF * delta / self.curriculum_distance
+        reward_terminal = (self.bonus - self.vel_coeff * vel_error) if docked else 0.0
+        reward = reward_pos + reward_terminal
 
         observation = self._build_observation()
         info = {
@@ -340,17 +251,12 @@ class CWRendezvousEnv(gym.Env):
             "distance":        pos_error,
             "docked":          docked,
             "reward_pos":      reward_pos,
-            "reward_fuel":     reward_fuel,
             "reward_terminal": reward_terminal,
-            "reward_milestone": reward_milestone,
             "vel_error":       vel_error,
             "delta_v":         np.linalg.norm(action),
             "applied_action":  action.copy(),
             "dv_used":         self.dv_used,
-            "dv_ceiling":      self.dv_ceiling,
-            "dv_ceiling_hit":  dv_ceiling_hit,
             "curriculum_distance": self.curriculum_distance,
-            "excursion":       excursion,
             "excursion_limit": self.excursion_limit,
         }
 
