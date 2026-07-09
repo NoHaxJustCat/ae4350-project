@@ -7,7 +7,6 @@ from libs.constants import (
     ENV_BOUNDARY,
     ENV_DT,
     ENV_FUEL_COEFF,
-    ENV_INITIAL_STATE_VBAR,
     ENV_MAX_DV,
     ENV_POS_TOLERANCE,
     ENV_TIMEOUT,
@@ -15,16 +14,20 @@ from libs.constants import (
     ENV_VEL_TOLERANCE,
     ENV_SHAPING_COEFF,
     OMEGA,
-    ENV_DV_BUDGET,
+    ENV_DV_CEILING_MULT,
+    ENV_DV_CEILING_FLOOR,
     ENV_CURRICULUM_ENABLED,
     ENV_CURRICULUM_START_DISTANCE,
     ENV_CURRICULUM_MAX_DISTANCE,
     ENV_CURRICULUM_INCREMENT,
+    SCENARIO,
+    RBAR_X_TO_Z_RATIO,
     MODE_2D,
     ACTION_DIM,
     PHYS_STATE_DIM,
     OBS_DIM,
 )
+from libs.reference import reference_dv_for_scenario
 from scipy.linalg import expm
 import torch
 
@@ -67,14 +70,21 @@ class CWRendezvousEnv(gym.Env):
     2-D state  : [x, z, ẋ, ż]           — V-bar / R-bar only (y = ẏ = 0)
     3-D state  : [x, y, z, ẋ, ẏ, ż]
 
-    Observation appends the remaining Δv budget so the policy can observe
-    fuel scarcity:
-        2-D obs : [x, z, ẋ, ż, dv_remaining]           (5-dim)
-        3-D obs : [x, y, z, ẋ, ẏ, ż, dv_remaining]     (7-dim)
+    Observation appends cumulative Δv used so far so the policy can
+    condition on how much fuel it has already spent:
+        2-D obs : [x, z, ẋ, ż, dv_used]           (5-dim)
+        3-D obs : [x, y, z, ẋ, ẏ, ż, dv_used]     (7-dim)
 
     Action:
         2-D : [dvx, dvz]   (2-dim)
         3-D : [dvx, dvy, dvz]   (3-dim)
+
+    Scenario (2-D only, selects the initial-condition family; see
+    CLAUDE.md goals 1 & 2). Sign/quadrant is randomized every reset() so a
+    single model learns both directions rather than only ever seeing one:
+        "vbar" : pure V-bar displacement, x = ±distance, z = 0
+        "rbar" : coupled displacement, (x, z) = ±distance · (ratio, -1)/norm
+                 restricted to the two mirrored quadrants (+x,-z)/(-x,+z)
     """
 
     def __init__(
@@ -89,18 +99,28 @@ class CWRendezvousEnv(gym.Env):
         vel_coeff: float = ENV_VEL_COEFF,
         fuel_coeff: float = ENV_FUEL_COEFF,
         bonus: float = ENV_BONUS,
-        dv_budget: float = ENV_DV_BUDGET,
+        scenario: str = SCENARIO,
+        dv_ceiling_mult: float = ENV_DV_CEILING_MULT,
+        dv_ceiling_floor: float = ENV_DV_CEILING_FLOOR,
         curriculum_enabled: bool = ENV_CURRICULUM_ENABLED,
         curriculum_start_distance: float = ENV_CURRICULUM_START_DISTANCE,
         curriculum_max_distance: float = ENV_CURRICULUM_MAX_DISTANCE,
         curriculum_increment: float = ENV_CURRICULUM_INCREMENT,
         curriculum_boundary_mult: float = 2.0,
+        rbar_x_to_z_ratio: float = RBAR_X_TO_Z_RATIO,
     ):
         super().__init__()
+        if scenario not in ("vbar", "rbar"):
+            raise ValueError(f"Unknown scenario: {scenario!r}")
+        if not MODE_2D and scenario == "rbar":
+            raise ValueError("scenario='rbar' is only defined for MODE_2D")
+
         self.mode_2d = MODE_2D
         self.phys_dim = PHYS_STATE_DIM   # 4 (2D) or 6 (3D)
         self.obs_dim  = OBS_DIM          # 5 (2D) or 7 (3D)
         self.action_dim = ACTION_DIM     # 2 (2D) or 3 (3D)
+        self.scenario = scenario
+        self.rbar_x_to_z_ratio = rbar_x_to_z_ratio
 
         self.omega = omega
         self.dt = dt
@@ -114,40 +134,24 @@ class CWRendezvousEnv(gym.Env):
         self.vel_coeff = vel_coeff
         self.fuel_coeff = fuel_coeff
         self.bonus = bonus
-        self.dv_budget = dv_budget
+        self.dv_ceiling_mult = dv_ceiling_mult
+        self.dv_ceiling_floor = dv_ceiling_floor
 
         # --- Curriculum ---
+        # NOTE: this env does NOT self-advance the curriculum anymore. With
+        # N parallel sub-envs each doing their own local "3 consecutive
+        # docks" count, curriculum_distance drifted out of sync across
+        # workers with no visibility into it — that's what looked like
+        # "random" spawn distances. A single authority (CurriculumCallback
+        # in training.py) now tracks dock rate across ALL envs and pushes
+        # one shared distance to every sub-env via set_curriculum_distance().
         self.curriculum_enabled = curriculum_enabled
         self.curriculum_increment = curriculum_increment
-        self._dock_streak = 0
-        self.curriculum_advance_threshold = 3  # require 3 consecutive docks
-
-        # Build initial state from constants (always a 6-D spec; we slice below)
-        base_pos_full = np.asarray(ENV_INITIAL_STATE_VBAR[0:3], dtype=np.float64)
-        if self.mode_2d:
-            # In-plane initial position: only x (V-bar) and z (R-bar) matter.
-            # ENV_INITIAL_STATE_VBAR is assumed to lie in the x-z plane (y=0).
-            base_pos_2d = np.array([base_pos_full[0], base_pos_full[2]], dtype=np.float64)
-            base_dist = np.linalg.norm(base_pos_2d)
-            self._curriculum_dir = (
-                base_pos_2d / base_dist if base_dist > 0 else np.array([1.0, 0.0])
-            )
-            base_vel_full = np.asarray(ENV_INITIAL_STATE_VBAR[3:6], dtype=np.float64)
-            self._base_velocity = np.array([base_vel_full[0], base_vel_full[2]], dtype=np.float64)
-        else:
-            base_dist = np.linalg.norm(base_pos_full)
-            self._curriculum_dir = (
-                base_pos_full / base_dist if base_dist > 0 else np.array([0.0, 1.0, 0.0])
-            )
-            self._base_velocity = np.asarray(ENV_INITIAL_STATE_VBAR[3:6], dtype=np.float64)
-
-        self.curriculum_max_distance = (
-            min(curriculum_max_distance, base_dist) if base_dist > 0 else curriculum_max_distance
-        )
+        self.curriculum_max_distance = curriculum_max_distance
         self.curriculum_distance = (
-            min(curriculum_start_distance, self.curriculum_max_distance)
-            if self.curriculum_enabled
-            else self.curriculum_max_distance
+            min(curriculum_start_distance, curriculum_max_distance)
+            if curriculum_enabled
+            else curriculum_max_distance
         )
 
         # --- State Transition Matrix ---
@@ -169,6 +173,7 @@ class CWRendezvousEnv(gym.Env):
         )
 
         self.state = None
+        self._forced_sign = None
 
     # ── Torch helpers ────────────────────────────────────────────────────────
 
@@ -179,7 +184,7 @@ class CWRendezvousEnv(gym.Env):
 
     def propagate_torch(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """Propagate the PHYSICAL state (4-dim 2D, 6-dim 3D) only.
-        Strip the obs dv_remaining column before calling."""
+        Strip the obs dv_used column before calling."""
         self._ensure_stm(state.device, state.dtype)
         # velocity indices: last half of physical state
         half = self.phys_dim // 2
@@ -187,66 +192,67 @@ class CWRendezvousEnv(gym.Env):
         s0 = torch.cat([state[..., :half], v_new], dim=-1)
         return torch.nn.functional.linear(s0, self.STM_T)
 
-    # ── Curriculum helpers ───────────────────────────────────────────────────
+    # ── Initial-condition sampling ───────────────────────────────────────────
 
-    def _initial_state_for_curriculum(self) -> np.ndarray:
-        pos = self._curriculum_dir * self.curriculum_distance
-        return np.concatenate([pos, self._base_velocity]).astype(np.float64)
+    def _sample_direction(self) -> np.ndarray:
+        """Unit direction vector for this episode's initial displacement.
+        Sign/quadrant is randomized so a single model sees both cases
+        required by CLAUDE.md goals 1 & 2, instead of always the same one.
+        Pass reset(options={"sign": +1 or -1}) to force a side for eval."""
+        if self._forced_sign is not None:
+            sign = float(self._forced_sign)
+        else:
+            sign = 1.0 if self.np_random.random() < 0.5 else -1.0
+        if self.scenario == "vbar":
+            return np.array([sign, 0.0], dtype=np.float64)
+        # "rbar": (+x,-z) or (-x,+z) — opposite-sign coupled displacement
+        raw = np.array([sign * self.rbar_x_to_z_ratio, -sign], dtype=np.float64)
+        return raw / np.linalg.norm(raw)
+
+    def _sample_initial_state(self) -> np.ndarray:
+        direction = self._sample_direction()
+        pos = direction * self.curriculum_distance
+        vel = np.zeros_like(pos)
+        return np.concatenate([pos, vel]).astype(np.float64)
 
     def set_curriculum_distance(self, distance: float):
+        """External control hook — called by training.py's CurriculumCallback
+        (via VecEnv.env_method) so every parallel sub-env shares one
+        synchronized curriculum distance instead of drifting independently."""
         self.curriculum_distance = float(
             np.clip(distance, 0.0, self.curriculum_max_distance)
         )
 
-    def _advance_curriculum(self):
-        if not self.curriculum_enabled:
-            return
-        self.curriculum_distance = min(
-            self.curriculum_distance + self.curriculum_increment,
-            self.curriculum_max_distance,
-        )
-        # Signal to training loop that buffer should be flushed
-        self.curriculum_advanced = True
-        return
-
     # ── Observation ──────────────────────────────────────────────────────────
 
     def _build_observation(self) -> np.ndarray:
-        dv_remaining = max(0.0, self.dv_budget - self.dv_used)
-        return np.concatenate([self.state, [dv_remaining]]).astype(np.float64)
+        return np.concatenate([self.state, [self.dv_used]]).astype(np.float64)
 
     # ── Gym API ──────────────────────────────────────────────────────────────
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
-        
 
-        if self.curriculum_enabled:
-            self.state = self._initial_state_for_curriculum()
-            self.excursion_limit = min(
-                self.base_boundary,
-                self.curriculum_distance * self.curriculum_boundary_mult,
-            )
-        else:
-            if self.mode_2d:
-                # Slice x, z, ẋ, ż from the full 6-D constant
-                s6 = np.asarray(ENV_INITIAL_STATE_VBAR, dtype=np.float64)
-                self.state = np.array([s6[0], s6[2], s6[3], s6[5]], dtype=np.float64)
-            else:
-                self.state = np.array(ENV_INITIAL_STATE_VBAR, dtype=np.float64)
-            self.excursion_limit = self.base_boundary
+        self._forced_sign = (options or {}).get("sign")
+        self.state = self._sample_initial_state()
+        self.excursion_limit = min(
+            self.base_boundary,
+            self.curriculum_distance * self.curriculum_boundary_mult,
+        )
 
         # Position part is the first half of the physical state
         half = self.phys_dim // 2
-        
         self.start_pos = self.state[:half].copy()
 
         self.best_distance   = np.linalg.norm(self.state[:half])
         self.step_count      = 0
         self.elapsed_time    = 0.0
         self.dv_used         = 0.0
-        self.curriculum_advanced = False   # ← add this
-        self.episode_curriculum_distance = self.curriculum_distance  # ← add this
+        self.episode_curriculum_distance = self.curriculum_distance
+
+        dx, dz = (abs(self.state[0]), abs(self.state[1])) if self.mode_2d else (abs(self.state[0]), 0.0)
+        ref_dv = reference_dv_for_scenario(self.scenario, dx, dz, self.omega)
+        self.dv_ceiling = max(self.dv_ceiling_mult * ref_dv, self.dv_ceiling_floor)
 
         observation = self._build_observation()
         info = {"curriculum_distance": self.curriculum_distance}
@@ -254,16 +260,6 @@ class CWRendezvousEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         action = np.clip(action, -self.max_dv, self.max_dv)
-
-        # Cap to remaining Δv budget
-        dv_remaining = max(0.0, self.dv_budget - self.dv_used)
-        action_norm  = np.linalg.norm(action)
-        budget_exhausted = dv_remaining <= 0.0
-        if budget_exhausted:
-            action = np.zeros_like(action)
-        elif action_norm > dv_remaining:
-            action = action * (dv_remaining / action_norm)
-
         self.dv_used += np.linalg.norm(action)
 
         half = self.phys_dim // 2
@@ -276,33 +272,32 @@ class CWRendezvousEnv(gym.Env):
 
         pos_error  = np.linalg.norm(self.state[:half])
         vel_error  = np.linalg.norm(self.state[half:])
-        # was: excursion = np.linalg.norm(self.state[:half] - self.start_pos)
-        excursion = pos_error
+        excursion  = pos_error
 
-        docked        = pos_error < self.pos_tolerance
-        out_of_bounds = excursion > self.excursion_limit
-        timeout       = self.elapsed_time > self.timeout
+        docked          = pos_error < self.pos_tolerance
+        out_of_bounds   = excursion > self.excursion_limit
+        timeout         = self.elapsed_time > self.timeout
+        # Soft safety valve (NOT a hard action clip): once an episode has
+        # burned far more Δv than any sane strategy would need and still
+        # hasn't docked, stop wasting steps on it. Generous multiple/floor
+        # (see constants.py) means this never fires on a competent — even
+        # somewhat wasteful — trajectory.
+        dv_ceiling_hit  = (not docked) and (self.dv_used > self.dv_ceiling)
 
         delta      = prev_pos_error - pos_error
         terminated = bool(docked or out_of_bounds)
-        truncated  = bool(timeout)
-
-        if docked:
-            self._dock_streak += 1
-            if self._dock_streak >= self.curriculum_advance_threshold:
-                self._advance_curriculum()
-                self._dock_streak = 0
+        truncated  = bool(timeout or dv_ceiling_hit)
 
         # --- Reward ---
         reward_pos  = ENV_SHAPING_COEFF * delta / self.curriculum_distance
-        reward_fuel = -ENV_FUEL_COEFF * np.linalg.norm(action)
+        reward_fuel = -self.fuel_coeff * np.linalg.norm(action)
 
         if docked:
-            reward_terminal = ENV_BONUS - ENV_VEL_COEFF * vel_error
+            reward_terminal = self.bonus - self.vel_coeff * vel_error
         elif out_of_bounds:
             reward_terminal = 0.0
-        elif truncated: # must penalize otherwise it elarns that the timeout is great compared to going left!
-            reward_terminal = - ENV_SHAPING_COEFF * (self.excursion_limit - pos_error) / self.curriculum_distance
+        elif truncated:  # penalize so the agent can't "hide" by running out the clock / burning wastefully
+            reward_terminal = -ENV_SHAPING_COEFF * (self.excursion_limit - pos_error) / self.curriculum_distance
         else:
             reward_terminal = 0.0
 
@@ -317,18 +312,19 @@ class CWRendezvousEnv(gym.Env):
 
         observation = self._build_observation()
         info = {
+            "state":           self.state.copy(),
             "distance":        pos_error,
             "docked":          docked,
             "reward_pos":      reward_pos,
             "reward_fuel":     reward_fuel,
             "reward_terminal": reward_terminal,
-            "reward_milestone":reward_milestone, 
+            "reward_milestone": reward_milestone,
             "vel_error":       vel_error,
             "delta_v":         np.linalg.norm(action),
             "applied_action":  action.copy(),
             "dv_used":         self.dv_used,
-            "dv_remaining":    max(0.0, self.dv_budget - self.dv_used),
-            "budget_exhausted": budget_exhausted,
+            "dv_ceiling":      self.dv_ceiling,
+            "dv_ceiling_hit":  dv_ceiling_hit,
             "curriculum_distance": self.curriculum_distance,
             "excursion":       excursion,
             "excursion_limit": self.excursion_limit,

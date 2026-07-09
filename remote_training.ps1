@@ -16,7 +16,7 @@ $RemoteHost      = "nicolobasso@aurora-server"
 $RemoteSubfolder = "hdp_training"
 $CondaEnvName    = "hdp-cw"
 $PythonVersion   = "3.11"
-$TrainCommand    = "python -u training.py"
+$TrainCommand    = "python -u training.py --scenario vbar --n-envs 32"
 $ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results", "tmp",
                      "__pycache__", ".venv", "venv")
 $PollIntervalSeconds = 20
@@ -123,18 +123,36 @@ Remove-Item -Force $remoteSh
 
 New-Item -ItemType Directory -Force -Path ".\tmp" | Out-Null
 $LocalTmpDir = (Resolve-Path ".\tmp").Path
+New-Item -ItemType Directory -Force -Path ".\trained\checkpoints" | Out-Null
+$LocalTrainedDir = (Resolve-Path ".\trained").Path
 
 # ── 3. Background poller ──────────────────────────────────────────────────────
+# Also periodically pulls trained/checkpoints/ back (training.py now saves a
+# checkpoint every --checkpoint-freq timesteps). If the SSH session below
+# drops, the final "retrieve results" step never runs — this poller is what
+# actually saves you from losing all progress, since it already pulled the
+# most recent checkpoint within the last $PollIntervalSeconds.
+#
+# Uses `scp -r ".../dir/*" "local\dir\"` rather than rsync — rsync isn't
+# installed on this machine (only OpenSSH's ssh/scp are). Unlike
+# `rsync -az src/ dst/`, plain `scp -r src dst` does NOT merge into an
+# existing dst — a second run would nest as dst\src\src\. Globbing the
+# source (`src/*`) copies the *contents* into dst instead, which is safe to
+# repeat every poll. 2>$null because early polls hit an empty/missing
+# checkpoints dir before the first checkpoint is written — expected, not an
+# error.
 $pollJob = Start-Job -ScriptBlock {
-    param($RemoteHost, $RemoteSubfolder, $LocalTmpDir, $Interval)
+    param($RemoteHost, $RemoteSubfolder, $LocalTmpDir, $LocalTrainedDir, $Interval)
     while ($true) {
         scp "${RemoteHost}:~/${RemoteSubfolder}/tmp/latest_trajectory.png" `
             (Join-Path $LocalTmpDir "latest_trajectory.png") 2>$null
+        scp -r "${RemoteHost}:~/${RemoteSubfolder}/trained/checkpoints/*" `
+            "$LocalTrainedDir/checkpoints/" 2>$null
         Start-Sleep -Seconds $Interval
     }
-} -ArgumentList $RemoteHost, $RemoteSubfolder, $LocalTmpDir, $PollIntervalSeconds
+} -ArgumentList $RemoteHost, $RemoteSubfolder, $LocalTmpDir, $LocalTrainedDir, $PollIntervalSeconds
 
-Write-Host "    Live trajectory polling started -> .\tmp\latest_trajectory.png (every ${PollIntervalSeconds}s)`n" -ForegroundColor DarkGray
+Write-Host "    Live trajectory + checkpoint polling started -> .\tmp\latest_trajectory.png, .\trained\checkpoints\ (every ${PollIntervalSeconds}s)`n" -ForegroundColor DarkGray
 
 try {
     ssh $RemoteHost "bash ~/${RemoteSubfolder}/_run.sh"
@@ -151,14 +169,16 @@ if ($trainExitCode -ne 0) {
 }
 
 # ── 4. Retrieve results ───────────────────────────────────────────────────────
+# scp, not rsync — see note above the background poller.
 Write-Host "`n==> [4/4] Retrieving out/, trained/, tmp/ ..." -ForegroundColor Cyan
-New-Item -ItemType Directory -Force -Path ".\out"     | Out-Null
-New-Item -ItemType Directory -Force -Path ".\trained" | Out-Null
-New-Item -ItemType Directory -Force -Path ".\tmp"     | Out-Null
+New-Item -ItemType Directory -Force -Path ".\out"             | Out-Null
+New-Item -ItemType Directory -Force -Path ".\trained\checkpoints" | Out-Null
+New-Item -ItemType Directory -Force -Path ".\tmp"             | Out-Null
 
-rsync -az "${RemoteHost}:~/${RemoteSubfolder}/out/"     ".\out\"
-rsync -az "${RemoteHost}:~/${RemoteSubfolder}/trained/" ".\trained\"
-rsync -az "${RemoteHost}:~/${RemoteSubfolder}/tmp/"     ".\tmp\"
+scp -r "${RemoteHost}:~/${RemoteSubfolder}/out/*"               ".\out\"
+scp -r "${RemoteHost}:~/${RemoteSubfolder}/trained/*.zip"       ".\trained\" 2>$null
+scp -r "${RemoteHost}:~/${RemoteSubfolder}/trained/checkpoints/*" ".\trained\checkpoints\" 2>$null
+scp -r "${RemoteHost}:~/${RemoteSubfolder}/tmp/*"                ".\tmp\"
 
 Write-Host "`n==> All done." -ForegroundColor Green
 Write-Host "`n--- out\ ---"

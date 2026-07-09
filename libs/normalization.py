@@ -8,28 +8,34 @@ This keeps network inputs centred and bounded regardless of sign
 (positions/velocities can be negative).
 
 Scale choices follow the physical problem:
-  • position  → ENV_BOUNDARY              (excursion limit, ~500 m)
+  • position  → ENV_BOUNDARY              (excursion limit, ~200 m)
   • velocity  → OMEGA * ENV_BOUNDARY      (characteristic CW velocity scale)
-  • dv_budget → ENV_DV_BUDGET             (total budget, ~50 m/s)
+  • dv_used   → DV_USED_NORM_SCALE        (typical cumulative Δv range)
   • action    → ENV_MAX_DV per axis       (per-step cap)
 
-2-D state  : [x, z, ẋ, ż, dv_remaining]          (5-dim)
-3-D state  : [x, y, z, ẋ, ẏ, ż, dv_remaining]    (7-dim)
+2-D state  : [x, z, ẋ, ż, dv_used]          (5-dim)
+3-D state  : [x, y, z, ẋ, ẏ, ż, dv_used]    (7-dim)
 Action     : [dvx, (dvy,) dvz]                     (2 or 3-dim)
+
+NormalizedObsEnv wraps CWRendezvousEnv so training and evaluation always see
+the same normalized observations — no need to call normalize_state by hand
+at each call site.
 """
 
 import numpy as np
 import torch
+import gymnasium as gym
+from gymnasium import spaces
 
-from libs.constants import MODE_2D, ENV_BOUNDARY, ENV_MAX_DV, ENV_DV_BUDGET, OMEGA
+from libs.constants import MODE_2D, ENV_BOUNDARY, ENV_MAX_DV, DV_USED_NORM_SCALE, OMEGA
 
 # --- Scale arrays (numpy; cast to tensor on demand) -------------------------
-_POS_SCALE = ENV_BOUNDARY           # ~500 m
+_POS_SCALE = ENV_BOUNDARY           # ~200 m
 _VEL_SCALE = OMEGA * ENV_BOUNDARY   # characteristic CW velocity [m/s]
-_DV_SCALE  = ENV_DV_BUDGET          # total Δv budget [m/s]
+_DV_SCALE  = DV_USED_NORM_SCALE     # typical cumulative Δv range [m/s]
 
 if MODE_2D:
-    # state = [x, z, ẋ, ż, dv_remaining]
+    # state = [x, z, ẋ, ż, dv_used]
     STATE_SCALE = np.array(
         [_POS_SCALE, _POS_SCALE,
          _VEL_SCALE, _VEL_SCALE,
@@ -38,7 +44,7 @@ if MODE_2D:
     )
     ACTION_SCALE = np.array([ENV_MAX_DV, ENV_MAX_DV], dtype=np.float64)
 else:
-    # state = [x, y, z, ẋ, ẏ, ż, dv_remaining]
+    # state = [x, y, z, ẋ, ẏ, ż, dv_used]
     STATE_SCALE = np.array(
         [_POS_SCALE, _POS_SCALE, _POS_SCALE,
          _VEL_SCALE, _VEL_SCALE, _VEL_SCALE,
@@ -77,3 +83,17 @@ def normalize_action(action):
     if isinstance(action, torch.Tensor):
         return _normalize_tensor(action, ACTION_SCALE)
     return _normalize_array(np.asarray(action, dtype=np.float64), ACTION_SCALE)
+
+
+class NormalizedObsEnv(gym.ObservationWrapper):
+    """Wraps CWRendezvousEnv so the policy always sees normalized obs in
+    [0, 1], both at training and at evaluation time."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=env.observation_space.shape, dtype=np.float64
+        )
+
+    def observation(self, observation):
+        return normalize_state(observation)
