@@ -244,7 +244,9 @@ class CWRendezvousEnv(gym.Env):
         half = self.phys_dim // 2
         self.start_pos = self.state[:half].copy()
 
-        self.best_distance   = np.linalg.norm(self.state[:half])
+        self.start_distance  = np.linalg.norm(self.state[:half])
+        self.best_distance   = self.start_distance
+        self.worst_distance  = self.start_distance
         self.step_count      = 0
         self.elapsed_time    = 0.0
         self.dv_used         = 0.0
@@ -259,6 +261,7 @@ class CWRendezvousEnv(gym.Env):
         return observation, info
 
     def step(self, action: np.ndarray):
+        self.step_count += 1
         action = np.clip(action, -self.max_dv, self.max_dv)
         self.dv_used += np.linalg.norm(action)
 
@@ -292,6 +295,23 @@ class CWRendezvousEnv(gym.Env):
         reward_pos  = ENV_SHAPING_COEFF * delta / self.curriculum_distance
         reward_fuel = -self.fuel_coeff * np.linalg.norm(action)
 
+        # Burning through the entire fuel ceiling is always at least as bad
+        # as the worst possible "never improved" milestone malus (see below),
+        # regardless of how many steps it took to get there. This is what
+        # actually closes the fast-burn exploit: previously a short, fast
+        # burn-to-ceiling could dodge the malus by ending the episode before
+        # worst_distance had a chance to grow; scaling the malus by step
+        # count also worked but diluted its guiding signal for genuine slow
+        # divergence. Charging the worst-case malus directly to reward_fuel
+        # whenever the ceiling is hit removes the incentive to race there
+        # without softening the milestone term itself.
+        if dv_ceiling_hit:
+            max_milestone_penalty = (
+                ENV_SHAPING_COEFF * (self.excursion_limit - self.start_distance)
+                / self.episode_curriculum_distance
+            )
+            reward_fuel -= max_milestone_penalty
+
         if docked:
             reward_terminal = self.bonus - self.vel_coeff * vel_error
         elif out_of_bounds:
@@ -301,10 +321,27 @@ class CWRendezvousEnv(gym.Env):
         else:
             reward_terminal = 0.0
 
+        if pos_error > self.worst_distance:
+            self.worst_distance = pos_error
+
         if pos_error < self.best_distance:
             improvement = self.best_distance - pos_error
             reward_milestone = ENV_SHAPING_COEFF * improvement / self.episode_curriculum_distance
             self.best_distance = pos_error
+        elif (terminated or truncated) and self.best_distance >= self.start_distance:
+            # Never once improved on the starting distance this whole
+            # episode (mid-episode excursions away from the target are NOT
+            # penalized — only fires at the terminal step, so a trajectory
+            # that legitimately needs to move away first before it can
+            # approach is untouched as long as it improves on start_distance
+            # by the end). The fast-burn-to-ceiling dodge this malus used to
+            # be vulnerable to is now closed separately by the dv_ceiling_hit
+            # charge to reward_fuel above, so this stays a direct function of
+            # how far it drifted — no step-count normalization needed.
+            reward_milestone = (
+                -ENV_SHAPING_COEFF * (self.worst_distance - self.start_distance)
+                / self.episode_curriculum_distance
+            )
         else:
             reward_milestone = 0.0
 

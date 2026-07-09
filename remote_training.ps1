@@ -16,7 +16,63 @@ $RemoteHost      = "nicolobasso@aurora-server"
 $RemoteSubfolder = "hdp_training"
 $CondaEnvName    = "hdp-cw"
 $PythonVersion   = "3.11"
-$TrainCommand    = "python -u training.py --scenario vbar --n-envs 32"
+# Perf flags for the remote EPYC 7532 (32c/64t) Linux/RHEL box. History of
+# what was tried, kept here so nobody re-derives this the hard way:
+#   --net-arch 64,64  : right-sized net, ~1.9x locally, confirmed platform-
+#                        agnostic win, keep always.
+#   --vec-env dummy    : CONFIRMED on this machine (not just assumed from the
+#                        local result) — SubprocVecEnv's real bottleneck isn't
+#                        worker compute, it's step_async/step_wait in SB3:
+#                        `for remote in self.remotes: remote.send(...)` then
+#                        `[remote.recv() for remote in self.remotes]` — a
+#                        SERIAL Python loop of n_envs pipe round-trips, every
+#                        vec-step, in the main process. That's syscall/pickle
+#                        overhead, not compute, so it (a) doesn't care how
+#                        many cores exist and (b) gets WORSE as n_envs grows
+#                        (n_envs=32->64 doubled the round-trips). This is why
+#                        going 32->64 envs + more torch-threads didn't move
+#                        steps/s and CPU stayed at ~8-13%. Switching to
+#                        DummyVecEnv (single process, no IPC at all) measured
+#                        ~335 steps/s steady-state vs ~290 for subproc, AND
+#                        reached 100% dock rate + 2 curriculum advances
+#                        (10m->15m->20m) within 14k timesteps in the same
+#                        test where subproc was still stuck near 15m past
+#                        100k. Don't switch back to subproc without a real
+#                        head-to-head showing it actually wins here.
+#   --n-envs 64        : fine to keep — DummyVecEnv still benefits from more
+#                        envs per vec-step (more transitions collected =
+#                        more gradient steps at UTD=1.0), and without
+#                        per-worker IPC cost there's no penalty for a high
+#                        count the way there was with subproc. Worth a sweep
+#                        (32/64/128) later, not urgent.
+#   --torch-threads    : left at default (4) here — no longer competing with
+#                        32-64 separate worker processes for cores now that
+#                        there's only one process total, so the earlier
+#                        oversubscription logic doesn't apply. Still true
+#                        that net_arch=[64,64] batch-256 matmuls are small
+#                        enough that more threads may not help much; if you
+#                        want to chase the remaining ~8-13% CPU number,
+#                        sweep --torch-threads 2/4/8/16 and compare
+#                        steps/s — but note CPU% staying low is not
+#                        inherently a problem now, it may just reflect that
+#                        this problem genuinely doesn't need 64 threads of
+#                        compute. Watch dock-rate-vs-timesteps, not CPU%.
+#   --vec-env-start-method : irrelevant now, DummyVecEnv doesn't use
+#                        multiprocessing at all. Left unset.
+#   --train-freq / --gradient-steps : deliberately NOT overridden — left at
+#                        training.py's defaults (train_freq=1, gradient_steps
+#                        =-1), a true 1 learning-update per 1 collected step.
+#                        A sparser ratio (--train-freq 2 --gradient-steps 1)
+#                        gave huge steps/s but ~117 real updates/sec and
+#                        confirmed-fast-but-not-learning behavior on a real
+#                        run. Re-derive gradient_steps/(train_freq*n_envs)
+#                        before ever touching these again.
+# Not enabled: --compile (torch.compile). More mature on Linux than Windows
+# in general, but unverified here — needs a working C/C++ toolchain in the
+# remote conda env and hasn't been benchmarked. Try it manually first:
+#   python -u training.py --scenario vbar --n-envs 64 --vec-env dummy --compile --total-timesteps 20000
+$TrainCommand    = "python -u training.py --scenario vbar --n-envs 64 " +
+                    "--net-arch 64,64 --vec-env dummy"
 $ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results", "tmp",
                      "__pycache__", ".venv", "venv")
 $PollIntervalSeconds = 20

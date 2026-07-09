@@ -8,7 +8,9 @@ Usage:
 
 import argparse
 from collections import deque
+import os
 from pathlib import Path
+import platform
 import shutil
 import time
 
@@ -59,6 +61,12 @@ from libs.trajectory import plot_trajectory
 
 def make_single_env(scenario: str):
     def _init():
+        # Runs inside each SubprocVecEnv worker. Each worker only ever does
+        # a 4x4 matmul per step — letting it default to a multi-threaded
+        # torch thread pool just means n_envs processes fighting each other
+        # for the same cores. The main process (real gradient compute) sets
+        # its own thread count separately in main().
+        torch.set_num_threads(1)
         env = CWRendezvousEnv(omega=OMEGA, scenario=scenario)
         env = CanonicalizeDirectionEnv(env)  # must wrap the raw (unnormalized) env
         env = NormalizedObsEnv(env)
@@ -111,6 +119,40 @@ class NoiseDecayCallback(BaseCallback):
         sub_noises = getattr(noise, "noises", [noise])
         for sub in sub_noises:
             sub._sigma[:] = sigma
+        return True
+
+
+class ThroughputCallback(BaseCallback):
+    """
+    Standalone steps/sec and ms/step log, decoupled from TrainingCallback's
+    episode-based print — episode length is wildly variable (3 steps early,
+    90+ once learning kicks in), so a per-episode timer is not a clean
+    throughput signal. This fires on a fixed timestep cadence instead, so
+    numbers are directly comparable before/after a perf change (thread
+    limits, net_arch, vec-env backend, compile, train_freq, ...).
+    """
+
+    def __init__(self, log_every_timesteps: int = 2000):
+        super().__init__(verbose=0)
+        self.log_every_timesteps = log_every_timesteps
+        self._last_t = None
+        self._last_timesteps = 0
+
+    def _on_training_start(self) -> None:
+        self._last_t = time.perf_counter()
+        self._last_timesteps = self.num_timesteps
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last_timesteps >= self.log_every_timesteps:
+            now = time.perf_counter()
+            dt = now - self._last_t
+            dsteps = self.num_timesteps - self._last_timesteps
+            steps_per_sec = dsteps / dt if dt > 0 else float("inf")
+            ms_per_step = 1000.0 * dt / dsteps if dsteps > 0 else float("nan")
+            print(f"[throughput] {self.num_timesteps:>10} timesteps | "
+                  f"{steps_per_sec:>8.1f} steps/s | {ms_per_step:>6.2f} ms/step")
+            self._last_t = now
+            self._last_timesteps = self.num_timesteps
         return True
 
 
@@ -333,15 +375,49 @@ def parse_args():
     p.add_argument("--total-timesteps", type=int, default=TOTAL_TIMESTEPS)
     p.add_argument("--device", default="cpu",
                     help="'cpu' is usually faster than 'cuda' for a network this small.")
-    p.add_argument("--checkpoint-freq", type=int, default=10000,
+    p.add_argument("--checkpoint-freq", type=int, default=100000,
                     help="Save the model every N environment timesteps.")
     p.add_argument("--keep-last-checkpoints", type=int, default=5,
                     help="Only keep the N most recent checkpoints on disk.")
+
+    # ── Perf knobs ──────────────────────────────────────────────────────────
+    p.add_argument("--vec-env", choices=["auto", "dummy", "subproc"], default="auto",
+                    help="'auto' = subproc if n-envs>1 else dummy. Force one to A/B test "
+                         "IPC overhead vs parallelism on an env this cheap to step.")
+    p.add_argument("--vec-env-start-method",
+                    default="fork" if platform.system() != "Windows" else "spawn",
+                    choices=["fork", "spawn", "forkserver"],
+                    help="'fork' (Linux/RHEL default here) skips re-importing torch/numpy "
+                         "in every worker; Windows only supports 'spawn'.")
+    p.add_argument("--net-arch", default="64,64",
+                    help="Comma-separated hidden layer sizes, e.g. '64,64'. Was [400,300] "
+                         "(from the original DDPG paper's much higher-dim tasks) — "
+                         "oversized for a 5-obs/2-action problem.")
+    p.add_argument("--torch-threads", type=int, default=min(4, os.cpu_count() or 4),
+                    help="Threads for the MAIN process's torch ops (gradient updates). "
+                         "Subprocess workers are always pinned to 1 (see make_single_env).")
+    p.add_argument("--compile", action="store_true",
+                    help="Wrap actor/critic nets in torch.compile(). Same fixed batch "
+                         "shape called millions of times -> real candidate, but more "
+                         "mature on Linux than Windows; falls back gracefully if it errors.")
+    p.add_argument("--train-freq", type=int, default=1,
+                    help="Collect this many env-steps between training phases.")
+    p.add_argument("--gradient-steps", type=int, default=-1,
+                    help="Gradient steps per training phase. -1 = match --train-freq "
+                         "(current 1:1 ratio). Lower e.g. --train-freq 4 --gradient-steps 1 "
+                         "for a 0.25 update-to-data ratio — env steps are ~free here, "
+                         "gradient steps are the expensive part.")
+    p.add_argument("--throughput-log-every", type=int, default=2000,
+                    help="Print steps/sec every N timesteps.")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    torch.set_num_threads(max(1, args.torch_threads))
+    print(f"Platform: {platform.system()} | torch main-process threads: {args.torch_threads} "
+          f"| cpu_count: {os.cpu_count()}")
 
     t0 = time.perf_counter()
     check_env(CWRendezvousEnv(omega=OMEGA, scenario=args.scenario))
@@ -354,8 +430,19 @@ def main():
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     n_envs = max(1, args.n_envs)
-    vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
-    env = make_vec_env(make_single_env(args.scenario), n_envs=n_envs, vec_env_cls=vec_cls)
+    if args.vec_env == "dummy":
+        vec_cls, vec_kwargs = DummyVecEnv, {}
+    elif args.vec_env == "subproc":
+        vec_cls, vec_kwargs = SubprocVecEnv, dict(start_method=args.vec_env_start_method)
+    else:  # auto
+        if n_envs > 1:
+            vec_cls, vec_kwargs = SubprocVecEnv, dict(start_method=args.vec_env_start_method)
+        else:
+            vec_cls, vec_kwargs = DummyVecEnv, {}
+    print(f"vec_env: {vec_cls.__name__}"
+          + (f" (start_method={vec_kwargs['start_method']})" if vec_kwargs else ""))
+    env = make_vec_env(make_single_env(args.scenario), n_envs=n_envs,
+                        vec_env_cls=vec_cls, vec_env_kwargs=vec_kwargs)
 
     action_dim = env.action_space.shape[0]
     action_noise = NormalActionNoise(
@@ -363,7 +450,10 @@ def main():
         sigma=ACTION_NOISE_SIGMA_START * np.ones(action_dim),
     )
 
-    policy_kwargs = dict(net_arch=[400, 300])
+    net_arch = [int(x) for x in args.net_arch.split(",")]
+    policy_kwargs = dict(net_arch=net_arch)
+    print(f"net_arch: {net_arch} | train_freq: {args.train_freq} | "
+          f"gradient_steps: {args.gradient_steps}")
 
     model = TD3(
         policy               = "MlpPolicy",
@@ -374,8 +464,8 @@ def main():
         batch_size           = BATCH_SIZE,
         tau                  = TAU,
         gamma                = GAMMA,
-        train_freq           = (1, "step"),
-        gradient_steps       = -1,   # match number of env steps collected (== n_envs)
+        train_freq           = (args.train_freq, "step"),
+        gradient_steps       = args.gradient_steps,
         action_noise         = action_noise,
         policy_delay         = 2,
         target_policy_noise  = TD3_TARGET_POLICY_NOISE,
@@ -384,6 +474,16 @@ def main():
         verbose              = 0,
         device               = args.device,
     )
+
+    if args.compile:
+        try:
+            model.actor = torch.compile(model.actor)
+            model.actor_target = torch.compile(model.actor_target)
+            model.critic = torch.compile(model.critic)
+            model.critic_target = torch.compile(model.critic_target)
+            print("torch.compile: enabled on actor/critic + targets")
+        except Exception as e:
+            print(f"torch.compile: FAILED to enable, continuing without it ({e})")
 
     curriculum_callback = CurriculumCallback(
         n_envs=n_envs,
@@ -405,6 +505,7 @@ def main():
             save_freq_timesteps=args.checkpoint_freq,
             keep_last=args.keep_last_checkpoints,
         ),
+        ThroughputCallback(log_every_timesteps=args.throughput_log_every),
     ]
     if curriculum_callback is not None:
         callback.append(curriculum_callback)
