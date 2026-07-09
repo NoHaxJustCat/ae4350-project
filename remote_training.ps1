@@ -57,7 +57,43 @@ $PythonVersion   = "3.11"
 #                        inherently a problem now, it may just reflect that
 #                        this problem genuinely doesn't need 64 threads of
 #                        compute. Watch dock-rate-vs-timesteps, not CPU%.
-#   --vec-env-start-method : irrelevant now, DummyVecEnv doesn't use
+#   --vec-env batched  : (2026-07) BatchedCWVecEnv (libs/batched_env.py) —
+#                        third round of this saga. Steps all 64 envs as ONE
+#                        (64,4)@(4,4) numpy matmul per vec-step instead of
+#                        DummyVecEnv's Python loop of 64 .step() calls.
+#                        Verified equivalent to the per-env stack to 1e-9
+#                        over 2570 episodes (both scenarios, both signs, all
+#                        four episode endings). Measured on THIS box:
+#                          - env-only: 17.1k -> 149.8k env-steps/s (8.7x);
+#                            3.74ms -> 0.43ms per vec-step
+#                          - pre-learning_starts (rollout-only): 3.4k ->
+#                            17.9k steps/s
+#                          - steady-state training: ~344 vs ~348 steps/s
+#                            (parity, within noise) at --torch-threads 1
+#                        Steady state is ~98% gradient updates (64
+#                        sequential batch-256 updates per vec-step at UTD
+#                        1.0), so NO env backend can move it — the one busy
+#                        core during training is the gradient loop, and
+#                        that's optimal (see --torch-threads below). Keep
+#                        batched anyway: env cost is permanently off the
+#                        table if n_envs/UTD ever change, and the curriculum
+#                        push is one attribute write instead of an
+#                        env_method fan-out.
+#   --torch-threads 1  : MEASURED, not a guess: 1 thread = 344 steps/s
+#                        (99% CPU), 2 = 327 (199%), 4 = 312 (398%). Intra-op
+#                        parallelism on batch-256 [64,64] matmuls costs more
+#                        in sync than it buys in compute — more cores make
+#                        it SLOWER. NOTE: the old dummy runs got this
+#                        accidentally: make_single_env()'s
+#                        torch.set_num_threads(1) (meant for subproc
+#                        workers) runs in the MAIN process under
+#                        DummyVecEnv, silently overriding --torch-threads.
+#                        The batched path skips those thunks, so 1 must be
+#                        passed explicitly. "Only one core busy" during
+#                        steady-state training is the CORRECT resting state
+#                        for this workload, not a bug: the gradient loop is
+#                        inherently serial and too small to parallelize.
+#   --vec-env-start-method : irrelevant now, neither dummy nor batched uses
 #                        multiprocessing at all. Left unset.
 #   --train-freq / --gradient-steps : deliberately NOT overridden — left at
 #                        training.py's defaults (train_freq=1, gradient_steps
@@ -72,7 +108,7 @@ $PythonVersion   = "3.11"
 # remote conda env and hasn't been benchmarked. Try it manually first:
 #   python -u training.py --scenario vbar --n-envs 64 --vec-env dummy --compile --total-timesteps 20000
 $TrainCommand    = "python -u training.py --scenario vbar --n-envs 64 " +
-                    "--net-arch 64,64 --vec-env dummy"
+                    "--net-arch 64,64 --vec-env batched --torch-threads 1"
 $ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results", "tmp",
                      "__pycache__", ".venv", "venv")
 $PollIntervalSeconds = 20

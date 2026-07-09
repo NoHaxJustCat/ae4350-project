@@ -35,6 +35,7 @@ from libs.constants import (
     ENV_CURRICULUM_ENABLED,
     ENV_CURRICULUM_INCREMENT,
     ENV_CURRICULUM_MAX_DISTANCE,
+    ENV_CURRICULUM_START_DISTANCE,
     ENV_MAX_DV,
     GAMMA,
     LOG_EVERY,
@@ -51,6 +52,7 @@ from libs.constants import (
     TRAINED_MODEL_DIR,
     TRAINING_HISTORY_PATH,
 )
+from libs.batched_env import BatchedCWVecEnv
 from libs.env import CWRendezvousEnv
 from libs.normalization import NormalizedObsEnv
 from libs.symmetry import CanonicalizeDirectionEnv
@@ -66,6 +68,15 @@ def make_single_env(scenario: str):
         # torch thread pool just means n_envs processes fighting each other
         # for the same cores. The main process (real gradient compute) sets
         # its own thread count separately in main().
+        #
+        # CAVEAT (discovered in the 2026-07 batched-vec-env benchmark): with
+        # DummyVecEnv these thunks run in the MAIN process, so this line
+        # silently overrides --torch-threads down to 1 for the gradient
+        # updates too. That accident happened to WIN on the EPYC box —
+        # 1 torch thread beat 4 by ~10% steps/s (348 vs 312), because
+        # batch-256 [64,64] matmuls are too small for intra-op parallelism
+        # to pay for its sync overhead. The batched vec-env path doesn't run
+        # this thunk, so give it --torch-threads 1 explicitly to match.
         torch.set_num_threads(1)
         env = CWRendezvousEnv(omega=OMEGA, scenario=scenario)
         env = CanonicalizeDirectionEnv(env)  # must wrap the raw (unnormalized) env
@@ -204,17 +215,31 @@ class CurriculumCallback(BaseCallback):
     rate over a rolling window of episode completions pooled across every
     env, and when it clears the threshold, advances one shared distance and
     pushes it to every sub-env via env_method("set_curriculum_distance").
+
+    Advance-only used to be a trap: with no way back down, a stage the
+    current policy genuinely can't clear yet (dock rate stuck under
+    threshold, e.g. the cur_d=35 stall) freezes curriculum_distance for the
+    rest of the run — the remaining timestep budget trains on a plateaued
+    stage instead of ever making further progress. If `stall_patience`
+    episodes pass with the dock rate never clearing the threshold (so no
+    advance fires), distance now steps back down by one increment instead,
+    letting the policy consolidate at an easier stage and re-attempt the
+    climb rather than sitting wedged.
     """
 
     def __init__(self, n_envs: int, increment: float, max_distance: float,
-                 window: int = 20, dock_rate_threshold: float = 0.5):
+                 min_distance: float, window: int = 20, dock_rate_threshold: float = 0.5,
+                 stall_patience: int = 3):
         super().__init__(verbose=0)
         self.n_envs = n_envs
         self.increment = increment
         self.max_distance = max_distance
+        self.min_distance = min_distance
         self.dock_rate_threshold = dock_rate_threshold
+        self.stall_patience_episodes = stall_patience * window
         self._recent_docks = deque(maxlen=window)
         self.curriculum_distance = None
+        self._episodes_since_change = 0
 
     def _on_training_start(self) -> None:
         self.curriculum_distance = self.training_env.get_attr("curriculum_distance")[0]
@@ -233,6 +258,7 @@ class CurriculumCallback(BaseCallback):
         for i in range(self.n_envs):
             if dones[i]:
                 self._recent_docks.append(bool(infos[i].get("docked", False)))
+                self._episodes_since_change += 1
 
         ready = len(self._recent_docks) == self._recent_docks.maxlen
         if (ready and np.mean(self._recent_docks) >= self.dock_rate_threshold
@@ -240,8 +266,17 @@ class CurriculumCallback(BaseCallback):
             self.curriculum_distance = min(self.curriculum_distance + self.increment, self.max_distance)
             self.training_env.env_method("set_curriculum_distance", self.curriculum_distance)
             self._recent_docks.clear()
+            self._episodes_since_change = 0
             print(f"[curriculum] dock rate >= {self.dock_rate_threshold:.0%} -> "
                   f"advancing to {self.curriculum_distance:.1f} m")
+        elif (self._episodes_since_change >= self.stall_patience_episodes
+                and self.curriculum_distance > self.min_distance):
+            self.curriculum_distance = max(self.curriculum_distance - self.increment, self.min_distance)
+            self.training_env.env_method("set_curriculum_distance", self.curriculum_distance)
+            self._recent_docks.clear()
+            self._episodes_since_change = 0
+            print(f"[curriculum] stalled for {self.stall_patience_episodes} episodes -> "
+                  f"regressing to {self.curriculum_distance:.1f} m")
         return True
 
 
@@ -381,9 +416,12 @@ def parse_args():
                     help="Only keep the N most recent checkpoints on disk.")
 
     # ── Perf knobs ──────────────────────────────────────────────────────────
-    p.add_argument("--vec-env", choices=["auto", "dummy", "subproc"], default="auto",
+    p.add_argument("--vec-env", choices=["auto", "dummy", "subproc", "batched"], default="auto",
                     help="'auto' = subproc if n-envs>1 else dummy. Force one to A/B test "
-                         "IPC overhead vs parallelism on an env this cheap to step.")
+                         "IPC overhead vs parallelism on an env this cheap to step. "
+                         "'batched' = BatchedCWVecEnv: single process, all n envs stepped "
+                         "as one (n,4)@(4,4) numpy matmul instead of a Python loop — no "
+                         "per-env .step() frames, no IPC (see libs/batched_env.py).")
     p.add_argument("--vec-env-start-method",
                     default="fork" if platform.system() != "Windows" else "spawn",
                     choices=["fork", "spawn", "forkserver"],
@@ -430,19 +468,25 @@ def main():
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     n_envs = max(1, args.n_envs)
-    if args.vec_env == "dummy":
-        vec_cls, vec_kwargs = DummyVecEnv, {}
-    elif args.vec_env == "subproc":
-        vec_cls, vec_kwargs = SubprocVecEnv, dict(start_method=args.vec_env_start_method)
-    else:  # auto
-        if n_envs > 1:
-            vec_cls, vec_kwargs = SubprocVecEnv, dict(start_method=args.vec_env_start_method)
-        else:
+    if args.vec_env == "batched":
+        # Single process, no per-env Python objects at all: all n_envs are
+        # stepped as one numpy batch (see libs/batched_env.py).
+        print("vec_env: BatchedCWVecEnv")
+        env = BatchedCWVecEnv(n_envs=n_envs, scenario=args.scenario)
+    else:
+        if args.vec_env == "dummy":
             vec_cls, vec_kwargs = DummyVecEnv, {}
-    print(f"vec_env: {vec_cls.__name__}"
-          + (f" (start_method={vec_kwargs['start_method']})" if vec_kwargs else ""))
-    env = make_vec_env(make_single_env(args.scenario), n_envs=n_envs,
-                        vec_env_cls=vec_cls, vec_env_kwargs=vec_kwargs)
+        elif args.vec_env == "subproc":
+            vec_cls, vec_kwargs = SubprocVecEnv, dict(start_method=args.vec_env_start_method)
+        else:  # auto
+            if n_envs > 1:
+                vec_cls, vec_kwargs = SubprocVecEnv, dict(start_method=args.vec_env_start_method)
+            else:
+                vec_cls, vec_kwargs = DummyVecEnv, {}
+        print(f"vec_env: {vec_cls.__name__}"
+              + (f" (start_method={vec_kwargs['start_method']})" if vec_kwargs else ""))
+        env = make_vec_env(make_single_env(args.scenario), n_envs=n_envs,
+                            vec_env_cls=vec_cls, vec_env_kwargs=vec_kwargs)
 
     action_dim = env.action_space.shape[0]
     action_noise = NormalActionNoise(
@@ -489,6 +533,7 @@ def main():
         n_envs=n_envs,
         increment=ENV_CURRICULUM_INCREMENT,
         max_distance=ENV_CURRICULUM_MAX_DISTANCE,
+        min_distance=ENV_CURRICULUM_START_DISTANCE,
     ) if ENV_CURRICULUM_ENABLED else None
 
     callback = [

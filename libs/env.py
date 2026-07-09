@@ -295,23 +295,6 @@ class CWRendezvousEnv(gym.Env):
         reward_pos  = ENV_SHAPING_COEFF * delta / self.curriculum_distance
         reward_fuel = -self.fuel_coeff * np.linalg.norm(action)
 
-        # Burning through the entire fuel ceiling is always at least as bad
-        # as the worst possible "never improved" milestone malus (see below),
-        # regardless of how many steps it took to get there. This is what
-        # actually closes the fast-burn exploit: previously a short, fast
-        # burn-to-ceiling could dodge the malus by ending the episode before
-        # worst_distance had a chance to grow; scaling the malus by step
-        # count also worked but diluted its guiding signal for genuine slow
-        # divergence. Charging the worst-case malus directly to reward_fuel
-        # whenever the ceiling is hit removes the incentive to race there
-        # without softening the milestone term itself.
-        if dv_ceiling_hit:
-            max_milestone_penalty = (
-                ENV_SHAPING_COEFF * (self.excursion_limit - self.start_distance)
-                / self.episode_curriculum_distance
-            )
-            reward_fuel -= max_milestone_penalty
-
         if docked:
             reward_terminal = self.bonus - self.vel_coeff * vel_error
         elif out_of_bounds:
@@ -334,10 +317,14 @@ class CWRendezvousEnv(gym.Env):
             # penalized — only fires at the terminal step, so a trajectory
             # that legitimately needs to move away first before it can
             # approach is untouched as long as it improves on start_distance
-            # by the end). The fast-burn-to-ceiling dodge this malus used to
-            # be vulnerable to is now closed separately by the dv_ceiling_hit
-            # charge to reward_fuel above, so this stays a direct function of
-            # how far it drifted — no step-count normalization needed.
+            # by the end). A prior version also charged the worst-case value
+            # of this malus to reward_fuel whenever dv_ceiling_hit fired —
+            # reverted: it created a hard reward discontinuity right at the
+            # ceiling boundary (crossing it cost a flat extra -10 regardless
+            # of margin) that a live run got stuck straddling for hundreds of
+            # episodes at zero dock rate. This malus alone, scaling smoothly
+            # with how far it actually drifted, is the only "gave up"
+            # deterrent now.
             reward_milestone = (
                 -ENV_SHAPING_COEFF * (self.worst_distance - self.start_distance)
                 / self.episode_curriculum_distance

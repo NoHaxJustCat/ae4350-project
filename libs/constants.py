@@ -55,13 +55,26 @@ RBAR_X_TO_Z_RATIO = 2.0  # matches the Δx = 2·Δz relation in goal 2 strategy 
 # Soft Δv ceiling: NOT a hard action clip (that was the bug — exploration
 # noise alone exhausted a fixed 0.05 m/s hard budget in ~7 steps, forcing
 # uncontrolled drift for the rest of every episode). Instead, once an
-# episode's cumulative Δv exceeds a generous multiple of the best-case
-# classical reference for the current scenario/distance, it is truncated
-# early as "hopelessly wasteful" — this only ever fires on genuinely
-# degenerate trajectories and exists purely to stop burning wall-clock time
-# on episodes that already spent far more than any sane strategy would.
-ENV_DV_CEILING_MULT = 15.0
-ENV_DV_CEILING_FLOOR = 0.15  # m/s — keeps the ceiling from being punishing at small curriculum distances
+# episode's cumulative Δv exceeds a multiple of the best-case classical
+# reference for the CURRENT scenario/distance, it is truncated early as
+# "wasteful".
+#
+# ENV_DV_CEILING_MULT=3 is effectively dead weight across the whole
+# curriculum: the vbar/rbar reference formulas are so cheap relative to a
+# single actuator burn (ω/(3π)·Δx ≈ 1.15e-4·Δx vs ENV_MAX_DV=0.05/axis)
+# that 3×reference never exceeds ONE single max-power action anywhere in
+# the 10-100 m curriculum range (even at 100 m: 3×ref≈0.035 < √2·0.05≈
+# 0.071) — confirmed the hard way: gymnasium's check_env samples one random
+# action and truncated immediately, because 3×reference alone can't survive
+# a single actuator saturation. So the floor is what actually governs the
+# ceiling everywhere in-range; it's set to a fixed multiple of ENV_MAX_DV
+# (actuator-referenced, not reference-formula-referenced) instead of an
+# arbitrary constant, so it always guarantees a handful of full-power
+# corrective bursts regardless of curriculum distance. This does NOT scale
+# with distance/difficulty (see the cur_d=35 stall this was meant to fix) —
+# that remains an open problem, just no longer a crash.
+ENV_DV_CEILING_MULT = 3.0
+ENV_DV_CEILING_FLOOR = 4.0 * ENV_MAX_DV  # m/s — ~4 full-power corrective bursts, always available regardless of distance
 
 # Normalization scale for the dv_used observation element (see
 # libs/normalization.py). Not the same as the soft ceiling above — just a
