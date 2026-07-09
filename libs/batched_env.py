@@ -53,6 +53,7 @@ from libs.constants import (
     ENV_CURRICULUM_START_DISTANCE,
     ENV_DT,
     ENV_FUEL_COEFF,
+    ENV_FUEL_LOG_SCALE,
     ENV_MAX_DV,
     ENV_POS_TOLERANCE,
     ENV_SHAPING_COEFF,
@@ -238,7 +239,8 @@ class BatchedCWVecEnv(VecEnv):
 
         # --- physics + bookkeeping (verbatim from CWRendezvousEnv.step) ---
         dv_norm = np.linalg.norm(real, axis=1)
-        self.dv_used += dv_norm
+        dv_used_before = self.dv_used
+        self.dv_used = dv_used_before + dv_norm
 
         prev_pos_error = np.linalg.norm(self.states[:, : self.half], axis=1)
         self.states[:, self.half:] += real
@@ -257,10 +259,14 @@ class BatchedCWVecEnv(VecEnv):
         truncated = timeout
 
         # --- reward (verbatim from CWRendezvousEnv.step): dense
-        # distance-shaping + docking bonus + a plain, smooth per-step fuel
-        # cost. No ceiling, no truncation tied to it.
+        # distance-shaping + docking bonus + a log-scaled fuel cost,
+        # telescoped per-step exactly like reward_pos. No ceiling, no
+        # truncation tied to it.
         reward_pos = ENV_SHAPING_COEFF * delta / self.curriculum_distance
-        reward_fuel = -self.fuel_coeff * dv_norm
+        reward_fuel = -self.fuel_coeff * (
+            np.log1p(self.dv_used / ENV_FUEL_LOG_SCALE)
+            - np.log1p(dv_used_before / ENV_FUEL_LOG_SCALE)
+        )
         reward_terminal = np.where(docked, self.bonus - self.vel_coeff * vel_error, 0.0)
         reward = reward_pos + reward_fuel + reward_terminal
         dones = terminated | truncated

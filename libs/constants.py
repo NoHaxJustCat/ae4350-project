@@ -24,18 +24,24 @@ ENV_POS_TOLERANCE = 1.0
 ENV_VEL_COEFF = 10.0
 ENV_SHAPING_COEFF = 10.0
 ENV_BONUS = 50.0
-# Fuel penalty coefficient — plain per-step cost (-fuel_coeff * ||action||),
-# nothing else attached to it (no ceiling, no truncation, no malus; those
-# combinations were the actual source of every reward exploit found this
-# project). Sized from measurement, not guesswork: a barebones
-# no-fuel-penalty run reached 90-100% dock rate while burning ~50 m/s per
-# episode (vs. a ~0.0115 m/s classical-reference optimum at 100 m — ~4000x
-# over). At this coefficient that habit costs -5 against a +50 dock bonus
-# (still clearly profitable, won't crater dock rate), while cost at the
-# reference optimum is ~0.001 (negligible, doesn't block the policy from
-# approaching it). Re-derive from the diagnostics r_fuel/dv trend if dock
-# rate drops after enabling this — it means the coefficient is too high.
-ENV_FUEL_COEFF = 0.1
+# Fuel penalty: log-scaled cost on CUMULATIVE dv_used, not a raw linear
+# per-step cost. A linear cost (-coeff * ||action||) was tried first and
+# measurably failed at low fuel levels: cutting dv 4->2 m/s earns
+# coeff*2 reward, but cutting the equally-impressive (same 2x ratio)
+# 0.05->0.025 m/s only earns coeff*0.025 — 80x weaker absolute signal for
+# the same proportional win, so once dv drifted down near-optimal the
+# corrective gradient vanished into episode-to-episode noise and dv drifted
+# back up over the following ~500k timesteps of a real run. log1p gives
+# equal reward for equal *ratio* changes regardless of scale (telescoped
+# per-step exactly like reward_pos, so it stays a dense signal — see
+# libs/env.py::step). log1p (not raw log) is what keeps a zero-thrust
+# coasting step, i.e. the behavior we actually want, well-defined instead
+# of blowing up at ||action||=0. Also structurally safer than the old
+# linear cost: log grows so slowly that even a wildly wasteful trajectory
+# can't out-cost the ENV_BONUS the way an unbounded linear term eventually
+# could (log1p(200) ~ 5.3 vs a 50-point bonus).
+ENV_FUEL_COEFF = 10.0
+ENV_FUEL_LOG_SCALE = 1.0  # m/s — dv_used denominator inside log1p(dv_used / scale)
 
 # Physical per-burn actuator cap (m/s). Independent of any fuel budget —
 # sized to comfortably cover a single optimal impulse for the largest
