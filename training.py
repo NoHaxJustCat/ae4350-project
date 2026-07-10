@@ -23,7 +23,7 @@ from stable_baselines3 import TD3
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
-from stable_baselines3.common.noise import NormalActionNoise
+from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
 from stable_baselines3.common.monitor import Monitor
 
 from libs.constants import (
@@ -127,7 +127,9 @@ class NoiseDecayCallback(BaseCallback):
         if noise is None:
             return True
         # With n_envs > 1, SB3 wraps action_noise in VectorizedActionNoise,
-        # which holds one deep-copied NormalActionNoise per sub-env.
+        # which holds one deep-copied ActionNoise instance per sub-env
+        # (OrnsteinUhlenbeckActionNoise also exposes ._sigma, same as
+        # NormalActionNoise, so this decay logic works unchanged).
         sub_noises = getattr(noise, "noises", [noise])
         for sub in sub_noises:
             sub._sigma[:] = sigma
@@ -546,7 +548,18 @@ def main():
               f"--total-timesteps {args.total_timesteps})")
     else:
         action_dim = env.action_space.shape[0]
-        action_noise = NormalActionNoise(
+        # OU (not i.i.d. Gaussian): exploration is a temporally-correlated
+        # random walk, so a sustained multi-step push in one direction is a
+        # plausible exploration outcome instead of vanishingly unlikely. The
+        # true-optimal V-bar maneuver needs ~230+ consecutive steps of
+        # "coasting away" before it pays off — i.i.d. per-step noise can't
+        # produce that by chance, since each step is independent of the
+        # last; a correlated walk can. NOTE: OU's stationary std is
+        # sigma/sqrt(2*theta), not sigma itself (~1.8x larger at the SB3
+        # defaults theta=0.15, dt=0.01) — so actual exploration amplitude is
+        # somewhat bigger than the same sigma gave under Gaussian noise, not
+        # a bug if early behavior looks more aggressive than before.
+        action_noise = OrnsteinUhlenbeckActionNoise(
             mean=np.zeros(action_dim),
             sigma=ACTION_NOISE_SIGMA_START * np.ones(action_dim),
         )
