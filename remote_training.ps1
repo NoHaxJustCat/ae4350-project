@@ -99,6 +99,34 @@ $TmuxSession     = "hdp_training"
 #                        confirmed-fast-but-not-learning behavior on a real
 #                        run. Re-derive gradient_steps/(train_freq*n_envs)
 #                        before ever touching these again.
+#   Async actor/learner split (Ape-X-style): (2026-07, INVESTIGATED, NOT
+#                        BUILT) proposed as N worker processes stepping
+#                        envs into a shared replay buffer while 1 learner
+#                        process trains continuously off it (most cores
+#                        simulate, one trains). Rejected without building
+#                        it: env-stepping is only ~2% of steady-state
+#                        wall-clock time here — the BatchedCWVecEnv result
+#                        above is the direct experiment for "what if
+#                        simulation were free" (8.7x faster stepping moved
+#                        overall steps/s by 0%), so even a PERFECT overlap
+#                        of simulation with gradient compute caps out
+#                        around a ~2% win. The actual bottleneck (64
+#                        sequential single-core TD3 gradient steps per
+#                        vec-step) is a dependent chain — each step needs
+#                        the previous step's updated weights — not
+#                        independent parallel work, so it can't be split
+#                        across cores the way env-stepping can. Splitting
+#                        a single gradient step's own compute across
+#                        threads already lost to fewer threads (see 1
+#                        torch thread beating 4 above). A real multi-
+#                        writer buffer would also need a from-scratch
+#                        rewrite onto shared memory (SB3's ReplayBuffer is
+#                        plain numpy + a non-atomic pos counter, single-
+#                        process only) for that ~2% ceiling — not worth
+#                        it. Don't re-propose this unless the env itself
+#                        becomes genuinely expensive to step (a much
+#                        heavier physics model), which would change the
+#                        98/2 split this conclusion rests on.
 # Not enabled: --compile (torch.compile). More mature on Linux than Windows
 # in general, but unverified here — needs a working C/C++ toolchain in the
 # remote conda env and hasn't been benchmarked. Try it manually first:
@@ -109,7 +137,7 @@ $TmuxSession     = "hdp_training"
 # training.py --help for details (curriculum_distance resumes automatically
 # from that checkpoint's sidecar .curriculum.json if present).
 $TrainCommand    = "python -u training.py --scenario vbar --n-envs 64 " +
-                    "--net-arch 128,128 --vec-env dummy"
+                    "--net-arch 128,128,64 --vec-env dummy --torch-threads 16"
 # $TrainCommand    = "python -u training.py --scenario vbar --n-envs 64 " +
 #                     "--net-arch 64,64 --vec-env dummy"
 $ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results", "tmp",

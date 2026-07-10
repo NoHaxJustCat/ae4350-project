@@ -19,7 +19,7 @@ ORBIT_PERIOD = 2 * np.pi / OMEGA
 # --- Environment defaults ---
 ENV_DT = 5.0
 ENV_BOUNDARY = 200.0
-ENV_TIMEOUT = 1 * ORBIT_PERIOD
+ENV_TIMEOUT = 2 * ORBIT_PERIOD
 ENV_POS_TOLERANCE = 1.0
 ENV_VEL_COEFF = 10.0
 ENV_SHAPING_COEFF = 10.0
@@ -77,7 +77,7 @@ ENV_CURRICULUM_INCREMENT = 5.0         # distance added per successful dock [m]
 # could never learn that an early burn pays off hundreds of steps later.
 # gamma=0.999 gives an effective horizon of ~1000 steps, matching the
 # actual task timescale.
-GAMMA = 0.999
+GAMMA = 0.9995
 MAX_STEPS = int(ENV_TIMEOUT / ENV_DT) + 1
 
 ACTOR_LR = 3e-4
