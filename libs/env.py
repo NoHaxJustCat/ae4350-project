@@ -7,7 +7,6 @@ from libs.constants import (
     ENV_BOUNDARY,
     ENV_DT,
     ENV_FUEL_COEFF,
-    ENV_FUEL_LOG_SCALE,
     ENV_MAX_DV,
     ENV_POS_TOLERANCE,
     ENV_TIMEOUT,
@@ -80,15 +79,19 @@ class CWRendezvousEnv(gym.Env):
     were the source of repeated reward-exploit debugging (fast-burn-to-
     ceiling loops, reward discontinuities).
 
-    The fuel cost is log-scaled on cumulative dv_used, not linear per-step
-    action norm (see constants.py::ENV_FUEL_COEFF/ENV_FUEL_LOG_SCALE for
-    why): a linear cost gives equal reward for equal *absolute* dv
-    reductions, so its gradient vanishes once dv_used is already small —
-    cutting 4->2 m/s earns far more reward than the equally-impressive 2x
-    cut from 0.05->0.025 m/s, and a real run measurably drifted back up
-    once it reached that low-signal regime. log1p gives roughly equal
-    reward for equal *ratio* changes regardless of scale, so the pressure
-    to keep improving doesn't disappear as it approaches the optimum.
+    The fuel term is a terminal bonus on cumulative dv_used, paid only on a
+    successful dock: 15 * dv_used**-0.5. Earlier versions tried a per-step
+    linear cost (-coeff * ||action||), then a per-step log1p-telescoped
+    cost — both replaced. The linear cost gives equal reward for equal
+    *absolute* dv reductions, so its gradient vanishes once dv_used is
+    already small (cutting 4->2 m/s earns far more than the equally
+    impressive 2x cut from 0.05->0.025 m/s), and a real run measurably
+    drifted back up once it reached that low-signal regime. The inverse-
+    sqrt terminal bonus keeps that "smaller is disproportionately better"
+    pressure alive at low dv_used without ever letting fuel cost make
+    *failing* to dock look better than a wasteful dock (it's strictly
+    additive on top of the dock bonus, never subtracted elsewhere). A small
+    epsilon keeps it finite as dv_used -> 0.
 
     Scenario (2-D only, selects the initial-condition family; see
     CLAUDE.md goals 1 & 2). Sign/quadrant is randomized every reset() so a
@@ -232,7 +235,6 @@ class CWRendezvousEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         action = np.clip(action, -self.max_dv, self.max_dv)
-        dv_used_before = self.dv_used
         self.dv_used += np.linalg.norm(action)
 
         half = self.phys_dim // 2
@@ -254,16 +256,19 @@ class CWRendezvousEnv(gym.Env):
         terminated = bool(docked or out_of_bounds)
         truncated  = bool(timeout)
 
-        # --- Reward: dense distance-shaping + docking bonus + a log-scaled
-        # fuel cost. No ceiling, no truncation tied to it. reward_fuel is
-        # telescoped exactly like reward_pos, so summed over the episode it
-        # equals -fuel_coeff * log1p(total_dv_used / fuel_log_scale) even
-        # though it's delivered as a dense per-step signal.
+        # --- Reward: dense distance-shaping + docking bonus + a fuel bonus
+        # paid only on a successful dock, inverse-sqrt in cumulative
+        # dv_used so smaller dv_used is disproportionately rewarded even
+        # once it's already small (see class docstring). eps floors it so
+        # an extremely low-fuel dock can't spike to +inf / divide by zero.
         reward_pos = ENV_SHAPING_COEFF * delta / self.curriculum_distance
-        reward_fuel = -self.fuel_coeff * (
-            np.log1p(self.dv_used / ENV_FUEL_LOG_SCALE)
-            - np.log1p(dv_used_before / ENV_FUEL_LOG_SCALE)
-        )
+
+        if docked:
+            eps = 1
+            reward_fuel = self.fuel_coeff * (self.dv_used + eps) ** (-1)
+        else:
+            reward_fuel = 0.0
+
         reward_terminal = (self.bonus - self.vel_coeff * vel_error) if docked else 0.0
         reward = reward_pos + reward_fuel + reward_terminal
 

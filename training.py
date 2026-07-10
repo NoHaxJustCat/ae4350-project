@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 from collections import deque
+import json
 import os
 from pathlib import Path
 import platform
@@ -52,7 +53,6 @@ from libs.constants import (
     TRAINED_MODEL_DIR,
     TRAINING_HISTORY_PATH,
 )
-from libs.batched_env import BatchedCWVecEnv
 from libs.env import CWRendezvousEnv
 from libs.normalization import NormalizedObsEnv
 from libs.symmetry import CanonicalizeDirectionEnv
@@ -61,7 +61,7 @@ from libs.trajectory import plot_trajectory
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def make_single_env(scenario: str):
+def make_single_env(scenario: str, curriculum_start_distance: float | None = None):
     def _init():
         # Runs inside each SubprocVecEnv worker. Each worker only ever does
         # a 4x4 matmul per step — letting it default to a multi-threaded
@@ -69,16 +69,17 @@ def make_single_env(scenario: str):
         # for the same cores. The main process (real gradient compute) sets
         # its own thread count separately in main().
         #
-        # CAVEAT (discovered in the 2026-07 batched-vec-env benchmark): with
-        # DummyVecEnv these thunks run in the MAIN process, so this line
-        # silently overrides --torch-threads down to 1 for the gradient
-        # updates too. That accident happened to WIN on the EPYC box —
-        # 1 torch thread beat 4 by ~10% steps/s (348 vs 312), because
+        # CAVEAT: with DummyVecEnv these thunks run in the MAIN process, so
+        # this line silently overrides --torch-threads down to 1 for the
+        # gradient updates too. That accident happened to WIN on the EPYC
+        # box — 1 torch thread beat 4 by ~10% steps/s (348 vs 312), because
         # batch-256 [64,64] matmuls are too small for intra-op parallelism
-        # to pay for its sync overhead. The batched vec-env path doesn't run
-        # this thunk, so give it --torch-threads 1 explicitly to match.
+        # to pay for its sync overhead.
         torch.set_num_threads(1)
-        env = CWRendezvousEnv(omega=OMEGA, scenario=scenario)
+        env_kwargs = {}
+        if curriculum_start_distance is not None:
+            env_kwargs["curriculum_start_distance"] = curriculum_start_distance
+        env = CWRendezvousEnv(omega=OMEGA, scenario=scenario, **env_kwargs)
         env = CanonicalizeDirectionEnv(env)  # must wrap the raw (unnormalized) env
         env = NormalizedObsEnv(env)
         return Monitor(env)
@@ -178,15 +179,23 @@ class PeriodicCheckpointCallback(BaseCallback):
     This is what remote_training.ps1's background poller now rsyncs back
     periodically, so a dropped SSH session doesn't lose all progress —
     only whatever happened since the last checkpoint.
+
+    Also writes a small <name>_<steps>_steps.curriculum.json sidecar with
+    the curriculum_distance at save time. SB3's model.save() only persists
+    the policy/optimizer/num_timesteps — curriculum_distance lives in
+    CurriculumCallback, not the model, so --resume-from needs this sidecar
+    to avoid silently restarting the curriculum from the beginning.
     """
 
     def __init__(self, save_dir: Path, name_prefix: str, n_envs: int,
-                 save_freq_timesteps: int = 1000, keep_last: int = 20):
+                 save_freq_timesteps: int = 1000, keep_last: int = 20,
+                 curriculum_callback: "CurriculumCallback | None" = None):
         super().__init__(verbose=0)
         self.save_dir = save_dir
         self.name_prefix = name_prefix
         self.keep_last = keep_last
         self.save_freq_calls = max(save_freq_timesteps // n_envs, 1)
+        self.curriculum_callback = curriculum_callback
 
     def _on_step(self) -> bool:
         if self.n_calls % self.save_freq_calls == 0:
@@ -194,12 +203,19 @@ class PeriodicCheckpointCallback(BaseCallback):
             path = self.save_dir / f"{self.name_prefix}_{self.num_timesteps}_steps"
             self.model.save(str(path))
 
+            if self.curriculum_callback is not None:
+                sidecar = path.with_suffix(".curriculum.json")
+                sidecar.write_text(json.dumps(
+                    {"curriculum_distance": self.curriculum_callback.curriculum_distance}
+                ))
+
             checkpoints = sorted(
                 self.save_dir.glob(f"{self.name_prefix}_*_steps.zip"),
                 key=lambda p: p.stat().st_mtime,
             )
             for old in checkpoints[:-self.keep_last]:
                 old.unlink(missing_ok=True)
+                old.with_suffix(".curriculum.json").unlink(missing_ok=True)
         return True
 
 
@@ -423,14 +439,30 @@ def parse_args():
                     help="Save the model every N environment timesteps.")
     p.add_argument("--keep-last-checkpoints", type=int, default=5,
                     help="Only keep the N most recent checkpoints on disk.")
+    p.add_argument("--resume-from", default=None,
+                    help="Path to a saved checkpoint .zip (e.g. "
+                         "trained/checkpoints/vbar_td3_2299264_steps.zip) to continue "
+                         "training from instead of starting fresh. --total-timesteps is "
+                         "still the ORIGINAL full target (e.g. 3000000), not a remaining "
+                         "amount — the run continues until the model's num_timesteps "
+                         "reaches it. Looks for a sidecar <path-without-.zip>.curriculum.json "
+                         "next to the checkpoint to resume curriculum_distance too (written "
+                         "automatically by PeriodicCheckpointCallback); if missing, curriculum "
+                         "restarts at ENV_CURRICULUM_START_DISTANCE. The replay buffer is NOT "
+                         "restored (not saved by the checkpoint callback), so gradient updates "
+                         "pause again until it refills past MIN_BUFFER — network weights carry "
+                         "over regardless.")
 
     # ── Perf knobs ──────────────────────────────────────────────────────────
-    p.add_argument("--vec-env", choices=["auto", "dummy", "subproc", "batched"], default="auto",
+    p.add_argument("--vec-env", choices=["auto", "dummy", "subproc"], default="auto",
                     help="'auto' = subproc if n-envs>1 else dummy. Force one to A/B test "
                          "IPC overhead vs parallelism on an env this cheap to step. "
-                         "'batched' = BatchedCWVecEnv: single process, all n envs stepped "
-                         "as one (n,4)@(4,4) numpy matmul instead of a Python loop — no "
-                         "per-env .step() frames, no IPC (see libs/batched_env.py).")
+                         "dummy measurably wins on this workload (see remote_training.ps1) "
+                         "since steady-state training is bottlenecked on the gradient loop, "
+                         "not env stepping — a batched (single-numpy-op) vec-env was tried "
+                         "and removed after confirming zero steady-state benefit for the "
+                         "real maintenance cost of a second, hand-duplicated reward/physics "
+                         "implementation.")
     p.add_argument("--vec-env-start-method",
                     default="fork" if platform.system() != "Windows" else "spawn",
                     choices=["fork", "spawn", "forkserver"],
@@ -476,57 +508,68 @@ def main():
     shutil.rmtree(tmp_dir, ignore_errors=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    n_envs = max(1, args.n_envs)
-    if args.vec_env == "batched":
-        # Single process, no per-env Python objects at all: all n_envs are
-        # stepped as one numpy batch (see libs/batched_env.py).
-        print("vec_env: BatchedCWVecEnv")
-        env = BatchedCWVecEnv(n_envs=n_envs, scenario=args.scenario)
-    else:
-        if args.vec_env == "dummy":
-            vec_cls, vec_kwargs = DummyVecEnv, {}
-        elif args.vec_env == "subproc":
-            vec_cls, vec_kwargs = SubprocVecEnv, dict(start_method=args.vec_env_start_method)
-        else:  # auto
-            if n_envs > 1:
-                vec_cls, vec_kwargs = SubprocVecEnv, dict(start_method=args.vec_env_start_method)
-            else:
-                vec_cls, vec_kwargs = DummyVecEnv, {}
-        print(f"vec_env: {vec_cls.__name__}"
-              + (f" (start_method={vec_kwargs['start_method']})" if vec_kwargs else ""))
-        env = make_vec_env(make_single_env(args.scenario), n_envs=n_envs,
-                            vec_env_cls=vec_cls, vec_env_kwargs=vec_kwargs)
+    resume_curriculum_distance = None
+    if args.resume_from:
+        sidecar = Path(args.resume_from).with_suffix("").with_suffix(".curriculum.json")
+        if sidecar.exists():
+            resume_curriculum_distance = json.loads(sidecar.read_text())["curriculum_distance"]
+            print(f"Resuming curriculum_distance = {resume_curriculum_distance:.1f} m (from {sidecar})")
+        else:
+            print(f"WARNING: no curriculum sidecar at {sidecar} — curriculum will "
+                  f"restart at {ENV_CURRICULUM_START_DISTANCE:.1f} m")
 
-    action_dim = env.action_space.shape[0]
-    action_noise = NormalActionNoise(
-        mean=np.zeros(action_dim),
-        sigma=ACTION_NOISE_SIGMA_START * np.ones(action_dim),
+    n_envs = max(1, args.n_envs)
+    if args.vec_env == "dummy":
+        vec_cls, vec_kwargs = DummyVecEnv, {}
+    elif args.vec_env == "subproc":
+        vec_cls, vec_kwargs = SubprocVecEnv, dict(start_method=args.vec_env_start_method)
+    else:  # auto
+        if n_envs > 1:
+            vec_cls, vec_kwargs = SubprocVecEnv, dict(start_method=args.vec_env_start_method)
+        else:
+            vec_cls, vec_kwargs = DummyVecEnv, {}
+    print(f"vec_env: {vec_cls.__name__}"
+          + (f" (start_method={vec_kwargs['start_method']})" if vec_kwargs else ""))
+    env = make_vec_env(
+        make_single_env(args.scenario, curriculum_start_distance=resume_curriculum_distance),
+        n_envs=n_envs, vec_env_cls=vec_cls, vec_env_kwargs=vec_kwargs,
     )
 
     net_arch = [int(x) for x in args.net_arch.split(",")]
-    policy_kwargs = dict(net_arch=net_arch)
     print(f"net_arch: {net_arch} | train_freq: {args.train_freq} | "
           f"gradient_steps: {args.gradient_steps}")
 
-    model = TD3(
-        policy               = "MlpPolicy",
-        env                  = env,
-        learning_rate        = CRITIC_LR,
-        buffer_size          = REPLAY_BUFFER_SIZE,
-        learning_starts      = MIN_BUFFER,
-        batch_size           = BATCH_SIZE,
-        tau                  = TAU,
-        gamma                = GAMMA,
-        train_freq           = (args.train_freq, "step"),
-        gradient_steps       = args.gradient_steps,
-        action_noise         = action_noise,
-        policy_delay         = 2,
-        target_policy_noise  = TD3_TARGET_POLICY_NOISE,
-        target_noise_clip    = TD3_TARGET_NOISE_CLIP,
-        policy_kwargs        = policy_kwargs,
-        verbose              = 0,
-        device               = args.device,
-    )
+    if args.resume_from:
+        model = TD3.load(args.resume_from, env=env, device=args.device)
+        print(f"Resumed model from {args.resume_from} at {model.num_timesteps} timesteps "
+              f"({args.total_timesteps - model.num_timesteps} remaining toward "
+              f"--total-timesteps {args.total_timesteps})")
+    else:
+        action_dim = env.action_space.shape[0]
+        action_noise = NormalActionNoise(
+            mean=np.zeros(action_dim),
+            sigma=ACTION_NOISE_SIGMA_START * np.ones(action_dim),
+        )
+        policy_kwargs = dict(net_arch=net_arch)
+        model = TD3(
+            policy               = "MlpPolicy",
+            env                  = env,
+            learning_rate        = CRITIC_LR,
+            buffer_size          = REPLAY_BUFFER_SIZE,
+            learning_starts      = MIN_BUFFER,
+            batch_size           = BATCH_SIZE,
+            tau                  = TAU,
+            gamma                = GAMMA,
+            train_freq           = (args.train_freq, "step"),
+            gradient_steps       = args.gradient_steps,
+            action_noise         = action_noise,
+            policy_delay         = 2,
+            target_policy_noise  = TD3_TARGET_POLICY_NOISE,
+            target_noise_clip    = TD3_TARGET_NOISE_CLIP,
+            policy_kwargs        = policy_kwargs,
+            verbose              = 0,
+            device               = args.device,
+        )
 
     if args.compile:
         try:
@@ -558,16 +601,31 @@ def main():
             n_envs=n_envs,
             save_freq_timesteps=args.checkpoint_freq,
             keep_last=args.keep_last_checkpoints,
+            curriculum_callback=curriculum_callback,
         ),
         ThroughputCallback(log_every_timesteps=args.throughput_log_every),
     ]
     if curriculum_callback is not None:
         callback.append(curriculum_callback)
 
+    # SB3's learn(total_timesteps, reset_num_timesteps=False) treats
+    # total_timesteps as an INCREMENT added to the model's existing
+    # num_timesteps, not an absolute target — so on resume we pass the
+    # remaining budget, not args.total_timesteps itself, to keep
+    # --total-timesteps meaning "the original full target" everywhere else
+    # (NoiseDecayCallback's decay schedule in particular needs the ORIGINAL
+    # total, not the remaining one, since it compares against the model's
+    # absolute num_timesteps).
+    if args.resume_from:
+        remaining_timesteps = max(args.total_timesteps - model.num_timesteps, 0)
+    else:
+        remaining_timesteps = args.total_timesteps
+
     model.learn(
-        total_timesteps = args.total_timesteps,
-        callback         = callback,
-        progress_bar     = False,
+        total_timesteps      = remaining_timesteps,
+        callback              = callback,
+        progress_bar          = False,
+        reset_num_timesteps   = not bool(args.resume_from),
     )
 
     model_path = f"{TRAINED_MODEL_DIR}/{args.scenario}_td3"

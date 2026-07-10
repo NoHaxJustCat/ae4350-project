@@ -1,10 +1,13 @@
 <#
 .SYNOPSIS
-    Syncs the project to aurora-server, creates/uses a conda env,
-    runs training (blocking, with live logs), then pulls back out/ and trained/.
-    While training runs, periodically pulls back the latest trajectory PNG.
+    Syncs the project to aurora-server, creates/uses a conda env, launches
+    training DETACHED in a remote tmux session (survives SSH disconnects —
+    e.g. the local machine sleeping — instead of dying with the connection),
+    live-tails its log with automatic reconnect, then pulls back out/ and
+    trained/. While training runs, periodically pulls back the latest
+    trajectory PNG and checkpoints.
 .USAGE
-    .\deploy_train.ps1
+    .\remote_training.ps1
 #>
 
 $ErrorActionPreference = "Stop"
@@ -16,6 +19,7 @@ $RemoteHost      = "nicolobasso@aurora-server"
 $RemoteSubfolder = "hdp_training"
 $CondaEnvName    = "hdp-cw"
 $PythonVersion   = "3.11"
+$TmuxSession     = "hdp_training"
 # Perf flags for the remote EPYC 7532 (32c/64t) Linux/RHEL box. History of
 # what was tried, kept here so nobody re-derives this the hard way:
 #   --net-arch 64,64  : right-sized net, ~1.9x locally, confirmed platform-
@@ -57,44 +61,36 @@ $PythonVersion   = "3.11"
 #                        inherently a problem now, it may just reflect that
 #                        this problem genuinely doesn't need 64 threads of
 #                        compute. Watch dock-rate-vs-timesteps, not CPU%.
-#   --vec-env batched  : (2026-07) BatchedCWVecEnv (libs/batched_env.py) —
-#                        third round of this saga. Steps all 64 envs as ONE
-#                        (64,4)@(4,4) numpy matmul per vec-step instead of
-#                        DummyVecEnv's Python loop of 64 .step() calls.
-#                        Verified equivalent to the per-env stack to 1e-9
-#                        over 2570 episodes (both scenarios, both signs, all
-#                        four episode endings). Measured on THIS box:
-#                          - env-only: 17.1k -> 149.8k env-steps/s (8.7x);
-#                            3.74ms -> 0.43ms per vec-step
-#                          - pre-learning_starts (rollout-only): 3.4k ->
-#                            17.9k steps/s
-#                          - steady-state training: ~344 vs ~348 steps/s
-#                            (parity, within noise) at --torch-threads 1
-#                        Steady state is ~98% gradient updates (64
+#   --vec-env batched  : (2026-07, REMOVED) BatchedCWVecEnv (libs/batched_env.py)
+#                        stepped all 64 envs as ONE (64,4)@(4,4) numpy matmul
+#                        per vec-step instead of DummyVecEnv's Python loop of
+#                        64 .step() calls. Verified equivalent to the per-env
+#                        stack to 1e-9 over 2570 episodes, and genuinely fast
+#                        at env-stepping (17.1k -> 149.8k env-steps/s, 8.7x).
+#                        But steady-state TRAINING throughput was measured at
+#                        ~344 (batched) vs ~348 (dummy) steps/s — parity,
+#                        because steady state is ~98% gradient updates (64
 #                        sequential batch-256 updates per vec-step at UTD
-#                        1.0), so NO env backend can move it — the one busy
-#                        core during training is the gradient loop, and
-#                        that's optimal (see --torch-threads below). Keep
-#                        batched anyway: env cost is permanently off the
-#                        table if n_envs/UTD ever change, and the curriculum
-#                        push is one attribute write instead of an
-#                        env_method fan-out.
-#   --torch-threads 1  : MEASURED, not a guess: 1 thread = 344 steps/s
-#                        (99% CPU), 2 = 327 (199%), 4 = 312 (398%). Intra-op
-#                        parallelism on batch-256 [64,64] matmuls costs more
-#                        in sync than it buys in compute — more cores make
-#                        it SLOWER. NOTE: the old dummy runs got this
-#                        accidentally: make_single_env()'s
-#                        torch.set_num_threads(1) (meant for subproc
-#                        workers) runs in the MAIN process under
-#                        DummyVecEnv, silently overriding --torch-threads.
-#                        The batched path skips those thunks, so 1 must be
-#                        passed explicitly. "Only one core busy" during
-#                        steady-state training is the CORRECT resting state
-#                        for this workload, not a bug: the gradient loop is
-#                        inherently serial and too small to parallelize.
-#   --vec-env-start-method : irrelevant now, neither dummy nor batched uses
-#                        multiprocessing at all. Left unset.
+#                        1.0), so env backend can't move it regardless. Kept
+#                        initially as future-proofing ("useful if n_envs/UTD
+#                        ever change"), but it duplicates every reward/physics
+#                        formula in libs/env.py by hand — and that duplication
+#                        caused a real bug (a reward-function edit silently
+#                        not applying on remote runs, which use the batched
+#                        path). Zero measured benefit for the actual training
+#                        regime + a real maintenance/correctness cost that
+#                        already bit once = removed. If a future config
+#                        genuinely becomes env-step-bound, re-benchmark before
+#                        reaching for this again rather than assuming it'll
+#                        still be the fix.
+#   "Only one core busy" during steady-state training is the CORRECT resting
+#   state for this workload, not a bug: the gradient loop is inherently
+#   serial and too small (batch-256, net_arch=[64,64]) for more threads to
+#   help — DummyVecEnv's make_single_env() thunks run in the MAIN process and
+#   accidentally pin torch to 1 thread there too, which measured faster than
+#   more threads anyway (344 vs 312 steps/s at 4 threads).
+#   --vec-env-start-method : irrelevant for dummy, no multiprocessing at all.
+#                        Left unset.
 #   --train-freq / --gradient-steps : deliberately NOT overridden — left at
 #                        training.py's defaults (train_freq=1, gradient_steps
 #                        =-1), a true 1 learning-update per 1 collected step.
@@ -107,15 +103,23 @@ $PythonVersion   = "3.11"
 # in general, but unverified here — needs a working C/C++ toolchain in the
 # remote conda env and hasn't been benchmarked. Try it manually first:
 #   python -u training.py --scenario vbar --n-envs 64 --vec-env dummy --compile --total-timesteps 20000
+# To resume a checkpoint that got interrupted (SSH dropped before tmux
+# detachment existed, machine rebooted, tmux session killed, etc.), add
+# --resume-from trained/checkpoints/<name>_<steps>_steps.zip here — see
+# training.py --help for details (curriculum_distance resumes automatically
+# from that checkpoint's sidecar .curriculum.json if present).
 $TrainCommand    = "python -u training.py --scenario vbar --n-envs 64 " +
-                    "--net-arch 64,64 --vec-env batched --torch-threads 1"
+                    "--net-arch 128,128 --vec-env dummy"
+# $TrainCommand    = "python -u training.py --scenario vbar --n-envs 64 " +
+#                     "--net-arch 64,64 --vec-env dummy"
 $ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results", "tmp",
                      "__pycache__", ".venv", "venv")
-$PollIntervalSeconds = 20
+$PollIntervalSeconds     = 20
+$ReconnectWaitSeconds    = 15
 #############################################
 
 # ── 1. Sync ───────────────────────────────────────────────────────────────────
-Write-Host "`n==> [1/4] Syncing to ${RemoteHost}:~/${RemoteSubfolder}/" -ForegroundColor Cyan
+Write-Host "`n==> [1/5] Syncing to ${RemoteHost}:~/${RemoteSubfolder}/" -ForegroundColor Cyan
 ssh $RemoteHost "mkdir -p ~/${RemoteSubfolder}/out ~/${RemoteSubfolder}/trained"
 
 $StagingDir = Join-Path $env:TEMP "hdp_stage"
@@ -129,12 +133,54 @@ scp -r "$StagingDir\*" "${RemoteHost}:~/${RemoteSubfolder}/"
 Remove-Item -Recurse -Force $StagingDir
 Write-Host "    Sync complete."
 
-# ── 2. Remote: setup + train ──────────────────────────────────────────────────
-Write-Host "`n==> [2/4] Remote setup + training (live logs below)" -ForegroundColor Cyan
-Write-Host "    SSH session open — do not close this window.`n" -ForegroundColor Yellow
+# ── 2. Remote: setup + launch training (detached) ─────────────────────────────
+# Split into two remote scripts on purpose:
+#   _run.sh         : conda setup (blocking, foreground, usually fast) then
+#                      launches _train_inner.sh INSIDE a detached tmux
+#                      session and returns immediately.
+#   _train_inner.sh : the actual conda-activate + $TrainCommand + writes
+#                      train.done with the exit code when finished.
+# Previously $TrainCommand ran directly in _run.sh's foreground, which ran
+# directly in this script's ssh session — so the instant that SSH connection
+# dropped (e.g. the local machine sleeping), the remote process got SIGHUP'd
+# and died. That's exactly what happened to a run 76.6% of the way through
+# 3M timesteps. tmux detaches the actual training process from this SSH
+# session entirely: the connection can drop and reconnect (or drop for
+# good) without touching it.
+Write-Host "`n==> [2/5] Remote setup + launching training in detached tmux session '$TmuxSession'" -ForegroundColor Cyan
+
+$remoteInnerSh = Join-Path $env:TEMP "hdp_remote_inner_$(Get-Random).sh"
+$innerScript = @'
+#!/usr/bin/env bash
+REMOTE_DIR=~/__SUBFOLDER__
+CONDA_ENV=__CONDAENV__
+
+CONDA_SH=""
+for c in /opt/miniconda3/etc/profile.d/conda.sh \
+          ~/miniconda3/etc/profile.d/conda.sh \
+          ~/anaconda3/etc/profile.d/conda.sh \
+          /opt/conda/etc/profile.d/conda.sh \
+          /usr/local/conda/etc/profile.d/conda.sh; do
+    if [ -f "$c" ]; then CONDA_SH="$c"; break; fi
+done
+source "$CONDA_SH"
+conda activate "$CONDA_ENV"
+cd "$REMOTE_DIR"
+
+echo "========================================="
+echo " Training started  -- $(date)"
+echo "========================================="
+__TRAINCMD__
+echo $? > "$REMOTE_DIR/train.done"
+echo "========================================="
+echo " Training finished -- $(date)"
+echo "========================================="
+'@
+$innerScript = $innerScript.Replace("__SUBFOLDER__", $RemoteSubfolder)
+$innerScript = $innerScript.Replace("__CONDAENV__",  $CondaEnvName)
+$innerScript = $innerScript.Replace("__TRAINCMD__",  $TrainCommand)
 
 $remoteSh = Join-Path $env:TEMP "hdp_remote_$(Get-Random).sh"
-
 $bashScript = @'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -143,6 +189,7 @@ trap 'echo "REMOTE ERROR at line $LINENO (exit $?)" >&2' ERR
 REMOTE_DIR=~/__SUBFOLDER__
 CONDA_ENV=__CONDAENV__
 PYTHON_VER=__PYVER__
+SESSION=__TMUXSESSION__
 
 echo "[setup] Remote dir : $REMOTE_DIR"
 echo "[setup] Conda env  : $CONDA_ENV"
@@ -186,32 +233,35 @@ for req in "$REMOTE_DIR/requirements.txt" "$REMOTE_DIR/libs/requirements.txt"; d
     fi
 done
 
-# train
-echo ""
-echo "========================================="
-echo " Training started  -- $(date)"
-echo "========================================="
 cd "$REMOTE_DIR"
 rm -rf tmp
 mkdir -p out trained tmp
-__TRAINCMD__
-echo ""
-echo "========================================="
-echo " Training finished -- $(date)"
-echo "========================================="
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+rm -f train.log train.done
+chmod +x "$REMOTE_DIR/_train_inner.sh"
+tmux new-session -d -s "$SESSION" \
+    "bash '$REMOTE_DIR/_train_inner.sh' > '$REMOTE_DIR/train.log' 2>&1"
+echo "[setup] Training launched in detached tmux session '$SESSION' -- safe to disconnect now."
 '@
 
 $bashScript = $bashScript.Replace("__SUBFOLDER__", $RemoteSubfolder)
 $bashScript = $bashScript.Replace("__CONDAENV__",  $CondaEnvName)
 $bashScript = $bashScript.Replace("__PYVER__",     $PythonVersion)
-$bashScript = $bashScript.Replace("__TRAINCMD__",  $TrainCommand)
+$bashScript = $bashScript.Replace("__TMUXSESSION__", $TmuxSession)
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-$unixScript = $bashScript -replace "`r`n", "`n"
-[System.IO.File]::WriteAllText($remoteSh, $unixScript, $utf8NoBom)
+[System.IO.File]::WriteAllText($remoteInnerSh, ($innerScript -replace "`r`n", "`n"), $utf8NoBom)
+[System.IO.File]::WriteAllText($remoteSh,      ($bashScript  -replace "`r`n", "`n"), $utf8NoBom)
 
-scp "$remoteSh" "${RemoteHost}:~/${RemoteSubfolder}/_run.sh"
-Remove-Item -Force $remoteSh
+scp "$remoteInnerSh" "${RemoteHost}:~/${RemoteSubfolder}/_train_inner.sh"
+scp "$remoteSh"      "${RemoteHost}:~/${RemoteSubfolder}/_run.sh"
+Remove-Item -Force $remoteInnerSh, $remoteSh
+
+ssh $RemoteHost "bash ~/${RemoteSubfolder}/_run.sh"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "`nERROR: remote setup script exited with code $LASTEXITCODE" -ForegroundColor Red
+    exit $LASTEXITCODE
+}
 
 New-Item -ItemType Directory -Force -Path ".\tmp" | Out-Null
 $LocalTmpDir = (Resolve-Path ".\tmp").Path
@@ -220,10 +270,10 @@ $LocalTrainedDir = (Resolve-Path ".\trained").Path
 
 # ── 3. Background poller ──────────────────────────────────────────────────────
 # Also periodically pulls trained/checkpoints/ back (training.py now saves a
-# checkpoint every --checkpoint-freq timesteps). If the SSH session below
-# drops, the final "retrieve results" step never runs — this poller is what
-# actually saves you from losing all progress, since it already pulled the
-# most recent checkpoint within the last $PollIntervalSeconds.
+# checkpoint every --checkpoint-freq timesteps, plus a curriculum sidecar
+# .json needed to --resume-from it correctly). This is the actual progress
+# safety net now — training itself survives disconnects via tmux, but this
+# is still what gets checkpoints onto your local disk periodically.
 #
 # Uses `scp -r ".../dir/*" "local\dir\"` rather than rsync — rsync isn't
 # installed on this machine (only OpenSSH's ssh/scp are). Unlike
@@ -246,23 +296,57 @@ $pollJob = Start-Job -ScriptBlock {
 
 Write-Host "    Live trajectory + checkpoint polling started -> .\tmp\latest_trajectory.png, .\trained\checkpoints\ (every ${PollIntervalSeconds}s)`n" -ForegroundColor DarkGray
 
+# ── 4. Live-tail training.log with automatic reconnect ────────────────────────
+# Training itself is safe (detached in tmux) regardless of what this loop
+# does — this is purely for live visibility. `ssh ... tail -f` blocks until
+# either the connection drops or the remote shell exits; either way, when it
+# returns we check train.done on the remote to tell "training actually
+# finished" apart from "just got disconnected," and reconnect in the latter
+# case instead of giving up. First attempt tails from the start of the file
+# (matches old behavior); reconnects only show recent context, not a full
+# replay of a potentially huge log.
+Write-Host "==> [3/5] Watching training.log (Ctrl+C stops watching only — training keeps running remotely)`n" -ForegroundColor Cyan
+
+$trainingDone = $false
+$firstAttempt = $true
 try {
-    ssh $RemoteHost "bash ~/${RemoteSubfolder}/_run.sh"
-    $trainExitCode = $LASTEXITCODE
+    while (-not $trainingDone) {
+        if ($firstAttempt) {
+            ssh $RemoteHost "tail -n +1 -f ~/${RemoteSubfolder}/train.log"
+            $firstAttempt = $false
+        } else {
+            ssh $RemoteHost "tail -n 40 -f ~/${RemoteSubfolder}/train.log"
+        }
+        # tail -f only returns here if the SSH connection dropped or the
+        # remote shell exited — either way, check whether training actually
+        # finished (train.done written) before deciding to reconnect.
+        $doneCheck = ssh -o ConnectTimeout=10 $RemoteHost `
+            "test -f ~/${RemoteSubfolder}/train.done && echo DONE" 2>$null
+        if ($doneCheck -match "DONE") {
+            $trainingDone = $true
+        } else {
+            Write-Host "`n[reconnect] Connection to $RemoteHost lost -- training continues in the remote tmux session '$TmuxSession' regardless. Reconnecting in ${ReconnectWaitSeconds}s...`n" -ForegroundColor Yellow
+            Start-Sleep -Seconds $ReconnectWaitSeconds
+        }
+    }
 }
 finally {
     Stop-Job $pollJob -ErrorAction SilentlyContinue | Out-Null
     Remove-Job $pollJob -ErrorAction SilentlyContinue | Out-Null
 }
 
+$trainExitCodeRaw = ssh $RemoteHost "cat ~/${RemoteSubfolder}/train.done" 2>$null
+$trainExitCode = 1
+[int]::TryParse($trainExitCodeRaw, [ref]$trainExitCode) | Out-Null
+
 if ($trainExitCode -ne 0) {
-    Write-Host "`nERROR: remote script exited with code $trainExitCode" -ForegroundColor Red
+    Write-Host "`nERROR: remote training exited with code $trainExitCode (see train.log)" -ForegroundColor Red
     exit $trainExitCode
 }
 
-# ── 4. Retrieve results ───────────────────────────────────────────────────────
+# ── 5. Retrieve results ───────────────────────────────────────────────────────
 # scp, not rsync — see note above the background poller.
-Write-Host "`n==> [4/4] Retrieving out/, trained/, tmp/ ..." -ForegroundColor Cyan
+Write-Host "`n==> [5/5] Retrieving out/, trained/, tmp/ ..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path ".\out"             | Out-Null
 New-Item -ItemType Directory -Force -Path ".\trained\checkpoints" | Out-Null
 New-Item -ItemType Directory -Force -Path ".\tmp"             | Out-Null

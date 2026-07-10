@@ -24,24 +24,20 @@ ENV_POS_TOLERANCE = 1.0
 ENV_VEL_COEFF = 10.0
 ENV_SHAPING_COEFF = 10.0
 ENV_BONUS = 50.0
-# Fuel penalty: log-scaled cost on CUMULATIVE dv_used, not a raw linear
-# per-step cost. A linear cost (-coeff * ||action||) was tried first and
-# measurably failed at low fuel levels: cutting dv 4->2 m/s earns
-# coeff*2 reward, but cutting the equally-impressive (same 2x ratio)
-# 0.05->0.025 m/s only earns coeff*0.025 — 80x weaker absolute signal for
-# the same proportional win, so once dv drifted down near-optimal the
-# corrective gradient vanished into episode-to-episode noise and dv drifted
-# back up over the following ~500k timesteps of a real run. log1p gives
-# equal reward for equal *ratio* changes regardless of scale (telescoped
-# per-step exactly like reward_pos, so it stays a dense signal — see
-# libs/env.py::step). log1p (not raw log) is what keeps a zero-thrust
-# coasting step, i.e. the behavior we actually want, well-defined instead
-# of blowing up at ||action||=0. Also structurally safer than the old
-# linear cost: log grows so slowly that even a wildly wasteful trajectory
-# can't out-cost the ENV_BONUS the way an unbounded linear term eventually
-# could (log1p(200) ~ 5.3 vs a 50-point bonus).
-ENV_FUEL_COEFF = 10.0
-ENV_FUEL_LOG_SCALE = 1.0  # m/s — dv_used denominator inside log1p(dv_used / scale)
+# Fuel bonus: paid only on a successful dock, inverse-sqrt in cumulative
+# dv_used (reward_fuel = coeff * (dv_used + eps)**-0.5 — see
+# libs/env.py::step). Two earlier designs were tried and replaced: a linear
+# per-step cost (-coeff * ||action||) gives equal reward for equal
+# *absolute* dv reductions, so its gradient vanished once dv_used was
+# already small (cutting 4->2 m/s earned far more than the equally
+# impressive 2x cut from 0.05->0.025 m/s) and a real run measurably drifted
+# back up once it reached that low-signal regime; a log1p-telescoped
+# version fixed the ratio-invariance but was still a flat cost regardless
+# of outcome. This version rewards low fuel disproportionately at the low
+# end (like the log1p version) while being strictly additive on top of the
+# dock bonus — it can never make failing to dock look better than a
+# wasteful dock, since it's zero unless docked=True.
+ENV_FUEL_COEFF = 150.0
 
 # Physical per-burn actuator cap (m/s). Independent of any fuel budget —
 # sized to comfortably cover a single optimal impulse for the largest
