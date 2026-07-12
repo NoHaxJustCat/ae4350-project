@@ -3,6 +3,8 @@ Deterministic evaluation rollouts for a trained TD3 model, plus comparison
 against the classical reference Δv formulas from CLAUDE.md.
 """
 
+from pathlib import Path
+
 import numpy as np
 
 from libs.constants import OMEGA, MAX_STEPS
@@ -15,6 +17,21 @@ from libs.reference import (
     dv_rbar_strategy_rv,
     dv_rbar_strategy_vv,
 )
+
+
+def find_latest_model(scenario: str, trained_dir: str = "trained") -> str:
+    """Most recently modified '{scenario}_td3.zip' anywhere under
+    trained_dir/ — every training.py run now lives in its own
+    trained/<session_id>/<run_tag>/ folder (see training.py) rather than a
+    shared flat path, so vbar.py/rbar.py find "whatever finished most
+    recently" instead of a hardcoded location."""
+    candidates = list(Path(trained_dir).rglob(f"{scenario}_td3.zip"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No {scenario}_td3.zip found under {trained_dir}/ — train one first, "
+            f"or pass an explicit model path as the first argument."
+        )
+    return str(max(candidates, key=lambda p: p.stat().st_mtime))
 
 
 def run_episode(model, scenario: str, sign: float, max_steps: int = MAX_STEPS) -> dict:

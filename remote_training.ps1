@@ -3,9 +3,13 @@
     Syncs the project to aurora-server, creates/uses a conda env, launches
     training DETACHED in a remote tmux session (survives SSH disconnects —
     e.g. the local machine sleeping — instead of dying with the connection),
-    live-tails its log with automatic reconnect, then pulls back out/ and
-    trained/. While training runs, periodically pulls back the latest
-    trajectory PNG and checkpoints.
+    shows a live status dashboard (one row per run, refreshed periodically)
+    instead of raw log tailing, then pulls back out/ and trained/. While
+    training runs, periodically pulls back the latest trajectory PNGs,
+    checkpoints, diagnostics plots, and status.json files.
+
+    To actually stop a detached remote run (Ctrl+C here only stops
+    watching — see the dashboard message), use .\stop_remote_training.ps1.
 .USAGE
     .\remote_training.ps1
 #>
@@ -20,6 +24,11 @@ $RemoteSubfolder = "hdp_training"
 $CondaEnvName    = "hdp-cw"
 $PythonVersion   = "3.11"
 $TmuxSession     = "hdp_training"
+# Shared across every run in $TrainCommand below (via --session-id) so a
+# sweep's N runs land together under trained/<SessionId>/<run-tag>/ instead
+# of each picking its own timestamp. Also what the dashboard (step 3) reads
+# to find their status.json files.
+$SessionId       = Get-Date -Format "yyyyMMdd_HHmmss"
 # Perf flags for the remote EPYC 7532 (32c/64t) Linux/RHEL box. History of
 # what was tried, kept here so nobody re-derives this the hard way:
 #   --net-arch 64,64  : right-sized net, ~1.9x locally, confirmed platform-
@@ -136,14 +145,59 @@ $TmuxSession     = "hdp_training"
 # --resume-from trained/checkpoints/<name>_<steps>_steps.zip here — see
 # training.py --help for details (curriculum_distance resumes automatically
 # from that checkpoint's sidecar .curriculum.json if present).
-$TrainCommand    = "python -u training.py --scenario vbar --n-envs 64 " +
-                    "--net-arch 128,128,64 --vec-env dummy --torch-threads 16"
+# $TrainCommand    = "python -u training.py --scenario vbar --n-envs 64 " +
+#                     "--net-arch 128,128,64 --vec-env dummy --torch-threads 16"
 # $TrainCommand    = "python -u training.py --scenario vbar --n-envs 64 " +
 #                     "--net-arch 64,64 --vec-env dummy"
+#
+# UTD-ratio x seed sweep (2026-07, TRIED, REVERTED): launched 24 independent
+# single-threaded processes (3 UTD levels x 8 seeds) concurrently to search
+# hyperparameters/seeds in parallel — genuine multi-core use (unlike
+# multithreading one run, already disproven above), but it produces 24
+# separate candidate models, and each one is somewhat SLOWER than a solo
+# run because all 24 share the same ~32-64 cores. Reverted because the
+# actual near-term need is one model trained as fast as a single run can
+# go, not 24 explored-in-parallel-but-individually-slower ones. Kept here
+# for when parallel hyperparameter search is actually wanted again:
+#   $TrainCommand = @'
+#   SEEDS=(0 1 2 3 4 5 6 7)
+#   UTD_LEVELS=(1 2 4)
+#   PIDS=()
+#   for UTD in "${UTD_LEVELS[@]}"; do
+#     GSTEPS=$((UTD * 64))
+#     for SEED in "${SEEDS[@]}"; do
+#       TAG="utd${UTD}_seed${SEED}"
+#       python -u training.py --scenario vbar --n-envs 64 \
+#         --net-arch 128,128,64 --vec-env dummy --torch-threads 1 \
+#         --train-freq 1 --gradient-steps "$GSTEPS" --seed "$SEED" \
+#         --session-id "$SESSION_ID" --run-tag "$TAG" \
+#         > "train_${TAG}.log" 2>&1 &
+#       PIDS+=($!)
+#     done
+#   done
+#   echo "Launched ${#PIDS[@]} parallel runs (UTD x seed), session_id=$SESSION_ID: ${PIDS[*]}"
+#   for PID in "${PIDS[@]}"; do
+#     wait "$PID"
+#   done
+#   '@
+#
+# Single dedicated run (2026-07, CURRENT): back to the original baseline
+# (net_arch, torch-threads unchanged) plus one still-untried, single-core
+# lever that doesn't cost any parallelism — UTD raised 1.0->2.0 via
+# --gradient-steps 128 (= 2x the 64 transitions collected per vec-step at
+# n_envs=64, train_freq=1). More learning per environment step, aimed at
+# "not finding the optimal solution in 3M steps," at the cost of ~2x the
+# wall-clock time per timestep vs UTD=1 — but since nothing else is
+# sharing cores with it, this is still the fastest a single model can
+# train on this box. If it still doesn't reach optimal, --gradient-steps
+# 256 (UTD=4) is the next step up; re-derive gradient_steps/(train_freq*
+# n_envs) before changing train_freq or n_envs alongside it.
+$TrainCommand = "python -u training.py --scenario vbar --n-envs 32 " +
+                 "--net-arch 128,128,128 --vec-env dummy --torch-threads 1 " +
+                 "--session-id `"$SessionId`""
 $ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results", "tmp",
                      "__pycache__", ".venv", "venv")
 $PollIntervalSeconds     = 20
-$ReconnectWaitSeconds    = 15
 #############################################
 
 # ── 1. Sync ───────────────────────────────────────────────────────────────────
@@ -265,10 +319,10 @@ cd "$REMOTE_DIR"
 rm -rf tmp
 mkdir -p out trained tmp
 tmux kill-session -t "$SESSION" 2>/dev/null || true
-rm -f train.log train.done
+rm -f train.log train.done train_*.log
 chmod +x "$REMOTE_DIR/_train_inner.sh"
 tmux new-session -d -s "$SESSION" \
-    "bash '$REMOTE_DIR/_train_inner.sh' > '$REMOTE_DIR/train.log' 2>&1"
+    "SESSION_ID='__SESSIONID__' bash '$REMOTE_DIR/_train_inner.sh' > '$REMOTE_DIR/train.log' 2>&1"
 echo "[setup] Training launched in detached tmux session '$SESSION' -- safe to disconnect now."
 '@
 
@@ -276,6 +330,7 @@ $bashScript = $bashScript.Replace("__SUBFOLDER__", $RemoteSubfolder)
 $bashScript = $bashScript.Replace("__CONDAENV__",  $CondaEnvName)
 $bashScript = $bashScript.Replace("__PYVER__",     $PythonVersion)
 $bashScript = $bashScript.Replace("__TMUXSESSION__", $TmuxSession)
+$bashScript = $bashScript.Replace("__SESSIONID__", $SessionId)
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 [System.IO.File]::WriteAllText($remoteInnerSh, ($innerScript -replace "`r`n", "`n"), $utf8NoBom)
@@ -293,15 +348,16 @@ if ($LASTEXITCODE -ne 0) {
 
 New-Item -ItemType Directory -Force -Path ".\tmp" | Out-Null
 $LocalTmpDir = (Resolve-Path ".\tmp").Path
-New-Item -ItemType Directory -Force -Path ".\trained\checkpoints" | Out-Null
+New-Item -ItemType Directory -Force -Path ".\trained" | Out-Null
 $LocalTrainedDir = (Resolve-Path ".\trained").Path
 
-# ── 3. Background poller ──────────────────────────────────────────────────────
-# Also periodically pulls trained/checkpoints/ back (training.py now saves a
-# checkpoint every --checkpoint-freq timesteps, plus a curriculum sidecar
-# .json needed to --resume-from it correctly). This is the actual progress
-# safety net now — training itself survives disconnects via tmux, but this
-# is still what gets checkpoints onto your local disk periodically.
+# ── 3. Background poller + live dashboard ──────────────────────────────────────
+# Pulls the WHOLE trained/$SessionId/ tree back periodically (not just
+# checkpoints/) — training.py now writes checkpoints, the final model,
+# diagnostics.png, history.npz, AND a small status.json all under
+# trained/<session-id>/<run-tag>/ (see training.py), and the dashboard
+# below needs those status.json files synced locally to render live
+# progress. Also still pulls tmp/ (per-run latest_trajectory.png).
 #
 # Uses `scp -r ".../dir/*" "local\dir\"` rather than rsync — rsync isn't
 # installed on this machine (only OpenSSH's ssh/scp are). Unlike
@@ -309,54 +365,89 @@ $LocalTrainedDir = (Resolve-Path ".\trained").Path
 # existing dst — a second run would nest as dst\src\src\. Globbing the
 # source (`src/*`) copies the *contents* into dst instead, which is safe to
 # repeat every poll. 2>$null because early polls hit an empty/missing
-# checkpoints dir before the first checkpoint is written — expected, not an
+# session dir before the first checkpoint is written — expected, not an
 # error.
 $pollJob = Start-Job -ScriptBlock {
     param($RemoteHost, $RemoteSubfolder, $LocalTmpDir, $LocalTrainedDir, $Interval)
     while ($true) {
-        scp "${RemoteHost}:~/${RemoteSubfolder}/tmp/latest_trajectory.png" `
-            (Join-Path $LocalTmpDir "latest_trajectory.png") 2>$null
-        scp -r "${RemoteHost}:~/${RemoteSubfolder}/trained/checkpoints/*" `
-            "$LocalTrainedDir/checkpoints/" 2>$null
+        scp -r "${RemoteHost}:~/${RemoteSubfolder}/tmp/*" `
+            "$LocalTmpDir/" 2>$null
+        scp -r "${RemoteHost}:~/${RemoteSubfolder}/trained/*" `
+            "$LocalTrainedDir/" 2>$null
         Start-Sleep -Seconds $Interval
     }
 } -ArgumentList $RemoteHost, $RemoteSubfolder, $LocalTmpDir, $LocalTrainedDir, $PollIntervalSeconds
 
-Write-Host "    Live trajectory + checkpoint polling started -> .\tmp\latest_trajectory.png, .\trained\checkpoints\ (every ${PollIntervalSeconds}s)`n" -ForegroundColor DarkGray
+Write-Host "    Live trajectory + trained/ polling started -> .\tmp\, .\trained\ (every ${PollIntervalSeconds}s)`n" -ForegroundColor DarkGray
 
-# ── 4. Live-tail training.log with automatic reconnect ────────────────────────
-# Training itself is safe (detached in tmux) regardless of what this loop
-# does — this is purely for live visibility. `ssh ... tail -f` blocks until
-# either the connection drops or the remote shell exits; either way, when it
-# returns we check train.done on the remote to tell "training actually
-# finished" apart from "just got disconnected," and reconnect in the latter
-# case instead of giving up. First attempt tails from the start of the file
-# (matches old behavior); reconnects only show recent context, not a full
-# replay of a potentially huge log.
-Write-Host "==> [3/5] Watching training.log (Ctrl+C stops watching only — training keeps running remotely)`n" -ForegroundColor Cyan
+# ── 4. Live status dashboard (replaces raw log tailing) ────────────────────────
+# Used to `ssh ... tail -f train.log` here — with a 24-run sweep, that's 24
+# processes' per-episode print lines interleaved in one stream, which is
+# unreadable as an "overall progress" view (each run still writes its own
+# train_<tag>.log on the remote if you want that per-run detail — see step
+# 5). Instead, render one summary row per run from the status.json files
+# the background poller (step 3) already syncs locally, refreshed on the
+# same cadence. Doesn't need its own SSH reconnect handling for the
+# display itself (it's reading already-local files); only the periodic
+# train.done check touches the network, tolerantly (failures just mean
+# "check again next cycle," same as before).
+Write-Host "==> [3/5] Live dashboard for session $SessionId (Ctrl+C stops watching only -- training keeps running remotely; use .\stop_remote_training.ps1 to actually stop it)`n" -ForegroundColor Cyan
+
+function Show-Dashboard {
+    param($SessionDir, $SessionId, $ConnectionWarning)
+    Clear-Host
+    Write-Host "Session: $SessionId  |  $(Get-Date -Format 'HH:mm:ss')  |  Ctrl+C stops watching only; .\stop_remote_training.ps1 actually stops remote training`n" -ForegroundColor Cyan
+    if ($ConnectionWarning) {
+        Write-Host "[reconnect] Lost contact with $RemoteHost on the last check -- training continues in the remote tmux session '$TmuxSession' regardless; retrying...`n" -ForegroundColor Yellow
+    }
+
+    $statusFiles = Get-ChildItem -Path $SessionDir -Filter "status.json" -Recurse -ErrorAction SilentlyContinue
+    if (-not $statusFiles) {
+        Write-Host "(no status.json synced yet -- waiting on first diagnostics update from the remote run(s))`n" -ForegroundColor DarkGray
+        return
+    }
+
+    $rows = foreach ($f in $statusFiles) {
+        try {
+            $s = Get-Content $f.FullName -Raw | ConvertFrom-Json
+            [PSCustomObject]@{
+                RunTag      = if ($s.run_tag) { $s.run_tag } else { "(single run)" }
+                Progress    = "{0:N0}/{1:N0}" -f $s.num_timesteps, $s.total_timesteps
+                Episodes    = $s.episode_count
+                DockRate    = if ($null -ne $s.recent_dock_rate) { "{0:P0}" -f $s.recent_dock_rate } else { "n/a" }
+                AvgReward   = if ($null -ne $s.recent_avg_reward) { "{0:N2}" -f $s.recent_avg_reward } else { "n/a" }
+                CurDist     = if ($null -ne $s.curriculum_distance) { "{0:N1}" -f $s.curriculum_distance } else { "n/a" }
+                StepsPerSec = if ($null -ne $s.steps_per_sec) { "{0:N1}" -f $s.steps_per_sec } else { "n/a" }
+                Updated     = $s.updated_at
+            }
+        } catch { }
+    }
+    $rows | Sort-Object RunTag | Format-Table -AutoSize
+}
 
 $trainingDone = $false
-$firstAttempt = $true
+$connectionWarning = $false
+$SessionDir = Join-Path $LocalTrainedDir $SessionId
 try {
     while (-not $trainingDone) {
-        if ($firstAttempt) {
-            ssh $RemoteHost "tail -n +1 -f ~/${RemoteSubfolder}/train.log"
-            $firstAttempt = $false
-        } else {
-            ssh $RemoteHost "tail -n 40 -f ~/${RemoteSubfolder}/train.log"
-        }
-        # tail -f only returns here if the SSH connection dropped or the
-        # remote shell exited — either way, check whether training actually
-        # finished (train.done written) before deciding to reconnect.
+        Show-Dashboard -SessionDir $SessionDir -SessionId $SessionId -ConnectionWarning $connectionWarning
         $doneCheck = ssh -o ConnectTimeout=10 $RemoteHost `
             "test -f ~/${RemoteSubfolder}/train.done && echo DONE" 2>$null
+        # ssh itself exits 255 specifically for a connection-level failure
+        # (can't resolve/connect/auth) vs. passing through the remote
+        # command's own exit status otherwise — `test -f ... && echo DONE`
+        # legitimately exits non-zero (1) every cycle before training.done
+        # exists, which is the normal/expected case, not a dropped
+        # connection, so only 255 should count as "lost contact."
+        $connectionWarning = ($LASTEXITCODE -eq 255)
         if ($doneCheck -match "DONE") {
             $trainingDone = $true
         } else {
-            Write-Host "`n[reconnect] Connection to $RemoteHost lost -- training continues in the remote tmux session '$TmuxSession' regardless. Reconnecting in ${ReconnectWaitSeconds}s...`n" -ForegroundColor Yellow
-            Start-Sleep -Seconds $ReconnectWaitSeconds
+            Start-Sleep -Seconds $PollIntervalSeconds
         }
     }
+    Show-Dashboard -SessionDir $SessionDir -SessionId $SessionId
+    Write-Host "Training finished remotely.`n" -ForegroundColor Green
 }
 finally {
     Stop-Job $pollJob -ErrorAction SilentlyContinue | Out-Null
@@ -374,15 +465,20 @@ if ($trainExitCode -ne 0) {
 
 # ── 5. Retrieve results ───────────────────────────────────────────────────────
 # scp, not rsync — see note above the background poller.
-Write-Host "`n==> [5/5] Retrieving out/, trained/, tmp/ ..." -ForegroundColor Cyan
-New-Item -ItemType Directory -Force -Path ".\out"             | Out-Null
-New-Item -ItemType Directory -Force -Path ".\trained\checkpoints" | Out-Null
-New-Item -ItemType Directory -Force -Path ".\tmp"             | Out-Null
+Write-Host "`n==> [5/5] Retrieving out/, trained/, tmp/, per-run logs ..." -ForegroundColor Cyan
+New-Item -ItemType Directory -Force -Path ".\out"                          | Out-Null
+New-Item -ItemType Directory -Force -Path ".\trained"                     | Out-Null
+New-Item -ItemType Directory -Force -Path ".\tmp"                         | Out-Null
+New-Item -ItemType Directory -Force -Path ".\trained\$SessionId\logs"     | Out-Null
 
-scp -r "${RemoteHost}:~/${RemoteSubfolder}/out/*"               ".\out\"
-scp -r "${RemoteHost}:~/${RemoteSubfolder}/trained/*.zip"       ".\trained\" 2>$null
-scp -r "${RemoteHost}:~/${RemoteSubfolder}/trained/checkpoints/*" ".\trained\checkpoints\" 2>$null
-scp -r "${RemoteHost}:~/${RemoteSubfolder}/tmp/*"                ".\tmp\"
+scp -r "${RemoteHost}:~/${RemoteSubfolder}/out/*"       ".\out\"     2>$null
+scp -r "${RemoteHost}:~/${RemoteSubfolder}/trained/*"   ".\trained\" 2>$null
+scp -r "${RemoteHost}:~/${RemoteSubfolder}/tmp/*"       ".\tmp\"     2>$null
+# Per-run detailed logs (train_<tag>.log for a sweep, just the coordinator
+# train.log for a plain single run) — not synced by the periodic poller,
+# archived here alongside that session's checkpoints/diagnostics/history.
+scp "${RemoteHost}:~/${RemoteSubfolder}/train_*.log" ".\trained\$SessionId\logs\" 2>$null
+scp "${RemoteHost}:~/${RemoteSubfolder}/train.log"    ".\trained\$SessionId\logs\" 2>$null
 
 Write-Host "`n==> All done." -ForegroundColor Green
 Write-Host "`n--- out\ ---"

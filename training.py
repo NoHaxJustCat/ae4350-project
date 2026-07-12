@@ -31,7 +31,6 @@ from libs.constants import (
     ACTION_NOISE_SIGMA_START,
     BATCH_SIZE,
     CRITIC_LR,
-    DIAGNOSTICS_PLOT_PATH,
     DOCK_RATE_WINDOW,
     ENV_CURRICULUM_ENABLED,
     ENV_CURRICULUM_INCREMENT,
@@ -51,7 +50,6 @@ from libs.constants import (
     TD3_TARGET_POLICY_NOISE,
     TOTAL_TIMESTEPS,
     TRAINED_MODEL_DIR,
-    TRAINING_HISTORY_PATH,
 )
 from libs.env import CWRendezvousEnv
 from libs.normalization import NormalizedObsEnv
@@ -102,6 +100,43 @@ def plot_with_smooth(ax, data, label, color, title, ylabel, window=SMOOTHING_WIN
     ax.set_xlabel("Episode")
     ax.grid(True, alpha=0.3)
     ax.legend()
+
+
+def build_diagnostics_figure(cb: "TrainingCallback", scenario: str):
+    """Builds the 3x3 training-diagnostics figure. Used both for periodic
+    live snapshots (LiveDiagnosticsCallback, during training) and the final
+    post-training save — one implementation so the two can't silently
+    diverge. Caller owns the returned figure (save/show/close it)."""
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+    fig.suptitle(f"TD3 (SB3) Training Diagnostics — scenario={scenario}", fontsize=14)
+
+    plot_with_smooth(axes[0, 0], cb.episode_rewards,       "reward",  "tab:blue",   "Total reward",          "reward")
+    plot_with_smooth(axes[0, 1], cb.episode_delta_vs,      "delta-v", "tab:orange", "Total Δv used",         "m/s")
+    plot_with_smooth(axes[0, 2], cb.episode_steps,         "steps",   "tab:green",  "Episode length",        "steps")
+    plot_with_smooth(axes[1, 0], cb.episode_r_pos_totals,  "r_pos",   "tab:red",    "Position reward (sum)", "reward")
+    plot_with_smooth(axes[1, 1], cb.episode_r_fuel_totals, "r_fuel",  "tab:purple", "Fuel reward (sum)",     "reward")
+    plot_with_smooth(axes[1, 2], cb.episode_r_term_totals, "r_term",  "tab:brown",  "Terminal reward (sum)", "reward")
+    plot_with_smooth(axes[2, 0], cb.episode_r_mile_totals, "r_mile",  "tab:pink",   "Milestone reward (sum)","reward")
+
+    dock_rate = [
+        np.mean(cb.episode_docked[max(0, i - DOCK_RATE_WINDOW):i + 1]) * 100
+        for i in range(len(cb.episode_docked))
+    ]
+    axes[2, 1].plot(dock_rate, color="tab:cyan", linewidth=2)
+    axes[2, 1].set_title(f"Dock rate ({DOCK_RATE_WINDOW}-ep rolling)")
+    axes[2, 1].set_ylabel("%")
+    axes[2, 1].set_xlabel("Episode")
+    axes[2, 1].set_ylim(0, 100)
+    axes[2, 1].grid(True, alpha=0.3)
+
+    axes[2, 2].plot(cb.episode_curriculum_distances, color="tab:olive", linewidth=2)
+    axes[2, 2].set_title("Curriculum distance (shared across all envs)")
+    axes[2, 2].set_ylabel("m")
+    axes[2, 2].set_xlabel("Episode")
+    axes[2, 2].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    return fig
 
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────
@@ -428,6 +463,77 @@ class TrainingCallback(BaseCallback):
         return True
 
 
+class LiveDiagnosticsCallback(BaseCallback):
+    """
+    Periodically regenerates the same 3x3 diagnostics figure that used to
+    only get built once at the very end, so you can watch overall training
+    progress (reward/dv/dock-rate/curriculum trends) while a run — or a
+    whole sweep of them — is still going, instead of waiting for it to
+    finish. Also writes a small status.json snapshot (used by
+    remote_training.ps1's sweep dashboard to show one summary row per
+    concurrent run instead of interleaved per-episode print lines).
+
+    Time-throttled (default every 30s of wall clock), not every episode —
+    rebuilding a smoothed multi-panel figure has a real, if small, per-call
+    cost that would otherwise scale with both run length and how many
+    concurrent sweep members are doing it at once.
+    """
+
+    def __init__(self, training_callback: "TrainingCallback", diag_path: str,
+                 status_path: Path, scenario: str, run_tag: str,
+                 total_timesteps: int, update_every_seconds: float = 30.0):
+        super().__init__(verbose=0)
+        self.training_callback = training_callback
+        self.diag_path = diag_path
+        self.status_path = status_path
+        self.scenario = scenario
+        self.run_tag = run_tag
+        self.total_timesteps = total_timesteps
+        self.update_every_seconds = update_every_seconds
+        self._last_update = None
+        self._start_time = None
+
+    def _on_training_start(self) -> None:
+        now = time.perf_counter()
+        self._last_update = now
+        self._start_time = now
+
+    def write_status(self, now: float) -> None:
+        cb = self.training_callback
+        dock_window = cb.episode_docked[-DOCK_RATE_WINDOW:]
+        reward_window = cb.episode_rewards[-SMOOTHING_WINDOW:]
+        elapsed = now - self._start_time
+        status = {
+            "scenario": self.scenario,
+            "run_tag": self.run_tag,
+            "num_timesteps": int(self.num_timesteps),
+            "total_timesteps": int(self.total_timesteps),
+            "episode_count": len(cb.episode_rewards),
+            "recent_dock_rate": float(np.mean(dock_window)) if dock_window else None,
+            "recent_avg_reward": float(np.mean(reward_window)) if reward_window else None,
+            "curriculum_distance": (float(cb.episode_curriculum_distances[-1])
+                                     if cb.episode_curriculum_distances else None),
+            "elapsed_seconds": elapsed,
+            "steps_per_sec": (self.num_timesteps / elapsed) if elapsed > 0 else None,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.status_path.write_text(json.dumps(status))
+
+    def _on_step(self) -> bool:
+        now = time.perf_counter()
+        if now - self._last_update < self.update_every_seconds:
+            return True
+        self._last_update = now
+
+        if self.training_callback.episode_rewards:
+            fig = build_diagnostics_figure(self.training_callback, self.scenario)
+            fig.savefig(self.diag_path, dpi=100)
+            plt.close(fig)
+
+        self.write_status(now)
+        return True
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -435,6 +541,24 @@ def parse_args():
     p.add_argument("--scenario", choices=["vbar", "rbar"], default="vbar")
     p.add_argument("--n-envs", type=int, default=NUM_ENVS)
     p.add_argument("--total-timesteps", type=int, default=TOTAL_TIMESTEPS)
+    p.add_argument("--seed", type=int, default=None,
+                    help="Seeds TD3's own RNG (policy init, replay buffer sampling, target "
+                         "noise). Independent of exploration noise/episode-init randomness, "
+                         "which draw from each sub-env's own np_random. Use to run "
+                         "reproducible parallel seed sweeps.")
+    p.add_argument("--run-tag", default="",
+                    help="Names this run's own subfolder under trained/<session-id>/ (and "
+                         "tmp/) — e.g. 'utd2_seed5' — so multiple training.py processes "
+                         "launched concurrently on the same machine (a hyperparameter/seed "
+                         "sweep) each get their own checkpoints/model/diagnostics/history "
+                         "instead of clobbering each other's. Empty (default) means this is "
+                         "the only run in its session, so no extra subfolder is needed.")
+    p.add_argument("--session-id", default="",
+                    help="Groups related runs under trained/<session-id>/ (e.g. all members "
+                         "of one --run-tag sweep launched by remote_training.ps1 share one, "
+                         "passed in for you). Empty (default) auto-generates a timestamp, so "
+                         "even a plain local run gets its own dated folder instead of "
+                         "overwriting the previous run's checkpoints/model/diagnostics/history.")
     p.add_argument("--device", default="cpu",
                     help="'cpu' is usually faster than 'cuda' for a network this small.")
     p.add_argument("--checkpoint-freq", type=int, default=100000,
@@ -443,7 +567,8 @@ def parse_args():
                     help="Only keep the N most recent checkpoints on disk.")
     p.add_argument("--resume-from", default=None,
                     help="Path to a saved checkpoint .zip (e.g. "
-                         "trained/checkpoints/vbar_td3_2299264_steps.zip) to continue "
+                         "trained/20260711_143022/checkpoints/vbar_td3_2299264_steps.zip) "
+                         "to continue "
                          "training from instead of starting fresh. --total-timesteps is "
                          "still the ORIGINAL full target (e.g. 3000000), not a remaining "
                          "amount — the run continues until the model's num_timesteps "
@@ -490,6 +615,12 @@ def parse_args():
                          "gradient steps are the expensive part.")
     p.add_argument("--throughput-log-every", type=int, default=2000,
                     help="Print steps/sec every N timesteps.")
+    p.add_argument("--diag-update-every-seconds", type=float, default=30.0,
+                    help="How often (wall-clock seconds) to refresh the live diagnostics.png "
+                         "and status.json while training. Rebuilding the 3x3 figure has real "
+                         "cost on this tiny a network — measured 859->31.6 steps/s (27x "
+                         "slower) at a 1s interval on net_arch=[64,64]. Keep this at 30s+ "
+                         "for real training; only lower it for a quick local smoke test.")
     return p.parse_args()
 
 
@@ -504,9 +635,27 @@ def main():
     check_env(CWRendezvousEnv(omega=OMEGA, scenario=args.scenario))
     print(f"Environment check completed in {time.perf_counter() - t0:.2f}s")
 
-    Path(TRAINED_MODEL_DIR).mkdir(parents=True, exist_ok=True)
-    Path("out").mkdir(parents=True, exist_ok=True)
-    tmp_dir = Path("tmp")
+    # Every run gets its own directory instead of flat trained/checkpoints/,
+    # so re-running (or a --run-tag sweep) never overwrites a previous run's
+    # checkpoints/model/diagnostics/history. session_id groups related runs
+    # together (e.g. all N members of one sweep launched by
+    # remote_training.ps1 share one, passed in via --session-id); it's
+    # auto-generated from the wall-clock time if not given, so a plain local
+    # `python training.py` still gets a fresh dated folder every time
+    # instead of clobbering the previous run's outputs.
+    session_id = args.session_id or time.strftime("%Y%m%d_%H%M%S")
+    run_dir = (Path(TRAINED_MODEL_DIR) / session_id / args.run_tag
+               if args.run_tag else Path(TRAINED_MODEL_DIR) / session_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    print(f"run_dir: {run_dir}")
+
+    model_path  = str(run_dir / f"{args.scenario}_td3")
+    diag_path   = str(run_dir / "diagnostics.png")
+    hist_path   = str(run_dir / "history.npz")
+    status_path = run_dir / "status.json"
+
+    tmp_dir = Path("tmp") / args.run_tag if args.run_tag else Path("tmp")
     shutil.rmtree(tmp_dir, ignore_errors=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -582,6 +731,7 @@ def main():
             policy_kwargs        = policy_kwargs,
             verbose              = 0,
             device               = args.device,
+            seed                 = args.seed,
         )
 
     if args.compile:
@@ -609,7 +759,7 @@ def main():
             sigma_end=ACTION_NOISE_SIGMA_END,
         ),
         PeriodicCheckpointCallback(
-            save_dir=Path(TRAINED_MODEL_DIR) / "checkpoints",
+            save_dir=run_dir / "checkpoints",
             name_prefix=f"{args.scenario}_td3",
             n_envs=n_envs,
             save_freq_timesteps=args.checkpoint_freq,
@@ -618,6 +768,16 @@ def main():
         ),
         ThroughputCallback(log_every_timesteps=args.throughput_log_every),
     ]
+    live_diag_callback = LiveDiagnosticsCallback(
+        training_callback=callback[0],
+        diag_path=diag_path,
+        status_path=status_path,
+        scenario=args.scenario,
+        run_tag=args.run_tag,
+        total_timesteps=args.total_timesteps,
+        update_every_seconds=args.diag_update_every_seconds,
+    )
+    callback.append(live_diag_callback)
     if curriculum_callback is not None:
         callback.append(curriculum_callback)
 
@@ -641,46 +801,21 @@ def main():
         reset_num_timesteps   = not bool(args.resume_from),
     )
 
-    model_path = f"{TRAINED_MODEL_DIR}/{args.scenario}_td3"
     model.save(model_path)
     print(f"Model saved -> {model_path}.zip")
 
     # ── Diagnostics plot ──────────────────────────────────────────────────────
     cb = callback[0]
-    fig, axes = plt.subplots(3, 3, figsize=(18, 12))
-    fig.suptitle(f"TD3 (SB3) Training Diagnostics — scenario={args.scenario}", fontsize=14)
-
-    plot_with_smooth(axes[0, 0], cb.episode_rewards,       "reward",  "tab:blue",   "Total reward",          "reward")
-    plot_with_smooth(axes[0, 1], cb.episode_delta_vs,      "delta-v", "tab:orange", "Total Δv used",         "m/s")
-    plot_with_smooth(axes[0, 2], cb.episode_steps,         "steps",   "tab:green",  "Episode length",        "steps")
-    plot_with_smooth(axes[1, 0], cb.episode_r_pos_totals,  "r_pos",   "tab:red",    "Position reward (sum)", "reward")
-    plot_with_smooth(axes[1, 1], cb.episode_r_fuel_totals, "r_fuel",  "tab:purple", "Fuel reward (sum)",     "reward")
-    plot_with_smooth(axes[1, 2], cb.episode_r_term_totals, "r_term",  "tab:brown",  "Terminal reward (sum)", "reward")
-    plot_with_smooth(axes[2, 0], cb.episode_r_mile_totals, "r_mile",  "tab:pink",   "Milestone reward (sum)","reward")
-
-    dock_rate = [
-        np.mean(cb.episode_docked[max(0, i - DOCK_RATE_WINDOW):i + 1]) * 100
-        for i in range(len(cb.episode_docked))
-    ]
-    axes[2, 1].plot(dock_rate, color="tab:cyan", linewidth=2)
-    axes[2, 1].set_title(f"Dock rate ({DOCK_RATE_WINDOW}-ep rolling)")
-    axes[2, 1].set_ylabel("%")
-    axes[2, 1].set_xlabel("Episode")
-    axes[2, 1].set_ylim(0, 100)
-    axes[2, 1].grid(True, alpha=0.3)
-
-    axes[2, 2].plot(cb.episode_curriculum_distances, color="tab:olive", linewidth=2)
-    axes[2, 2].set_title("Curriculum distance (shared across all envs)")
-    axes[2, 2].set_ylabel("m")
-    axes[2, 2].set_xlabel("Episode")
-    axes[2, 2].grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    diag_path = DIAGNOSTICS_PLOT_PATH.replace(".png", f"_{args.scenario}.png")
+    fig = build_diagnostics_figure(cb, args.scenario)
     fig.savefig(diag_path, dpi=150)
     plt.show()
 
-    hist_path = TRAINING_HISTORY_PATH.replace(".npz", f"_{args.scenario}.npz")
+    # Guaranteed final status.json write — the periodic one in
+    # LiveDiagnosticsCallback is time-throttled, so a run that finishes
+    # between updates (or is shorter than the interval) would otherwise
+    # never get one, and the dashboard would show it as stuck/missing.
+    live_diag_callback.write_status(time.perf_counter())
+
     np.savez(
         hist_path,
         rewards    = np.array(cb.episode_rewards),

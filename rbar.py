@@ -3,16 +3,20 @@ Goal 2 evaluation: R-bar docking with coupled x/z displacement, both mirrored
 sign combinations (+x,-z) and (-x,+z).
 
 Usage:
-    python rbar.py
+    python rbar.py                              # evaluates the most recently trained model
+    python rbar.py trained/<session>/<run_tag>/rbar_td3.zip   # evaluates a specific one
 """
+
+import sys
 
 from stable_baselines3 import TD3
 
-from libs.constants import TRAINED_MODEL_DIR
-from libs.evaluate import run_episode, print_summary
+from libs.evaluate import run_episode, print_summary, find_latest_model
 from libs.trajectory import plot_trajectory
 
-model = TD3.load(f"{TRAINED_MODEL_DIR}/rbar_td3")
+model_path = sys.argv[1] if len(sys.argv) > 1 else find_latest_model("rbar")
+print(f"Loading model: {model_path}")
+model = TD3.load(model_path)
 
 # sign=+1 -> direction (+ratio,-1) i.e. (+x,-z); sign=-1 -> (-x,+z)
 for sign, label in [(+1, "(+x, -z)"), (-1, "(-x, +z)")]:
