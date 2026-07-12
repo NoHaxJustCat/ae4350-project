@@ -598,7 +598,24 @@ def parse_args():
     p.add_argument("--net-arch", default="64,64",
                     help="Comma-separated hidden layer sizes, e.g. '64,64'. Was [400,300] "
                          "(from the original DDPG paper's much higher-dim tasks) — "
-                         "oversized for a 5-obs/2-action problem.")
+                         "oversized for a 5-obs/2-action problem. With --arch smart these "
+                         "size the actor/critic HEADS that sit on top of the residual encoder.")
+    p.add_argument("--arch", choices=["mlp", "smart"], default="mlp",
+                    help="'mlp' = SB3's flat MlpPolicy (default, matches all prior runs). "
+                         "'smart' = LayerNorm residual encoder (libs/policies.py) in front of "
+                         "the actor/critic heads — added to escape the fuel-wasteful local "
+                         "optimum the flat [128,128] nets converge to. Meant for --device cuda.")
+    p.add_argument("--features-dim", type=int, default=256,
+                    help="(--arch smart only) width of every LayerNorm-MLP encoder layer.")
+    p.add_argument("--n-blocks", type=int, default=2,
+                    help="(--arch smart only) number of Linear->LayerNorm->act encoder layers. "
+                         "Empirically 2 is the deepest that trains cleanly with relu (3 saturates "
+                         "the actor at init and never learns); silu tolerates only 1. See the A/B "
+                         "isolation results — depth beyond this pins the actor to the boundary.")
+    p.add_argument("--activation", choices=["silu", "relu", "gelu", "tanh"], default="relu",
+                    help="(--arch smart only) hidden activation for encoder + heads. relu is more "
+                         "robust to the init-saturation failure than silu at depth (silu fails at "
+                         "n_blocks=2, relu survives to 2).")
     p.add_argument("--torch-threads", type=int, default=min(4, os.cpu_count() or 4),
                     help="Threads for the MAIN process's torch ops (gradient updates). "
                          "Subprocess workers are always pinned to 1 (see make_single_env).")
@@ -712,7 +729,20 @@ def main():
             mean=np.zeros(action_dim),
             sigma=ACTION_NOISE_SIGMA_START * np.ones(action_dim),
         )
-        policy_kwargs = dict(net_arch=net_arch)
+        if args.arch == "smart":
+            from libs.policies import build_smart_policy_kwargs
+            policy_kwargs = build_smart_policy_kwargs(
+                net_arch=net_arch,
+                features_dim=args.features_dim,
+                n_blocks=args.n_blocks,
+                activation=args.activation,
+            )
+            print(f"arch: smart | features_dim: {args.features_dim} | "
+                  f"n_blocks: {args.n_blocks} | activation: {args.activation} "
+                  f"| head net_arch: {net_arch}")
+        else:
+            policy_kwargs = dict(net_arch=net_arch)
+            print(f"arch: mlp | net_arch: {net_arch}")
         model = TD3(
             policy               = "MlpPolicy",
             env                  = env,
