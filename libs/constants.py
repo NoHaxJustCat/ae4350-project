@@ -24,20 +24,23 @@ ENV_POS_TOLERANCE = 1.0
 ENV_VEL_COEFF = 10.0
 ENV_SHAPING_COEFF = 10.0
 ENV_BONUS = 50.0
-# Fuel bonus: paid only on a successful dock, inverse-sqrt in cumulative
-# dv_used (reward_fuel = coeff * (dv_used + eps)**-0.5 — see
-# libs/env.py::step). Two earlier designs were tried and replaced: a linear
-# per-step cost (-coeff * ||action||) gives equal reward for equal
-# *absolute* dv reductions, so its gradient vanished once dv_used was
-# already small (cutting 4->2 m/s earned far more than the equally
-# impressive 2x cut from 0.05->0.025 m/s) and a real run measurably drifted
-# back up once it reached that low-signal regime; a log1p-telescoped
-# version fixed the ratio-invariance but was still a flat cost regardless
-# of outcome. This version rewards low fuel disproportionately at the low
-# end (like the log1p version) while being strictly additive on top of the
-# dock bonus — it can never make failing to dock look better than a
-# wasteful dock, since it's zero unless docked=True.
-ENV_FUEL_COEFF = 150.0
+# Fuel bonus: paid only on a successful dock, inverse in cumulative dv_used
+# (reward_fuel = coeff * (dv_used + eps)**-1 — see libs/env.py::step).
+# Strictly additive on top of the dock bonus, so it can never make failing
+# to dock look better than a wasteful dock (it's zero unless docked=True).
+#
+# Retuned for the fuel push: coeff 150 -> 25 and eps 1.0 -> 0.01. The old
+# eps=1.0 flattened the whole low-dv end — 150/(0.01+1)=148.5 vs
+# 150/(0.05+1)=142.9, only ~6 reward points between a near-optimal 0.01 m/s
+# dock and a 5x-worse 0.05 m/s one, so the agent had almost no incentive to
+# chase the last order of magnitude of fuel. With eps=0.01 the curve stays
+# steep exactly where the optimum lives: 25/(0.0115+0.01)=1163 at the
+# optimal V-bar dv vs 25/(0.5+0.01)=49 at a wasteful 0.5 m/s dock — a ~24x
+# reward gap that makes low fuel strongly worth it. coeff dropped to 25 so
+# the peak reward stays in a sane range for the critic to represent given
+# the smaller eps blows the magnitude up. Earlier per-step linear / log1p
+# costs were tried and dropped (vanishing low-end gradient / flat cost).
+ENV_FUEL_COEFF = 25.0
 
 # Physical per-burn actuator cap (m/s). Independent of any fuel budget —
 # sized to comfortably cover a single optimal impulse for the largest
@@ -77,7 +80,20 @@ ENV_CURRICULUM_INCREMENT = 5.0         # distance added per successful dock [m]
 # could never learn that an early burn pays off hundreds of steps later.
 # gamma=0.999 gives an effective horizon of ~1000 steps, matching the
 # actual task timescale.
-GAMMA = 0.9995
+#
+# Raised 0.9995 -> 0.9999 to attack the FUEL problem specifically. With no
+# per-step time cost, the only thing implicitly rewarding a fast dock is the
+# discount: the fuel-optimal V-bar transfer pays off ~1160 steps out, and at
+# gamma=0.9995 that terminal reward is discounted by 0.9995**1160 ~= 0.56,
+# while a wasteful 28-step burn is discounted by only ~0.99 — so the two
+# score about the same despite a 100x fuel difference, and the agent
+# rationally picks the fast burn. At gamma=0.9999, 0.9999**1160 ~= 0.89, so
+# the slow low-fuel transfer's terminal payoff survives the discount and
+# actually wins. Trade-off: a longer effective horizon makes credit
+# assignment harder for the critic — pairs best with the LayerNorm --arch
+# smart critic; plain MLPs may need the extra capacity of the wider sweep
+# members to cope. Drop back to 0.9995 if runs stop learning.
+GAMMA = 0.9999
 MAX_STEPS = int(ENV_TIMEOUT / ENV_DT) + 1
 
 ACTOR_LR = 3e-4

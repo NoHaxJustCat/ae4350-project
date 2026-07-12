@@ -181,20 +181,35 @@ $SessionId       = Get-Date -Format "yyyyMMdd_HHmmss"
 #   done
 #   '@
 #
-# Single dedicated run (2026-07, CURRENT): back to the original baseline
-# (net_arch, torch-threads unchanged) plus one still-untried, single-core
-# lever that doesn't cost any parallelism — UTD raised 1.0->2.0 via
-# --gradient-steps 128 (= 2x the 64 transitions collected per vec-step at
-# n_envs=64, train_freq=1). More learning per environment step, aimed at
-# "not finding the optimal solution in 3M steps," at the cost of ~2x the
-# wall-clock time per timestep vs UTD=1 — but since nothing else is
-# sharing cores with it, this is still the fastest a single model can
-# train on this box. If it still doesn't reach optimal, --gradient-steps
-# 256 (UTD=4) is the next step up; re-derive gradient_steps/(train_freq*
-# n_envs) before changing train_freq or n_envs alongside it.
-$TrainCommand = "python -u training.py --scenario vbar --n-envs 32 " +
-                 "--net-arch 128,128,128 --vec-env dummy --torch-threads 1 " +
-                 "--session-id `"$SessionId`""
+# Net-architecture sweep (2026-07, CURRENT): after retuning the reward for
+# fuel efficiency (gamma 0.9995->0.9999 + a steeper fuel bonus
+# 25*(dv_used+0.01)^-1 — see libs/constants.py & libs/env.py), sweep 5
+# plain-MLP capacities head-to-head UNDER THE SAME new reward to see which
+# depth/width best exploits it toward the optimal (~0.0115 m/s) V-bar
+# transfer instead of the fuel-wasteful ~1.53 m/s brute-force dock.
+#   64,64 / 128,128 / 64,64,64 / 128,128,128 / 256,256
+# All CPU, launched in parallel inside the one detached tmux session, each
+# in its own trained/<session>/arch_<a>_<b>/ (via --run-tag) so the live
+# dashboard shows one row per arch. torch-threads 1 + vec-env dummy per run
+# (same rationale as the reverted UTD x seed sweep above): single-process,
+# no IPC, and the EPYC box has plenty of cores for 5 concurrent 1-thread
+# gradient loops. Everything except net_arch is held identical so the
+# comparison is clean. (For the LayerNorm arch, add --arch smart --n-blocks 2
+# to a run — see libs/policies.py — but this sweep is the plain-MLP baseline.)
+$TrainCommand = @'
+ARCHS=("64,64" "128,128" "64,64,64" "128,128,128" "256,256")
+PIDS=()
+for ARCH in "${ARCHS[@]}"; do
+  TAG="arch_${ARCH//,/_}"
+  python -u training.py --scenario vbar --n-envs 32 \
+    --net-arch "$ARCH" --vec-env dummy --torch-threads 1 \
+    --session-id "$SESSION_ID" --run-tag "$TAG" \
+    > "train_${TAG}.log" 2>&1 &
+  PIDS+=($!)
+done
+echo "Launched ${#PIDS[@]} net-arch runs, session_id=$SESSION_ID: ${PIDS[*]}"
+for PID in "${PIDS[@]}"; do wait "$PID"; done
+'@
 $ExcludeNames    = @(".git", ".conda", ".vscode", "out", "trained", "results", "tmp",
                      "__pycache__", ".venv", "venv")
 $PollIntervalSeconds     = 20

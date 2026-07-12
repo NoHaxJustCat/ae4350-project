@@ -80,18 +80,20 @@ class CWRendezvousEnv(gym.Env):
     ceiling loops, reward discontinuities).
 
     The fuel term is a terminal bonus on cumulative dv_used, paid only on a
-    successful dock: 15 * dv_used**-0.5. Earlier versions tried a per-step
-    linear cost (-coeff * ||action||), then a per-step log1p-telescoped
-    cost — both replaced. The linear cost gives equal reward for equal
-    *absolute* dv reductions, so its gradient vanishes once dv_used is
-    already small (cutting 4->2 m/s earns far more than the equally
-    impressive 2x cut from 0.05->0.025 m/s), and a real run measurably
-    drifted back up once it reached that low-signal regime. The inverse-
-    sqrt terminal bonus keeps that "smaller is disproportionately better"
-    pressure alive at low dv_used without ever letting fuel cost make
-    *failing* to dock look better than a wasteful dock (it's strictly
-    additive on top of the dock bonus, never subtracted elsewhere). A small
-    epsilon keeps it finite as dv_used -> 0.
+    successful dock: ENV_FUEL_COEFF * (dv_used + eps)**-1 (currently
+    25 * (dv_used + 0.01)**-1). Earlier versions tried a per-step linear
+    cost (-coeff * ||action||), then a per-step log1p-telescoped cost — both
+    replaced. The linear cost gives equal reward for equal *absolute* dv
+    reductions, so its gradient vanishes once dv_used is already small
+    (cutting 4->2 m/s earns far more than the equally impressive 2x cut from
+    0.05->0.025 m/s), and a real run measurably drifted back up once it
+    reached that low-signal regime. The inverse terminal bonus keeps that
+    "smaller is disproportionately better" pressure alive at low dv_used
+    without ever letting fuel cost make *failing* to dock look better than a
+    wasteful dock (it's strictly additive on top of the dock bonus, never
+    subtracted elsewhere). The small eps (0.01, ~the optimal dv scale) keeps
+    it finite as dv_used -> 0 while leaving the curve steep near the optimum;
+    see the ENV_FUEL_COEFF comment in constants.py.
 
     Scenario (2-D only, selects the initial-condition family; see
     CLAUDE.md goals 1 & 2). Sign/quadrant is randomized every reset() so a
@@ -264,7 +266,11 @@ class CWRendezvousEnv(gym.Env):
         reward_pos = ENV_SHAPING_COEFF * delta / self.curriculum_distance
 
         if docked:
-            eps = 1
+            # eps=0.01 keeps the inverse curve steep right where the optimal
+            # dv lives (~0.01 m/s) instead of flattening it — see the
+            # ENV_FUEL_COEFF comment in constants.py. Floors the term so an
+            # ultra-low-fuel dock can't spike to +inf / divide by zero.
+            eps = 0.01
             reward_fuel = self.fuel_coeff * (self.dv_used + eps) ** (-1)
         else:
             reward_fuel = 0.0
