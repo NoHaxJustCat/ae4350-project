@@ -16,6 +16,14 @@
 
 $ErrorActionPreference = "Stop"
 
+# Always operate from the script's own directory. Without this the sync in
+# step 1 (robocopy of ".") depends on the caller's CWD — if the script is
+# invoked from anywhere else (e.g. a background launcher that doesn't inherit
+# the shell's cd), robocopy copies an empty/wrong tree, staging comes up
+# empty, and the run silently trains STALE remote code. Pin CWD here so "."
+# is always the project root.
+Set-Location -LiteralPath $PSScriptRoot
+
 #############################################
 # CONFIG
 #############################################
@@ -225,8 +233,31 @@ New-Item -ItemType Directory -Force -Path $StagingDir | Out-Null
 $roboArgs = @(".", $StagingDir, "/E", "/XO", "/NFL", "/NDL", "/NJH", "/NJS", "/NP")
 foreach ($ex in $ExcludeNames) { $roboArgs += @("/XD", $ex) }
 robocopy @roboArgs | Out-Null
+# robocopy exit codes 0-7 are success (1 = files copied); >=8 is a real
+# failure. Anything that leaves staging empty means nothing will transfer —
+# fail loudly here instead of scp'ing nothing and training stale remote code.
+if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE); nothing staged." }
+$stagedCount = (Get-ChildItem -Recurse -File $StagingDir | Measure-Object).Count
+if ($stagedCount -eq 0) {
+    $cwd = Get-Location
+    throw "Staging dir is empty after robocopy (CWD=$cwd). Refusing to sync an empty tree; the remote would keep running stale code."
+}
+Write-Host "    Staged $stagedCount files."
 
-scp -r "$StagingDir\*" "${RemoteHost}:~/${RemoteSubfolder}/"
+# Transfer: scp the staging dir as ONE directory. Windows OpenSSH scp does
+# NOT expand a local "dir\*" glob — it stat()s a literal "*" and fails 255
+# (this is why the old `scp -r "$StagingDir\*"` silently transferred nothing
+# and the remote kept training stale code). Land it in a FRESH remote temp
+# dir so scp -r never nests into an existing remote subdir (libs -> libs/libs),
+# then merge the contents into place with cp on the remote — overwrites
+# changed files, adds new ones, no nesting.
+$remoteStage = "~/${RemoteSubfolder}_stage"
+ssh $RemoteHost "rm -rf $remoteStage && mkdir -p $remoteStage"
+if ($LASTEXITCODE -ne 0) { throw "failed to prepare remote staging dir (exit $LASTEXITCODE)." }
+scp -r "$StagingDir" "${RemoteHost}:$remoteStage/src"
+if ($LASTEXITCODE -ne 0) { throw "scp of staged tree failed (exit $LASTEXITCODE)." }
+ssh $RemoteHost "cp -rf $remoteStage/src/. ~/${RemoteSubfolder}/ && rm -rf $remoteStage"
+if ($LASTEXITCODE -ne 0) { throw "remote merge of staged tree failed (exit $LASTEXITCODE)." }
 Remove-Item -Recurse -Force $StagingDir
 Write-Host "    Sync complete."
 
