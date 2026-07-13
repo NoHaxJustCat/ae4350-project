@@ -7,6 +7,7 @@ from libs.constants import (
     ENV_BOUNDARY,
     ENV_DT,
     ENV_DT_PHYS,
+    ENV_BURN_DEADZONE,
     ENV_FUEL_COEFF,
     ENV_MAX_DV,
     ENV_POS_TOLERANCE,
@@ -110,6 +111,7 @@ class CWRendezvousEnv(gym.Env):
         dt: float = ENV_DT,
         dt_phys: float = ENV_DT_PHYS,
         max_dv: float = ENV_MAX_DV,
+        burn_deadzone: float = ENV_BURN_DEADZONE,
         boundary: float = ENV_BOUNDARY,
         timeout: float = ENV_TIMEOUT,
         pos_tolerance: float = ENV_POS_TOLERANCE,
@@ -151,6 +153,7 @@ class CWRendezvousEnv(gym.Env):
                 f"({dt_phys}); got ratio {n_sub}."
             )
         self.max_dv = max_dv
+        self.burn_deadzone = burn_deadzone
         self.base_boundary = boundary
         self.excursion_limit = boundary
         self.curriculum_boundary_mult = curriculum_boundary_mult
@@ -272,7 +275,20 @@ class CWRendezvousEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         action = np.clip(action, -self.max_dv, self.max_dv)
-        self.dv_used += np.linalg.norm(action)
+
+        # Burn deadzone / minimum-impulse-bit: a commanded burn below the
+        # threshold is treated as EXACTLY zero — no Δv charged and no velocity
+        # applied — so the agent can coast for free instead of leaking a
+        # little fuel every step it can't output an exact zero (see
+        # ENV_BURN_DEADZONE in constants.py). Applied to the norm so it's the
+        # total impulse magnitude that must clear the threshold, and used
+        # everywhere below (dv_used, the state update, and the info's
+        # delta_v/applied_action) so what's charged == what's applied.
+        burn = float(np.linalg.norm(action))
+        if burn < self.burn_deadzone:
+            action = np.zeros_like(action)
+            burn = 0.0
+        self.dv_used += burn
 
         half = self.phys_dim // 2
         prev_pos_error = np.linalg.norm(self.state[:half])

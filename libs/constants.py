@@ -67,6 +67,23 @@ ENV_FUEL_COEFF = 25.0
 # strategy at 100 m), with headroom for the policy to correct errors.
 ENV_MAX_DV = 0.05
 
+# Burn deadzone / minimum-impulse-bit (m/s). Any commanded burn whose
+# magnitude ‖a‖ is below this is treated as EXACTLY zero — no Δv charged, no
+# velocity change. Two reasons:
+#   1. Physical: real thrusters have a minimum impulse bit and an off state;
+#      an arbitrarily small continuous burn isn't realizable anyway.
+#   2. RL-critical: dv_used sums ‖aₜ‖ over EVERY agent step, but a neural-net
+#      actor can't output exactly zero, so without a deadzone every "coast"
+#      step leaks a little Δv and a long low-fuel coast accumulates MORE waste
+#      than a fast burn-straight-in dock — which is exactly why the policy
+#      refuses to coast and docks fast (~23x optimal). The deadzone makes
+#      coasting free and representable (the actor just aims below it), which
+#      is what lets the fuel-optimal slow two-impulse transfer actually win.
+# Sized BELOW the smallest real impulse the optimal maneuver needs (~0.006
+# m/s per burn at 100 m) so genuine burns still count, but above the actor's
+# near-zero coast-leakage floor. Set to 0 to disable.
+ENV_BURN_DEADZONE = 0.002
+
 # Base (max-curriculum) initial condition. Only the sign/quadrant is
 # randomized per episode (see CWRendezvousEnv._sample_initial_position) —
 # this vector just fixes the V-bar magnitude used at full curriculum
