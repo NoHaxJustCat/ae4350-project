@@ -65,7 +65,7 @@ ENV_FUEL_COEFF = 25.0
 # sized to comfortably cover a single optimal impulse for the largest
 # curriculum distance (worst case ~0.03 m/s for the R-bar two-V-bar-impulse
 # strategy at 100 m), with headroom for the policy to correct errors.
-ENV_MAX_DV = 0.05
+ENV_MAX_DV = 0.02
 
 # Burn deadzone / minimum-impulse-bit (m/s). Any commanded burn whose
 # magnitude ‖a‖ is below this is treated as EXACTLY zero — no Δv charged, no

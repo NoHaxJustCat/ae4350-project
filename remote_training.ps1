@@ -209,10 +209,10 @@ ARCHS=("64,64" "128,128" "64,64,64" "128,128,128" "256,256")
 PIDS=()
 for ARCH in "${ARCHS[@]}"; do
   TAG="arch_${ARCH//,/_}"
-  python -u training.py --scenario rbar --n-envs 32 \
+  python -u training.py --scenario vbar --n-envs 32 \
     --net-arch "$ARCH" --vec-env dummy --torch-threads 1 \
     --session-id "$SESSION_ID" --run-tag "$TAG" \
-    --arch smart \
+    --arch smart --gamma 0.99 --lr 1e-4 --total-timesteps 20000000 --checkpoint-freq 100000 --keep-last-checkpoints 2 \
     > "train_${TAG}.log" 2>&1 &
   PIDS+=($!)
 done
