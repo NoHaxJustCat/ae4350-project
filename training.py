@@ -600,6 +600,12 @@ def parse_args():
                          "(from the original DDPG paper's much higher-dim tasks) — "
                          "oversized for a 5-obs/2-action problem. With --arch smart these "
                          "size the actor/critic HEADS that sit on top of the residual encoder.")
+    p.add_argument("--gamma", type=float, default=GAMMA,
+                    help="Discount factor override (default from constants.py). Big nets "
+                         "destabilize under the fuel-tuned 0.9999 (critic value divergence -> "
+                         "actor saturates at the action bound, never learns); drop to ~0.9995 "
+                         "to train a wide/deep net, at the cost of the fuel-optimal long-coast "
+                         "incentive 0.9999 was chosen for.")
     p.add_argument("--arch", choices=["mlp", "smart"], default="mlp",
                     help="'mlp' = SB3's flat MlpPolicy (default, matches all prior runs). "
                          "'smart' = LayerNorm residual encoder (libs/policies.py) in front of "
@@ -751,7 +757,7 @@ def main():
             learning_starts      = MIN_BUFFER,
             batch_size           = BATCH_SIZE,
             tau                  = TAU,
-            gamma                = GAMMA,
+            gamma                = args.gamma,
             train_freq           = (args.train_freq, "step"),
             gradient_steps       = args.gradient_steps,
             action_noise         = action_noise,
@@ -763,6 +769,15 @@ def main():
             device               = args.device,
             seed                 = args.seed,
         )
+
+        # Small-output actor init (DDPG/TD3 fan-in trick). Required for the
+        # wide/deep smart nets: without it a big net saturates the actor at
+        # ±max_dv from step one and never learns (see
+        # libs/policies.py::shrink_actor_output_init). Harmless for small
+        # nets, so applied to every --arch smart model.
+        if args.arch == "smart":
+            from libs.policies import shrink_actor_output_init
+            shrink_actor_output_init(model)
 
     if args.compile:
         try:

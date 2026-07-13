@@ -1,0 +1,1 @@
+{"scenario": "rbar", "run_tag": "arch_128_128", "num_timesteps": 1161344, "total_timesteps": 10000000, "episode_count": 2532, "recent_dock_rate": 0.0, "recent_avg_reward": -10.558778500000003, "curriculum_distance": 10.0, "elapsed_seconds": 17050.408853399917, "steps_per_sec": 68.11238428270437, "updated_at": "2026-07-13 14:20:11"}

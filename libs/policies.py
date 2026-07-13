@@ -109,6 +109,31 @@ class SmartEncoder(BaseFeaturesExtractor):
         return self.net(observations)
 
 
+def shrink_actor_output_init(model, weight_bound: float = 3e-3) -> None:
+    """Re-initialize the actor's FINAL linear layer with small uniform weights
+    (the classic DDPG/TD3 fan-in trick, [-3e-3, 3e-3]) so the policy outputs
+    near-zero actions at init instead of saturating tanh at ±max_dv.
+
+    Without this, a deep or very WIDE net produces large pre-tanh values from
+    step one, so the actor is pinned at the action bound, every episode flies
+    straight to the boundary, the replay buffer fills with uniformly bad
+    transitions, and the deterministic policy gradient is flat — it never
+    learns even the trivial 10 m curriculum stage. Shrinking only the last
+    layer tames the output magnitude regardless of how large the hidden
+    activations are, which is what lets width/depth beyond the earlier
+    saturation ceiling (see SmartEncoder docstring) actually train.
+
+    Must run AFTER TD3 construction and BEFORE learning; the actor_target is
+    re-synced to the actor so both start identical (SB3 copies actor->target
+    at build time, i.e. before this edit)."""
+    import torch.nn as nn
+    linears = [m for m in model.actor.mu.modules() if isinstance(m, nn.Linear)]
+    last = linears[-1]
+    nn.init.uniform_(last.weight, -weight_bound, weight_bound)
+    nn.init.uniform_(last.bias, -weight_bound, weight_bound)
+    model.actor_target.load_state_dict(model.actor.state_dict())
+
+
 def build_smart_policy_kwargs(
     net_arch: list[int],
     features_dim: int = 256,
