@@ -17,7 +17,26 @@ OMEGA = np.sqrt(EARTH_MU / ORBIT_RADIUS ** 3)
 ORBIT_PERIOD = 2 * np.pi / OMEGA
 
 # --- Environment defaults ---
-ENV_DT = 5.0
+# Two decoupled timesteps (see libs/env.py):
+#   ENV_DT_PHYS  : the fine PHYSICS/collision substep. The CW state-transition
+#                  matrix is the exact closed-form solution of the linear
+#                  dynamics, so this introduces NO integration error at any
+#                  size — it exists only to sample the trajectory finely
+#                  enough that (a) the straight-chord docking test is accurate
+#                  and (b) a fast pass-through the 1 m circle can't tunnel
+#                  between samples. Kept at the historical 5 s so the physics
+#                  is byte-identical to every prior run.
+#   ENV_DT_AGENT : the interval at which the RL agent actually acts (applies
+#                  one impulsive Δv), observes, and writes a transition to the
+#                  replay buffer. Larger than dt_phys so an episode spans far
+#                  fewer agent steps, which lets a MUCH lower gamma still
+#                  "see" the terminal reward (see GAMMA below). Must be an
+#                  integer multiple of ENV_DT_PHYS.
+ENV_DT_PHYS = 5.0
+ENV_DT_AGENT = 100.0
+# Back-compat alias: ENV_DT means the AGENT step everywhere downstream
+# (MAX_STEPS, evaluate.py, the env's default dt).
+ENV_DT = ENV_DT_AGENT
 ENV_BOUNDARY = 200.0
 ENV_TIMEOUT = 2 * ORBIT_PERIOD
 ENV_POS_TOLERANCE = 1.0
@@ -73,31 +92,26 @@ ENV_CURRICULUM_MAX_DISTANCE = 100.0    # final distance [m] (matches ENV_INITIAL
 ENV_CURRICULUM_INCREMENT = 5.0         # distance added per successful dock [m]
 
 # --- Training defaults ---
-# gamma=0.97 gives an effective horizon of ~33 steps (1/(1-gamma)) — but a
-# classical V-bar two-impulse hop takes close to a full orbital period
-# (~1160 steps here). Under the old gamma the terminal dock bonus and any
-# payoff more than ~30 steps out was invisible to the critic, so the agent
-# could never learn that an early burn pays off hundreds of steps later.
-# gamma=0.999 gives an effective horizon of ~1000 steps, matching the
-# actual task timescale.
-#
-# Raised 0.9995 -> 0.9999 to attack the FUEL problem specifically. With no
-# per-step time cost, the only thing implicitly rewarding a fast dock is the
-# discount: the fuel-optimal V-bar transfer pays off ~1160 steps out, and at
-# gamma=0.9995 that terminal reward is discounted by 0.9995**1160 ~= 0.56,
-# while a wasteful 28-step burn is discounted by only ~0.99 — so the two
-# score about the same despite a 100x fuel difference, and the agent
-# rationally picks the fast burn. At gamma=0.9999, 0.9999**1160 ~= 0.89, so
-# the slow low-fuel transfer's terminal payoff survives the discount and
-# actually wins. Trade-off: a longer effective horizon makes credit
-# assignment harder for the critic — pairs best with the LayerNorm --arch
-# smart critic; plain MLPs may need the extra capacity of the wider sweep
-# members to cope. Drop back to 0.9995 if runs stop learning.
-GAMMA = 0.9999
+# The discount has to make the SLOW fuel-optimal transfer's terminal reward
+# survive back to the early "coast, don't burn" decisions, otherwise the
+# agent just fast-burns (see the ENV_FUEL_COEFF note). The number of AGENT
+# steps to that payoff is what matters, and that is now set by ENV_DT_AGENT,
+# not the physics dt:
+#   old: dt = 5 s  -> a ~1 orbit (~5800 s) transfer is ~1160 steps, so you
+#        needed gamma ~0.9999 (0.9999**1160 ~= 0.89) to see the reward — and
+#        that long an effective horizon (1/(1-gamma) ~= 10000) diverges the
+#        critic on anything but a tiny net.
+#   now: dt_agent = 100 s -> the same transfer is ~58 agent steps, so a MUCH
+#        gentler gamma sees it: 0.99**58 ~= 0.56. Effective horizon
+#        1/(1-0.99) = 100 steps ~ one max episode (ENV_TIMEOUT/dt_agent), so
+#        credit assignment is easy and wide/deep nets train stably.
+# This is the whole point of raising ENV_DT_AGENT: trade the (physically
+# free) fine control cadence for a short-horizon MDP a smart net can learn.
+GAMMA = 0.99
 MAX_STEPS = int(ENV_TIMEOUT / ENV_DT) + 1
 
-ACTOR_LR = 1e-5
-CRITIC_LR = 1e-5
+ACTOR_LR = 1e-4
+CRITIC_LR = 1e-4
 GRAD_CLIP_NORM = 1.0
 LOG_EVERY = 10
 TAU = 0.005

@@ -6,6 +6,7 @@ from libs.constants import (
     ENV_BONUS,
     ENV_BOUNDARY,
     ENV_DT,
+    ENV_DT_PHYS,
     ENV_FUEL_COEFF,
     ENV_MAX_DV,
     ENV_POS_TOLERANCE,
@@ -107,6 +108,7 @@ class CWRendezvousEnv(gym.Env):
         self,
         omega: float = OMEGA,
         dt: float = ENV_DT,
+        dt_phys: float = ENV_DT_PHYS,
         max_dv: float = ENV_MAX_DV,
         boundary: float = ENV_BOUNDARY,
         timeout: float = ENV_TIMEOUT,
@@ -136,7 +138,18 @@ class CWRendezvousEnv(gym.Env):
         self.rbar_x_to_z_ratio = rbar_x_to_z_ratio
 
         self.omega = omega
+        # dt is the AGENT step (one impulse + one observation + one stored
+        # transition); dt_phys is the fine physics/collision substep it is
+        # decomposed into. Must divide evenly — the substep count is exact.
         self.dt = dt
+        self.dt_phys = dt_phys
+        n_sub = dt / dt_phys
+        self.n_substeps = int(round(n_sub))
+        if self.n_substeps < 1 or abs(n_sub - self.n_substeps) > 1e-9:
+            raise ValueError(
+                f"dt ({dt}) must be a positive integer multiple of dt_phys "
+                f"({dt_phys}); got ratio {n_sub}."
+            )
         self.max_dv = max_dv
         self.base_boundary = boundary
         self.excursion_limit = boundary
@@ -165,10 +178,15 @@ class CWRendezvousEnv(gym.Env):
         )
 
         # --- State Transition Matrix ---
+        # Built for the fine PHYSICS substep, not the agent step. Propagating
+        # n_substeps of dt_phys is exactly propagating one dt_agent (the CW
+        # STM is a matrix exponential: expm(A*dt_phys)**n == expm(A*n*dt_phys)),
+        # so this changes nothing about the physics — it only lets us sample
+        # the trajectory finely for the docking/collision test.
         if self.mode_2d:
-            self.STM_np = _build_stm_2d(omega, dt)
+            self.STM_np = _build_stm_2d(omega, dt_phys)
         else:
-            self.STM_np = _build_stm_full(omega, dt)
+            self.STM_np = _build_stm_full(omega, dt_phys)
 
         # --- Gym spaces ---
         self.observation_space = spaces.Box(
@@ -235,6 +253,23 @@ class CWRendezvousEnv(gym.Env):
         info = {"curriculum_distance": self.curriculum_distance}
         return observation, info
 
+    @staticmethod
+    def _segment_closest_to_origin(p0: np.ndarray, p1: np.ndarray):
+        """Closest point on the segment [p0, p1] to the origin, and its
+        distance. Used for the docking test so a fast fly-through of the
+        pos_tolerance circle registers a dock even if neither endpoint sample
+        happens to land inside it (the tunnelling the larger agent step would
+        otherwise cause). Exact for a straight chord; over one fine dt_phys the
+        real curved CW arc is essentially straight, so this is accurate."""
+        d = p1 - p0
+        denom = float(d @ d)
+        if denom <= 0.0:
+            closest = p0
+        else:
+            t = float(np.clip(-(p0 @ d) / denom, 0.0, 1.0))
+            closest = p0 + t * d
+        return closest, float(np.linalg.norm(closest))
+
     def step(self, action: np.ndarray):
         action = np.clip(action, -self.max_dv, self.max_dv)
         self.dv_used += np.linalg.norm(action)
@@ -242,17 +277,38 @@ class CWRendezvousEnv(gym.Env):
         half = self.phys_dim // 2
         prev_pos_error = np.linalg.norm(self.state[:half])
 
-        # Propagate: apply Δv to velocity, then advance with STM
+        # One impulsive Δv is applied ONCE at the start of the agent step,
+        # then the state coasts through n_substeps of the fine physics dt.
+        # Docking (segment test) and out-of-bounds are checked at EVERY
+        # substep so a fast pass-through the target can't tunnel between the
+        # coarse agent samples, and we stop the instant a terminal event
+        # happens instead of only looking at the agent-step endpoint.
         self.state[half:] += action
-        self.state = self.STM_np @ self.state
-        self.elapsed_time += self.dt
+
+        docked = out_of_bounds = timeout = False
+        for _ in range(self.n_substeps):
+            prev_pos = self.state[:half].copy()
+            self.state = self.STM_np @ self.state
+            self.elapsed_time += self.dt_phys
+            new_pos = self.state[:half]
+
+            closest, closest_dist = self._segment_closest_to_origin(prev_pos, new_pos)
+            if closest_dist < self.pos_tolerance:
+                docked = True
+                # Snap the recorded position to the closest-approach point so
+                # pos_error reflects the true miss distance; keep the coasted
+                # velocity for the terminal (vel_error) penalty.
+                self.state[:half] = closest
+                break
+            if np.linalg.norm(new_pos) > self.excursion_limit:
+                out_of_bounds = True
+                break
+            if self.elapsed_time > self.timeout:
+                timeout = True
+                break
 
         pos_error = np.linalg.norm(self.state[:half])
         vel_error = np.linalg.norm(self.state[half:])
-
-        docked        = pos_error < self.pos_tolerance
-        out_of_bounds = pos_error > self.excursion_limit
-        timeout       = self.elapsed_time > self.timeout
 
         delta      = prev_pos_error - pos_error
         terminated = bool(docked or out_of_bounds)

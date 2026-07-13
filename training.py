@@ -600,6 +600,9 @@ def parse_args():
                          "(from the original DDPG paper's much higher-dim tasks) — "
                          "oversized for a 5-obs/2-action problem. With --arch smart these "
                          "size the actor/critic HEADS that sit on top of the residual encoder.")
+    p.add_argument("--lr", type=float, default=CRITIC_LR,
+                    help="Learning rate for actor+critic (default from constants.py). Lower "
+                         "(1e-4/3e-5) stabilizes a wide/deep critic; higher trains faster.")
     p.add_argument("--gamma", type=float, default=GAMMA,
                     help="Discount factor override (default from constants.py). Big nets "
                          "destabilize under the fuel-tuned 0.9999 (critic value divergence -> "
@@ -752,7 +755,7 @@ def main():
         model = TD3(
             policy               = "MlpPolicy",
             env                  = env,
-            learning_rate        = CRITIC_LR,
+            learning_rate        = args.lr,
             buffer_size          = REPLAY_BUFFER_SIZE,
             learning_starts      = MIN_BUFFER,
             batch_size           = BATCH_SIZE,
