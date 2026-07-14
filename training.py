@@ -37,6 +37,9 @@ from libs.constants import (
     ENV_CURRICULUM_INCREMENT,
     ENV_CURRICULUM_MAX_DISTANCE,
     ENV_CURRICULUM_START_DISTANCE,
+    ENV_DV_BUDGET_COEFF_FLOOR,
+    ENV_DV_BUDGET_COEFF_START,
+    ENV_DV_BUDGET_SHRINK,
     ENV_MAX_DV_COEFF,
     GAMMA,
     LOG_EVERY,
@@ -63,7 +66,8 @@ from libs.trajectory import plot_trajectory
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def make_single_env(scenario: str, curriculum_start_distance: float | None = None):
+def make_single_env(scenario: str, curriculum_start_distance: float | None = None,
+                     dv_budget_coeff_start: float | None = None):
     def _init():
         # Runs inside each SubprocVecEnv worker. Each worker only ever does
         # a 4x4 matmul per step — letting it default to a multi-threaded
@@ -81,6 +85,8 @@ def make_single_env(scenario: str, curriculum_start_distance: float | None = Non
         env_kwargs = {}
         if curriculum_start_distance is not None:
             env_kwargs["curriculum_start_distance"] = curriculum_start_distance
+        if dv_budget_coeff_start is not None:
+            env_kwargs["dv_budget_coeff"] = dv_budget_coeff_start
         env = CWRendezvousEnv(omega=OMEGA, scenario=scenario, **env_kwargs)
         env = CanonicalizeDirectionEnv(env)  # must wrap the raw (unnormalized) env
         env = NormalizedObsEnv(env)
@@ -144,11 +150,18 @@ def build_diagnostics_figure(cb: "TrainingCallback", scenario: str):
     axes[2, 1].set_ylim(0, 100)
     axes[2, 1].grid(True, alpha=0.3)
 
-    axes[2, 2].plot(cb.episode_curriculum_distances, color="tab:olive", linewidth=2)
-    axes[2, 2].set_title("Curriculum distance (shared across all envs)")
+    axes[2, 2].plot(cb.episode_curriculum_distances, color="tab:olive", linewidth=2, label="distance")
+    axes[2, 2].set_title("Curriculum distance + Δv budget (shared across all envs)")
     axes[2, 2].set_ylabel("m")
     axes[2, 2].set_xlabel("Episode")
     axes[2, 2].grid(True, alpha=0.3)
+    if any(not np.isnan(c) for c in cb.episode_dv_budget_coeffs):
+        ax_budget = axes[2, 2].twinx()
+        ax_budget.plot(cb.episode_dv_budget_coeffs, color="tab:red", linewidth=2, label="dv_budget_coeff")
+        ax_budget.set_ylabel("dv_budget_coeff (x dv_ref)")
+        lines_l, labels_l = axes[2, 2].get_legend_handles_labels()
+        lines_r, labels_r = ax_budget.get_legend_handles_labels()
+        axes[2, 2].legend(lines_l + lines_r, labels_l + labels_r, loc="best")
 
     fig.tight_layout()
     return fig
@@ -241,21 +254,25 @@ class PeriodicCheckpointCallback(BaseCallback):
     only whatever happened since the last checkpoint.
 
     Also writes a small <name>_<steps>_steps.curriculum.json sidecar with
-    the curriculum_distance at save time. SB3's model.save() only persists
-    the policy/optimizer/num_timesteps — curriculum_distance lives in
-    CurriculumCallback, not the model, so --resume-from needs this sidecar
-    to avoid silently restarting the curriculum from the beginning.
+    the curriculum_distance (and, if a DvBudgetCurriculumCallback is active,
+    dv_budget_coeff) at save time. SB3's model.save() only persists the
+    policy/optimizer/num_timesteps — curriculum_distance/dv_budget_coeff
+    live in CurriculumCallback/DvBudgetCurriculumCallback, not the model, so
+    --resume-from needs this sidecar to avoid silently restarting either
+    curriculum from the beginning.
     """
 
     def __init__(self, save_dir: Path, name_prefix: str, n_envs: int,
                  save_freq_timesteps: int = 1000, keep_last: int = 20,
-                 curriculum_callback: "CurriculumCallback | None" = None):
+                 curriculum_callback: "CurriculumCallback | None" = None,
+                 dv_budget_curriculum_callback: "DvBudgetCurriculumCallback | None" = None):
         super().__init__(verbose=0)
         self.save_dir = save_dir
         self.name_prefix = name_prefix
         self.keep_last = keep_last
         self.save_freq_calls = max(save_freq_timesteps // n_envs, 1)
         self.curriculum_callback = curriculum_callback
+        self.dv_budget_curriculum_callback = dv_budget_curriculum_callback
 
     def _on_step(self) -> bool:
         if self.n_calls % self.save_freq_calls == 0:
@@ -264,10 +281,11 @@ class PeriodicCheckpointCallback(BaseCallback):
             self.model.save(str(path))
 
             if self.curriculum_callback is not None:
+                sidecar_data = {"curriculum_distance": self.curriculum_callback.curriculum_distance}
+                if self.dv_budget_curriculum_callback is not None:
+                    sidecar_data["dv_budget_coeff"] = self.dv_budget_curriculum_callback.dv_budget_coeff
                 sidecar = path.with_suffix(".curriculum.json")
-                sidecar.write_text(json.dumps(
-                    {"curriculum_distance": self.curriculum_callback.curriculum_distance}
-                ))
+                sidecar.write_text(json.dumps(sidecar_data))
 
             checkpoints = sorted(
                 self.save_dir.glob(f"{self.name_prefix}_*_steps.zip"),
@@ -322,9 +340,26 @@ class CurriculumCallback(BaseCallback):
         self._recent_docks = deque(maxlen=window)
         self.curriculum_distance = None
         self._stalled_windows = 0
+        # Set by lock() — see its docstring. Distinct from "already at
+        # max_distance": that alone still permits stall-triggered regression,
+        # this permanently forbids ANY further change.
+        self.locked = False
 
     def _on_training_start(self) -> None:
         self.curriculum_distance = self.training_env.get_attr("curriculum_distance")[0]
+
+    def lock(self) -> None:
+        """Freezes curriculum_distance permanently: _on_step becomes a no-op,
+        so it can no longer advance OR regress regardless of dock rate.
+        Called by DvBudgetCurriculumCallback the instant the fuel curriculum
+        activates (see its _on_step/_on_training_start), so a dip in dock
+        rate while the Δv budget is being tightened can't ALSO regress the
+        distance out from under it — the two axes shouldn't fight each
+        other. No effect if --fuel-curriculum is off (nothing ever calls
+        this), so normal runs keep the old regress-on-stall behavior."""
+        if not self.locked:
+            self.locked = True
+            print(f"[curriculum] locked at {self.curriculum_distance:.1f} m (fuel curriculum active)")
 
     @property
     def progress(self) -> str:
@@ -335,6 +370,9 @@ class CurriculumCallback(BaseCallback):
         return f"{k}/{n}"
 
     def _on_step(self) -> bool:
+        if self.locked:
+            return True
+
         infos = self.locals["infos"]
         dones = self.locals["dones"]
         for i in range(self.n_envs):
@@ -360,6 +398,136 @@ class CurriculumCallback(BaseCallback):
                 self.training_env.env_method("set_curriculum_distance", self.curriculum_distance)
                 print(f"[curriculum] dock rate < {self.dock_rate_threshold:.0%} for "
                       f"{self.stall_patience} windows -> regressing to {self.curriculum_distance:.1f} m")
+                self._stalled_windows = 0
+            self._recent_docks.clear()
+        return True
+
+
+class DvBudgetCurriculumCallback(BaseCallback):
+    """
+    A SECOND curriculum axis, independent of (and gated behind)
+    CurriculumCallback's distance ramp: once the agent is docking reliably
+    at full curriculum distance, caps the TOTAL Δv the agent may spend across
+    a WHOLE episode (dv_budget = dv_ref * dv_budget_coeff, enforced by
+    CWRendezvousEnv.step() clipping any burn that would exceed it — see
+    set_dv_budget_coeff() there) and ratchets that budget DOWN toward
+    `floor_coeff` as dock rate stays high.
+
+    This is deliberately NOT the same lever as ENV_MAX_DV_COEFF (a per-burst
+    actuator cap): an earlier attempt tightening only the per-burst cap found
+    the agent just chained many separate near-cap burns and kept total
+    dv_used/dv_ref sitting around ~20x even at a tight 1.2x per-burst cap —
+    a per-burst cap doesn't limit burn COUNT. Capping the total instead
+    forces genuine fuel discipline: once the tank's dry, it's dry.
+
+    Ratchets MULTIPLICATIVELY (not linearly) — dv_budget_coeff *= shrink_factor
+    each successful dock-rate window, floored at floor_coeff — so it falls
+    fast while there's lots of slack (50x -> 42.5x -> 36.1x...) and slows
+    down as it nears the tight floor, rather than a fixed-size step being a
+    huge relative cut near the floor (e.g. -0.05 at 1.2x vs -0.05 at 50x)
+    or a needlessly tiny one relative to the huge initial slack.
+
+    Inactive (dv_budget_coeff stays None, i.e. unconstrained — matching every
+    prior run's behavior) until BOTH distance_curriculum has graduated to
+    max_distance AND dock rate first clears the threshold — at which point it
+    activates at start_coeff and begins ratcheting down from there. Mirrors
+    CurriculumCallback's stall-regression too: if dock rate then stays below
+    threshold for `stall_patience` windows, the budget relaxes back up
+    (divide by shrink_factor), capped at start_coeff — never all the way back
+    to fully unconstrained once activated.
+
+    The INSTANT this axis activates, it calls distance_curriculum.lock() —
+    permanently freezing curriculum_distance so it can never advance OR
+    regress again, even if dock rate later dips while the Δv budget is being
+    tightened. Without this the two axes could fight each other: a stall
+    caused by a just-tightened budget would otherwise also read as "distance
+    curriculum should regress," undoing progress on an axis that has nothing
+    to do with why dock rate dipped.
+    """
+
+    def __init__(self, n_envs: int, start_coeff: float, floor_coeff: float,
+                 shrink_factor: float, distance_curriculum: "CurriculumCallback | None" = None,
+                 window: int = 20, dock_rate_threshold: float = 0.5,
+                 stall_patience: int = 3):
+        super().__init__(verbose=0)
+        self.n_envs = n_envs
+        self.start_coeff = start_coeff
+        self.floor_coeff = floor_coeff
+        self.shrink_factor = shrink_factor
+        self.distance_curriculum = distance_curriculum
+        self.dock_rate_threshold = dock_rate_threshold
+        self.stall_patience = stall_patience
+        self._recent_docks = deque(maxlen=window)
+        self.dv_budget_coeff = None  # None = unconstrained, until first activation
+        self._active = False
+        self._stalled_windows = 0
+
+    def _on_training_start(self) -> None:
+        # Mirrors CurriculumCallback: pick up whatever the env already has
+        # (e.g. restored from a --resume-from sidecar) instead of always
+        # resetting to unconstrained, so resuming mid-ratchet continues from
+        # where it left off.
+        current = self.training_env.get_attr("dv_budget_coeff")[0]
+        if current is not None:
+            self.dv_budget_coeff = float(current)
+            self._active = True
+            if self.distance_curriculum is not None:
+                self.distance_curriculum.lock()
+
+    @property
+    def _distance_graduated(self) -> bool:
+        dc = self.distance_curriculum
+        return dc is None or dc.curriculum_distance is None or dc.curriculum_distance >= dc.max_distance
+
+    @property
+    def progress(self) -> str:
+        """'k/n' of the pooled rolling window, mirroring
+        CurriculumCallback.progress — read by TrainingCallback for the log
+        line once this axis is active."""
+        n = len(self._recent_docks)
+        k = sum(self._recent_docks)
+        return f"{k}/{n}"
+
+    def _on_step(self) -> bool:
+        if not self._distance_graduated:
+            return True
+
+        infos = self.locals["infos"]
+        dones = self.locals["dones"]
+        for i in range(self.n_envs):
+            if dones[i]:
+                self._recent_docks.append(bool(infos[i].get("docked", False)))
+
+        if len(self._recent_docks) < self._recent_docks.maxlen:
+            return True
+
+        dock_rate = np.mean(self._recent_docks)
+        if dock_rate >= self.dock_rate_threshold:
+            self._stalled_windows = 0
+            if not self._active:
+                self._active = True
+                self.dv_budget_coeff = self.start_coeff
+                self.training_env.env_method("set_dv_budget_coeff", self.dv_budget_coeff)
+                if self.distance_curriculum is not None:
+                    self.distance_curriculum.lock()
+                print(f"[fuel-curriculum] distance graduated + dock rate >= "
+                      f"{self.dock_rate_threshold:.0%} -> activating dv budget at "
+                      f"{self.dv_budget_coeff:.2f}x dv_ref")
+            elif self.dv_budget_coeff > self.floor_coeff:
+                self.dv_budget_coeff = max(self.dv_budget_coeff * self.shrink_factor, self.floor_coeff)
+                self.training_env.env_method("set_dv_budget_coeff", self.dv_budget_coeff)
+                print(f"[fuel-curriculum] dock rate >= {self.dock_rate_threshold:.0%} -> "
+                      f"tightening dv budget to {self.dv_budget_coeff:.2f}x dv_ref")
+            self._recent_docks.clear()
+        else:
+            self._stalled_windows += 1
+            if (self._active and self._stalled_windows >= self.stall_patience
+                    and self.dv_budget_coeff < self.start_coeff):
+                self.dv_budget_coeff = min(self.dv_budget_coeff / self.shrink_factor, self.start_coeff)
+                self.training_env.env_method("set_dv_budget_coeff", self.dv_budget_coeff)
+                print(f"[fuel-curriculum] dock rate < {self.dock_rate_threshold:.0%} for "
+                      f"{self.stall_patience} windows -> relaxing dv budget to "
+                      f"{self.dv_budget_coeff:.2f}x dv_ref")
                 self._stalled_windows = 0
             self._recent_docks.clear()
         return True
@@ -399,6 +567,7 @@ class TrainingCallback(BaseCallback):
         self.episode_r_term_totals  = []
         self.episode_noise_std      = []
         self.episode_curriculum_distances = []
+        self.episode_dv_budget_coeffs = []
 
         self._acc = [self._new_accumulator() for _ in range(n_envs)]
         self._episode_num = 0
@@ -473,6 +642,8 @@ class TrainingCallback(BaseCallback):
                 noise_std  = self._current_noise_std()
                 dv_ref     = info.get("dv_ref", float("nan"))
                 dv_ratio   = acc["delta_v"] / dv_ref if dv_ref else float("nan")
+                dv_budget_coeff = info.get("dv_budget_coeff")
+                dv_budget_coeff = float(dv_budget_coeff) if dv_budget_coeff is not None else float("nan")
 
                 self.episode_rewards.append(reward)
                 self.episode_steps.append(steps)
@@ -484,6 +655,7 @@ class TrainingCallback(BaseCallback):
                 self.episode_r_term_totals.append(acc["r_term"])
                 self.episode_noise_std.append(noise_std)
                 self.episode_curriculum_distances.append(cur_dist)
+                self.episode_dv_budget_coeffs.append(dv_budget_coeff)
 
                 ep = self._episode_num
                 if ep % self.log_every == 0:
@@ -575,6 +747,8 @@ class LiveDiagnosticsCallback(BaseCallback):
             "recent_avg_reward": float(np.mean(reward_window)) if reward_window else None,
             "curriculum_distance": (float(cb.episode_curriculum_distances[-1])
                                      if cb.episode_curriculum_distances else None),
+            "dv_budget_coeff": (float(cb.episode_dv_budget_coeffs[-1])
+                                 if cb.episode_dv_budget_coeffs else None),
             "elapsed_seconds": elapsed,
             "steps_per_sec": (self.num_timesteps / elapsed) if elapsed > 0 else None,
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -652,6 +826,32 @@ def parse_args():
     p.add_argument("--noise-std-end", type=float, default=ACTION_NOISE_STD_END,
                     help="Exploration noise stationary std at the END of the decay schedule. "
                          "Default from constants.py.")
+    p.add_argument("--fuel-curriculum", action="store_true",
+                    help="Enable a SECOND curriculum axis (DvBudgetCurriculumCallback): once "
+                         "the distance curriculum has reached ENV_CURRICULUM_MAX_DISTANCE and "
+                         "dock rate stays >= 50%% over a rolling window, activates a TOTAL "
+                         "per-episode dv budget (dv_used capped at dv_budget_coeff * dv_ref, "
+                         "any burn beyond it clipped down to whatever remains — the tank runs "
+                         "dry) starting at --fuel-curriculum-start and ratcheting MULTIPLICATIVELY "
+                         "down toward --fuel-curriculum-floor as dock rate stays high (mirrors "
+                         "the distance curriculum's dock-rate-gated advance/stall-regress logic). "
+                         "Off by default — meant for a fine-tuning pass on a model that already "
+                         "docks reliably (e.g. via --resume-from), forcing genuine total-fuel "
+                         "discipline instead of just capping any one burn's size.")
+    p.add_argument("--fuel-curriculum-start", type=float, default=ENV_DV_BUDGET_COEFF_START,
+                    help="dv budget (as a multiple of dv_ref) the fuel curriculum activates at "
+                         "and regresses back up toward on a sustained stall (default from "
+                         "constants.py).")
+    p.add_argument("--fuel-curriculum-floor", type=float, default=ENV_DV_BUDGET_COEFF_FLOOR,
+                    help="Tightest dv budget (as a multiple of dv_ref) the fuel curriculum will "
+                         "ratchet down to (default from constants.py; e.g. 3.0 = 3x dv_ref total "
+                         "for the whole episode).")
+    p.add_argument("--fuel-curriculum-shrink", type=float, default=ENV_DV_BUDGET_SHRINK,
+                    help="Multiplicative shrink factor applied to the dv budget per dock-rate-"
+                         "window ratchet (e.g. 0.85 = -15%% per step); regress divides by this "
+                         "same factor instead of subtracting, so the ratchet is non-linear — "
+                         "big absolute steps while there's slack, small ones near the floor "
+                         "(default from constants.py).")
 
     # ── Perf knobs ──────────────────────────────────────────────────────────
     p.add_argument("--vec-env", choices=["auto", "dummy", "subproc"], default="auto",
@@ -762,11 +962,16 @@ def main():
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     resume_curriculum_distance = None
+    resume_dv_budget_coeff = None
     if args.resume_from:
         sidecar = Path(args.resume_from).with_suffix("").with_suffix(".curriculum.json")
         if sidecar.exists():
-            resume_curriculum_distance = json.loads(sidecar.read_text())["curriculum_distance"]
+            sidecar_data = json.loads(sidecar.read_text())
+            resume_curriculum_distance = sidecar_data["curriculum_distance"]
             print(f"Resuming curriculum_distance = {resume_curriculum_distance:.1f} m (from {sidecar})")
+            resume_dv_budget_coeff = sidecar_data.get("dv_budget_coeff")
+            if resume_dv_budget_coeff is not None:
+                print(f"Resuming dv_budget_coeff = {resume_dv_budget_coeff:.2f}x dv_ref (from {sidecar})")
         else:
             print(f"WARNING: no curriculum sidecar at {sidecar} — curriculum will "
                   f"restart at {ENV_CURRICULUM_START_DISTANCE:.1f} m")
@@ -784,7 +989,8 @@ def main():
     print(f"vec_env: {vec_cls.__name__}"
           + (f" (start_method={vec_kwargs['start_method']})" if vec_kwargs else ""))
     env = make_vec_env(
-        make_single_env(args.scenario, curriculum_start_distance=resume_curriculum_distance),
+        make_single_env(args.scenario, curriculum_start_distance=resume_curriculum_distance,
+                         dv_budget_coeff_start=resume_dv_budget_coeff),
         n_envs=n_envs, vec_env_cls=vec_cls, vec_env_kwargs=vec_kwargs,
     )
 
@@ -878,6 +1084,14 @@ def main():
         min_distance=ENV_CURRICULUM_START_DISTANCE,
     ) if ENV_CURRICULUM_ENABLED else None
 
+    dv_budget_curriculum_callback = DvBudgetCurriculumCallback(
+        n_envs=n_envs,
+        start_coeff=args.fuel_curriculum_start,
+        floor_coeff=args.fuel_curriculum_floor,
+        shrink_factor=args.fuel_curriculum_shrink,
+        distance_curriculum=curriculum_callback,
+    ) if args.fuel_curriculum else None
+
     # SB3's learn(total_timesteps, reset_num_timesteps=False) treats
     # total_timesteps as an INCREMENT added to the model's existing
     # num_timesteps, not an absolute target — so on resume we pass the
@@ -907,6 +1121,7 @@ def main():
             save_freq_timesteps=args.checkpoint_freq,
             keep_last=args.keep_last_checkpoints,
             curriculum_callback=curriculum_callback,
+            dv_budget_curriculum_callback=dv_budget_curriculum_callback,
         ),
         ThroughputCallback(log_every_timesteps=args.throughput_log_every),
     ]
@@ -922,6 +1137,8 @@ def main():
     callback.append(live_diag_callback)
     if curriculum_callback is not None:
         callback.append(curriculum_callback)
+    if dv_budget_curriculum_callback is not None:
+        callback.append(dv_budget_curriculum_callback)
 
     model.learn(
         total_timesteps      = remaining_timesteps,
@@ -957,6 +1174,7 @@ def main():
         r_term     = np.array(cb.episode_r_term_totals),
         noise_std  = np.array(cb.episode_noise_std),
         curriculum_distance = np.array(cb.episode_curriculum_distances),
+        dv_budget_coeff = np.array(cb.episode_dv_budget_coeffs),
     )
     print("Done.")
 

@@ -114,6 +114,7 @@ class CWRendezvousEnv(gym.Env):
         dt: float = ENV_DT,
         dt_phys: float = ENV_DT_PHYS,
         max_dv_coeff: float = ENV_MAX_DV_COEFF,
+        dv_budget_coeff: Optional[float] = None,
         burn_deadzone_frac: float = ENV_BURN_DEADZONE_FRAC,
         boundary: float = ENV_BOUNDARY,
         timeout: float = ENV_TIMEOUT,
@@ -157,6 +158,13 @@ class CWRendezvousEnv(gym.Env):
             )
 
         self.max_dv_coeff = max_dv_coeff
+        # None = unconstrained (default — matches all prior behavior). Once
+        # set (training.py's DvBudgetCurriculumCallback, via
+        # set_dv_budget_coeff()), dv_budget = dv_ref * dv_budget_coeff caps
+        # TOTAL cumulative dv_used for the whole episode, not just one burn
+        # — see the ENV_DV_BUDGET_COEFF_START comment in constants.py.
+        self.dv_budget_coeff = dv_budget_coeff
+        self.dv_budget = None  # set for real in reset(), as dv_budget_coeff * dv_ref
         self.burn_deadzone_frac = burn_deadzone_frac
         self.burn_deadzone = 0.0  # set for real in reset(), as burn_deadzone_frac * max_dv
         self.base_boundary = boundary
@@ -238,6 +246,15 @@ class CWRendezvousEnv(gym.Env):
             np.clip(distance, 0.0, self.curriculum_max_distance)
         )
 
+    def set_dv_budget_coeff(self, coeff: Optional[float]):
+        """External control hook — called by training.py's
+        DvBudgetCurriculumCallback (via VecEnv.env_method), mirroring
+        set_curriculum_distance(). None disables the budget (unconstrained,
+        the default); a float takes effect from the NEXT reset() onward
+        (dv_budget is recomputed from dv_budget_coeff * dv_ref there), not
+        retroactively on whatever episode is already in flight."""
+        self.dv_budget_coeff = None if coeff is None else max(float(coeff), 1e-3)
+
     # ── Observation ──────────────────────────────────────────────────────────
 
     def _build_observation(self) -> np.ndarray:
@@ -267,6 +284,9 @@ class CWRendezvousEnv(gym.Env):
             # TODO: divide by the amount required actually to reach... could use half as approximation
             
         self.max_dv = self.dv_ref * self.max_dv_coeff
+        self.dv_budget = (
+            None if self.dv_budget_coeff is None else self.dv_ref * self.dv_budget_coeff
+        )
 
         self.burn_deadzone = self.burn_deadzone_frac * self.max_dv
 
@@ -313,6 +333,22 @@ class CWRendezvousEnv(gym.Env):
         if burn < self.burn_deadzone:
             action = np.zeros_like(action)
             burn = 0.0
+        elif self.dv_budget is not None:
+            # Total-episode Δv BUDGET (distinct from max_dv above, which
+            # only caps THIS one burn): clip — don't zero — any burn that
+            # would push cumulative dv_used past dv_budget down to whatever
+            # remains, preserving direction. The tank runs genuinely dry
+            # instead of the agent being free to keep re-burning at the
+            # per-burst cap indefinitely (see the ENV_DV_BUDGET_COEFF_START
+            # comment in constants.py for why a per-burst cap alone doesn't
+            # limit burn COUNT).
+            remaining = self.dv_budget - self.dv_used
+            if remaining <= 0.0:
+                action = np.zeros_like(action)
+                burn = 0.0
+            elif burn > remaining:
+                action = action * (remaining / burn)
+                burn = remaining
         self.dv_used += burn
 
         half = self.phys_dim // 2
@@ -404,6 +440,7 @@ class CWRendezvousEnv(gym.Env):
             "applied_action":  action.copy(),
             "dv_used":         self.dv_used,
             "dv_ref":          self.dv_ref,
+            "dv_budget_coeff": self.dv_budget_coeff,
             "curriculum_distance": self.curriculum_distance,
             "excursion_limit": self.excursion_limit,
         }

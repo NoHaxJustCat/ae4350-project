@@ -97,6 +97,29 @@ ENV_FUEL_COEFF = 500.0
 # without needing retuning when the curriculum range changes.
 ENV_MAX_DV_COEFF = 1.5
 
+# --- Total Δv BUDGET curriculum, opt-in via --fuel-curriculum ---
+# A SECOND, independent curriculum axis (training.py's
+# DvBudgetCurriculumCallback), gated behind the distance curriculum reaching
+# ENV_CURRICULUM_MAX_DISTANCE. Unlike ENV_MAX_DV_COEFF above (a PER-BURST cap
+# on any single impulse), this caps the TOTAL cumulative dv_used allowed
+# across the WHOLE episode: dv_budget = dv_ref * dv_budget_coeff, enforced in
+# CWRendezvousEnv.step() by clipping (not zeroing) any commanded burn down to
+# whatever budget remains once dv_used would exceed it — the tank runs
+# genuinely dry, direction preserved, magnitude reduced. A per-burst cap
+# alone doesn't limit burn COUNT: an earlier attempt capping only
+# ENV_MAX_DV_COEFF found the agent just chained many separate near-cap burns
+# and kept total dv_used/dv_ref sitting around ~20x even at a tight 1.2x
+# per-burst cap, since the flat docking bonus doesn't scale with efficiency.
+#
+# Starts, once activated, at a deliberately generous 50x dv_ref (looser than
+# the ~20x ratio observed in practice, so it's initially non-binding) and
+# ratchets down MULTIPLICATIVELY (not linearly — see ENV_DV_BUDGET_SHRINK)
+# toward a tight 3x floor as dock rate stays high, mirroring
+# CurriculumCallback's dock-rate-gated advance/stall-regress shape.
+ENV_DV_BUDGET_COEFF_START = 50.0
+ENV_DV_BUDGET_COEFF_FLOOR = 3.0
+ENV_DV_BUDGET_SHRINK = 0.85  # multiplicative ratchet per dock-rate window
+
 # Burn deadzone / minimum-impulse-bit, as a FRACTION of the episode's max_dv
 # (CWRendezvousEnv.reset() sets burn_deadzone = ENV_BURN_DEADZONE_FRAC *
 # max_dv — relative to dv_ref for the same reason as ENV_MAX_DV_COEFF above,
@@ -203,11 +226,11 @@ OU_THETA = 0.15   # SB3 OrnsteinUhlenbeckActionNoise default; pinned explicitly
 OU_DT    = 0.01   # so the amplification-factor math below can't silently drift
 OU_STD_PER_SIGMA = (2 * OU_THETA - OU_THETA ** 2 * OU_DT) ** -0.5
 
-ACTION_NOISE_STD_START = 0.25
-ACTION_NOISE_STD_END   = 0.02
+ACTION_NOISE_STD_START = 0.15
+ACTION_NOISE_STD_END   = 0.001
 ACTION_NOISE_SIGMA_START = ACTION_NOISE_STD_START / OU_STD_PER_SIGMA
 ACTION_NOISE_SIGMA_END   = ACTION_NOISE_STD_END / OU_STD_PER_SIGMA
-NOISE_DECAY_FRAC = 0.23  # ~3x faster than the old 0.7 — noise was still near
+NOISE_DECAY_FRAC = 0.25  # ~3x faster than the old 0.7 — noise was still near
 # sigma_start at 20% of training, starving the agent of low-noise fuel-
 # efficiency practice for the back 80% of the run.
 
