@@ -357,16 +357,27 @@ class CWRendezvousEnv(gym.Env):
         reward_pos = ENV_SHAPING_COEFF * delta / self.curriculum_distance
 
         if docked:
-            # Reward is a cubic decay in dv_used/dv_ref (the analytic two-
-            # impulse reference computed in reset()), not an absolute dv
-            # scale — so it's calibrated against "how close to optimal was
-            # this transfer" rather than a fixed m/s budget. Ratio is floored
-            # at 1 so matching-or-beating the reference all saturates at the
-            # same peak (fuel_coeff) instead of blowing up as dv_used -> 0.
-            # With ENV_FUEL_COEFF=100: ratio<=1 -> 100, ratio=2 -> 12.5,
-            # ratio=3 -> 3.7, ratio=4 -> 1.6, decaying further beyond that.
+            # Reward is coeff/ratio, ratio = dv_used/dv_ref (the analytic
+            # two-impulse reference computed in reset()) floored at 1 so
+            # matching-or-beating the reference all saturates at the same
+            # peak (fuel_coeff) instead of blowing up as dv_used -> 0.
+            #
+            # A plain inverse (not inverse-CUBE, as an earlier version used)
+            # is a deliberate choice: 1/ratio has constant elasticity
+            # (d(reward)/reward == -d(ratio)/ratio everywhere), so a given
+            # PROPORTIONAL fuel improvement is worth the same reward change
+            # at ratio=1.2 as at ratio=20 — unlike 1/ratio**3, which is steep
+            # near ratio=1 but has essentially zero gradient by ratio~10
+            # (100/10**3=0.1, 100/11**3=0.075 — a 10% fuel cut is worth
+            # 0.025 points, invisible next to ordinary terminal-velocity
+            # noise). That flat-tail problem was real: a live run sitting at
+            # ratio~13-17x reference showed total dv NOT improving over
+            # 26k+ episodes because the fuel term had nothing left to say.
+            # With 1/ratio: ratio=1->100, 1.5->66.7, 2->50, 3->33.3, 5->20,
+            # 10->10, 15->6.7, 20->5 — strong near the optimum (as before)
+            # AND still a meaningful, non-vanishing gradient at 20x+.
             ratio = max(self.dv_used / self.dv_ref, 1.0)
-            reward_fuel = self.fuel_coeff * ratio ** (-3)
+            reward_fuel = self.fuel_coeff / ratio
         else:
             reward_fuel = 0.0
 

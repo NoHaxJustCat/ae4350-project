@@ -1,0 +1,1 @@
+{"scenario": "vbar", "run_tag": "pleasework", "num_timesteps": 14784, "total_timesteps": 10000000, "episode_count": 2268, "recent_dock_rate": 0.5, "recent_avg_reward": 13.5882467, "curriculum_distance": 200.0, "elapsed_seconds": 150.1961707999999, "steps_per_sec": 98.43127105874267, "updated_at": "2026-07-14 11:52:47"}

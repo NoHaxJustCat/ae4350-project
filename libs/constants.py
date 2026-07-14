@@ -67,21 +67,25 @@ ENV_POS_TOLERANCE = 5.0
 ENV_VEL_COEFF = 10.0
 ENV_SHAPING_COEFF = 10.0
 ENV_BONUS = 50.0
-# Fuel bonus: paid only on a successful dock, cubic decay in
-# dv_used/dv_ref (reward_fuel = coeff * max(dv_used/dv_ref, 1)**-3 — see
-# libs/env.py::step). dv_ref is the analytic two-impulse reference for this
-# episode's scenario/distance (libs/reference.py), so the bonus is graded
-# against "how close to the optimal transfer" rather than an absolute m/s
-# scale. Strictly additive on top of the dock bonus, so it can never make
-# failing to dock look better than a wasteful dock (zero unless docked=True).
+# Fuel bonus: paid only on a successful dock, inverse (constant-elasticity)
+# decay in dv_used/dv_ref (reward_fuel = coeff / max(dv_used/dv_ref, 1) —
+# see libs/env.py::step). dv_ref is the analytic two-impulse reference for
+# this episode's scenario/distance (libs/reference.py), so the bonus is
+# graded against "how close to the optimal transfer" rather than an
+# absolute m/s scale. Strictly additive on top of the dock bonus, so it can
+# never make failing to dock look better than a wasteful dock (zero unless
+# docked=True).
 #
-# coeff=100 sets the peak (dv_used <= dv_ref, i.e. matching or beating the
-# reference): 100/1**3=100. Using 2x the reference dv scores ~12.5, 3x
-# scores ~3.7, 4x ~1.6, decaying further beyond that — a steep, strictly
-# decreasing schedule that still leaves a real reward gap between "close to
-# optimal" and "wasteful" docks. Replaces an earlier inverse-in-absolute-dv
-# formulation (coeff * (dv_used + eps)**-1) that needed a hand-tuned eps
-# floor and wasn't calibrated to the scenario's actual optimal dv.
+# coeff=100 sets the peak (dv_used <= dv_ref): 100/1=100. ratio=1.5->66.7,
+# 2->50, 3->33.3, 5->20, 10->10, 15->6.7, 20->5 — a plain 1/ratio (not
+# 1/ratio**3, an earlier version) so the reward has constant elasticity: a
+# given PROPORTIONAL fuel improvement is worth the same relative reward
+# change at ratio=20 as at ratio=1.2, instead of the gradient vanishing once
+# dv_used is already many multiples of optimal. A live run sitting at
+# ratio~13-17x showed total dv flat for 26k+ episodes under the old cubic
+# (100/15**3=0.03, 100/16**3=0.024 — a real fuel improvement was worth
+# 0.006 points, invisible next to ordinary terminal-velocity noise); 1/ratio
+# is worth 6.7 vs 6.25 at the same two points, an actually learnable signal.
 ENV_FUEL_COEFF = 100.0
 
 # Physical per-burn actuator cap: max_dv = dv_ref * ENV_MAX_DV_COEFF, set per
@@ -169,24 +173,40 @@ REPLAY_BUFFER_SIZE = 300_000
 # throughput scales ~linearly with cores). Override with --n-envs.
 NUM_ENVS = max(1, min((os.cpu_count() or 4) - 1, 16))
 
-# Exploration noise (OU, TD3-style — NOT tied to any fuel budget).
-# Linearly decayed from *_START to *_END over the first NOISE_DECAY_FRAC of
-# training so the policy can rely on its own (learned) near-zero output
-# later in training instead of noise perpetually forcing nonzero burns.
+# Exploration noise (OU, TD3-style — NOT tied to any fuel budget). Kept as
+# OU rather than i.i.d. Gaussian on purpose: exploration is a temporally
+# correlated random walk, so it can linger near zero (or hold a sustained
+# push) for many consecutive agent steps — needed to ever stumble into the
+# true-optimal V-bar transfer's ~230+ consecutive steps of coasting, which
+# i.i.d. per-step noise essentially cannot produce by chance.
 #
-# Sized directly for the env's action space, which is ALWAYS the native
-# [-1, 1] box regardless of ENV_MAX_DV_COEFF — CWRendezvousEnv.step() scales
-# u in [-1,1] to the physical impulse (u * max_dv) internally, so the action
-# space the actor/noise actually operate in never changes shape with
-# max_dv_coeff. Previously these were `coeff * ENV_MAX_DV_COEFF` (a leftover
-# from an earlier design where the action space itself was physical,
-# [-ENV_MAX_DV, ENV_MAX_DV]) — with ENV_MAX_DV_COEFF=1.5 that made sigma_start
-# 0.75 on a box of half-width 1, big enough to keep |u| past the burn
-# deadzone (0.2, see ENV_BURN_DEADZONE_FRAC) on almost every step for most of
-# training (decay only completes at NOISE_DECAY_FRAC * TOTAL_TIMESTEPS),
-# masking whatever the actor had actually learned about coasting.
-ACTION_NOISE_SIGMA_START = 0.5
-ACTION_NOISE_SIGMA_END   = 0.02
+# ACTION_NOISE_STD_* is the quantity that actually matters — the noise's
+# stationary std in the env's native [-1,1] action units (always [-1,1]
+# regardless of ENV_MAX_DV_COEFF; CWRendezvousEnv.step() scales u to the
+# physical impulse internally). It is NOT the same as the `sigma` parameter
+# OrnsteinUhlenbeckActionNoise takes: for the discrete OU update SB3 uses
+# (x += theta*(mean-x)*dt + sigma*sqrt(dt)*noise), the stationary std is
+# sigma / sqrt(2*theta - theta**2*dt), ~1.83x the sigma parameter at
+# OU_THETA/OU_DT below — verified empirically (see scratch check). The
+# previous ACTION_NOISE_SIGMA_* constants were passed straight into `sigma`
+# without this correction, so the *actual* std was ~1.83x bigger than the
+# number suggested — with the old 0.5 that meant a stationary std of ~0.94
+# on a box of half-width 1 (i.e. saturating near +-1 almost constantly),
+# leaving the burn deadzone (0.2, see ENV_BURN_DEADZONE_FRAC) essentially
+# unreachable through nearly all of training (decay only completes at
+# NOISE_DECAY_FRAC * TOTAL_TIMESTEPS). STD_START=0.25 instead gives noise a
+# genuine chance to dip under the deadzone (~30% instantaneous probability
+# of the 2-D noise norm alone landing under 0.2) while still producing
+# meaningful directed excursions (real optimal actions rarely need more than
+# a fraction of max_dv anyway).
+OU_THETA = 0.15   # SB3 OrnsteinUhlenbeckActionNoise default; pinned explicitly
+OU_DT    = 0.01   # so the amplification-factor math below can't silently drift
+_OU_STD_PER_SIGMA = (2 * OU_THETA - OU_THETA ** 2 * OU_DT) ** -0.5
+
+ACTION_NOISE_STD_START = 0.25
+ACTION_NOISE_STD_END   = 0.02
+ACTION_NOISE_SIGMA_START = ACTION_NOISE_STD_START / _OU_STD_PER_SIGMA
+ACTION_NOISE_SIGMA_END   = ACTION_NOISE_STD_END / _OU_STD_PER_SIGMA
 NOISE_DECAY_FRAC = 0.7
 
 # TD3 target-policy-smoothing noise. SB3 defaults (0.2 / 0.5) already assume

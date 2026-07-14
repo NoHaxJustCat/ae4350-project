@@ -1,1 +1,0 @@
-{"scenario": "vbar", "run_tag": "pleaseman", "num_timesteps": 38082, "total_timesteps": 3000000, "episode_count": 2039, "recent_dock_rate": 0.6, "recent_avg_reward": 132.65066525, "curriculum_distance": 100.0, "elapsed_seconds": 420.3731831999976, "steps_per_sec": 90.59093567793555, "updated_at": "2026-07-13 18:41:26"}

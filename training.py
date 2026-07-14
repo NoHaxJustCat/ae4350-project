@@ -43,6 +43,8 @@ from libs.constants import (
     NOISE_DECAY_FRAC,
     NUM_ENVS,
     OMEGA,
+    OU_DT,
+    OU_THETA,
     REPLAY_BUFFER_SIZE,
     SMOOTHING_WINDOW,
     TAU,
@@ -724,19 +726,20 @@ def main():
     else:
         action_dim = env.action_space.shape[0]
         # OU (not i.i.d. Gaussian): exploration is a temporally-correlated
-        # random walk, so a sustained multi-step push in one direction is a
-        # plausible exploration outcome instead of vanishingly unlikely. The
-        # true-optimal V-bar maneuver needs ~230+ consecutive steps of
-        # "coasting away" before it pays off — i.i.d. per-step noise can't
-        # produce that by chance, since each step is independent of the
-        # last; a correlated walk can. NOTE: OU's stationary std is
-        # sigma/sqrt(2*theta), not sigma itself (~1.8x larger at the SB3
-        # defaults theta=0.15, dt=0.01) — so actual exploration amplitude is
-        # somewhat bigger than the same sigma gave under Gaussian noise, not
-        # a bug if early behavior looks more aggressive than before.
+        # random walk, so a sustained multi-step push OR a long lingering
+        # stretch near zero is a plausible exploration outcome instead of
+        # vanishingly unlikely. The true-optimal V-bar maneuver needs ~230+
+        # consecutive steps of "coasting" (near-zero action) before it pays
+        # off — i.i.d. per-step noise can't produce that by chance, since
+        # each step is independent of the last; a correlated walk can.
+        # ACTION_NOISE_SIGMA_START/END are pre-corrected in constants.py for
+        # OU's sigma->stationary-std amplification (see the comment there) —
+        # theta/dt must match what that correction assumed.
         action_noise = OrnsteinUhlenbeckActionNoise(
             mean=np.zeros(action_dim),
             sigma=ACTION_NOISE_SIGMA_START * np.ones(action_dim),
+            theta=OU_THETA,
+            dt=OU_DT,
         )
         if args.arch == "smart":
             from libs.policies import build_smart_policy_kwargs
