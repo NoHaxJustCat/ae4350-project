@@ -9,7 +9,7 @@ from libs.constants import (
     ENV_DT_PHYS,
     ENV_BURN_DEADZONE,
     ENV_FUEL_COEFF,
-    ENV_MAX_DV,
+    ENV_MAX_DV_COEFF,
     ENV_POS_TOLERANCE,
     ENV_TIMEOUT,
     ENV_VEL_COEFF,
@@ -27,6 +27,8 @@ from libs.constants import (
     OBS_DIM,
 )
 from scipy.linalg import expm
+
+from libs.reference import dv_rbar_strategy_rv, dv_vbar_two_impulse_rr
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +112,7 @@ class CWRendezvousEnv(gym.Env):
         omega: float = OMEGA,
         dt: float = ENV_DT,
         dt_phys: float = ENV_DT_PHYS,
-        max_dv: float = ENV_MAX_DV,
+        max_dv_coeff: float = ENV_MAX_DV_COEFF,
         burn_deadzone: float = ENV_BURN_DEADZONE,
         boundary: float = ENV_BOUNDARY,
         timeout: float = ENV_TIMEOUT,
@@ -152,7 +154,8 @@ class CWRendezvousEnv(gym.Env):
                 f"dt ({dt}) must be a positive integer multiple of dt_phys "
                 f"({dt_phys}); got ratio {n_sub}."
             )
-        self.max_dv = max_dv
+
+        self.max_dv_coeff = max_dv_coeff
         self.burn_deadzone = burn_deadzone
         self.base_boundary = boundary
         self.excursion_limit = boundary
@@ -196,7 +199,7 @@ class CWRendezvousEnv(gym.Env):
             low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float64
         )
         self.action_space = spaces.Box(
-            low=-max_dv, high=max_dv, shape=(self.action_dim,), dtype=np.float64
+            low=-1.0, high=1.0, shape=(self.action_dim,), dtype=np.float64
         )
 
         self.state = None
@@ -252,6 +255,17 @@ class CWRendezvousEnv(gym.Env):
         self.elapsed_time = 0.0
         self.dv_used      = 0.0
 
+        half = self.phys_dim // 2
+
+        if self.scenario == "vbar":
+            self.dv_ref = 0.5 * dv_vbar_two_impulse_rr(np.linalg.norm(self.state[:half]), self.omega)
+        else:
+            self.dv_ref = dv_rbar_strategy_rv(np.linalg.norm(self.state[:half]), self.omega)
+            
+        self.max_dv = self.dv_ref * self.max_dv_coeff
+
+        self.burn_deadzone = 0.2 * self.max_dv
+
         observation = self._build_observation()
         info = {"curriculum_distance": self.curriculum_distance}
         return observation, info
@@ -274,7 +288,10 @@ class CWRendezvousEnv(gym.Env):
         return closest, float(np.linalg.norm(closest))
 
     def step(self, action: np.ndarray):
-        action = np.clip(action, -self.max_dv, self.max_dv)
+        # Action is a NORMALIZED fraction u in [-1, 1] per axis; scale it to the
+        # physical impulse for this episode's distance (max_dv_ep set in reset).
+        u = np.clip(action, -1.0, 1.0)
+        action = u * self.max_dv_ep
 
         # Burn deadzone / minimum-impulse-bit: a commanded burn below the
         # threshold is treated as EXACTLY zero — no Δv charged and no velocity
@@ -338,14 +355,19 @@ class CWRendezvousEnv(gym.Env):
         reward_pos = ENV_SHAPING_COEFF * delta / self.curriculum_distance
 
         if docked:
-            # eps=0.01 keeps the inverse curve steep right where the optimal
-            # dv lives (~0.01 m/s) instead of flattening it — see the
-            # ENV_FUEL_COEFF comment in constants.py. Floors the term so an
-            # ultra-low-fuel dock can't spike to +inf / divide by zero.
-            eps = 0.01
-            reward_fuel = self.fuel_coeff * (self.dv_used + eps) ** (-1)
+            # Reward is a cubic decay in dv_used/dv_ref (the analytic two-
+            # impulse reference computed in reset()), not an absolute dv
+            # scale — so it's calibrated against "how close to optimal was
+            # this transfer" rather than a fixed m/s budget. Ratio is floored
+            # at 1 so matching-or-beating the reference all saturates at the
+            # same peak (fuel_coeff) instead of blowing up as dv_used -> 0.
+            # With ENV_FUEL_COEFF=100: ratio<=1 -> 100, ratio=2 -> 12.5,
+            # ratio=3 -> 3.7, ratio=4 -> 1.6, decaying further beyond that.
+            ratio = max(self.dv_used / self.dv_ref, 1.0)
+            reward_fuel = self.fuel_coeff * ratio ** (-3)
         else:
             reward_fuel = 0.0
+
 
         reward_terminal = (self.bonus - self.vel_coeff * vel_error) if docked else 0.0
         reward = reward_pos + reward_fuel + reward_terminal

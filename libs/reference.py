@@ -9,15 +9,17 @@ All formulas take Δx / Δz as positive magnitudes.
 
 import numpy as np
 
+# These output the TOTAL Delta V
 
-def dv_vbar_two_impulse(dx: float, omega: float) -> float:
+
+def dv_vbar_two_impulse_vv(dx: float, omega: float) -> float:
     """Two V-bar impulses, Δx displacement along V-bar (goal 1)."""
     return omega / (3.0 * np.pi) * abs(dx)
 
 
-def dv_rbar_two_impulse(dz: float, omega: float) -> float:
+def dv_vbar_two_impulse_rr(dx: float, omega: float) -> float:
     """Two R-bar impulses, Δx displacement along V-bar (goal 1 comparison)."""
-    return omega / 2.0 * abs(dz)
+    return omega / 2.0 * abs(dx)
 
 
 def dv_rbar_strategy_rv(dz: float, omega: float) -> float:

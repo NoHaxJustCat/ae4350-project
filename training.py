@@ -36,7 +36,7 @@ from libs.constants import (
     ENV_CURRICULUM_INCREMENT,
     ENV_CURRICULUM_MAX_DISTANCE,
     ENV_CURRICULUM_START_DISTANCE,
-    ENV_MAX_DV,
+    ENV_MAX_DV_COEFF,
     GAMMA,
     LOG_EVERY,
     MIN_BUFFER,
@@ -445,7 +445,7 @@ class TrainingCallback(BaseCallback):
                         acc["states"],
                         acc["actions"],
                         str(traj_path),
-                        min_dv_display=ENV_MAX_DV * 0.01,
+                        min_dv_display=ENV_MAX_DV_COEFF * 0.01,
                     )
                     shutil.copy(traj_path, self.tmp_dir / "latest_trajectory.png")
                     np.savez(

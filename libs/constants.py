@@ -39,33 +39,32 @@ ENV_DT_AGENT = 100.0
 ENV_DT = ENV_DT_AGENT
 ENV_BOUNDARY = 200.0
 ENV_TIMEOUT = 2 * ORBIT_PERIOD
-ENV_POS_TOLERANCE = 1.0
+ENV_POS_TOLERANCE = 5.0
 ENV_VEL_COEFF = 10.0
 ENV_SHAPING_COEFF = 10.0
 ENV_BONUS = 50.0
-# Fuel bonus: paid only on a successful dock, inverse in cumulative dv_used
-# (reward_fuel = coeff * (dv_used + eps)**-1 — see libs/env.py::step).
-# Strictly additive on top of the dock bonus, so it can never make failing
-# to dock look better than a wasteful dock (it's zero unless docked=True).
+# Fuel bonus: paid only on a successful dock, cubic decay in
+# dv_used/dv_ref (reward_fuel = coeff * max(dv_used/dv_ref, 1)**-3 — see
+# libs/env.py::step). dv_ref is the analytic two-impulse reference for this
+# episode's scenario/distance (libs/reference.py), so the bonus is graded
+# against "how close to the optimal transfer" rather than an absolute m/s
+# scale. Strictly additive on top of the dock bonus, so it can never make
+# failing to dock look better than a wasteful dock (zero unless docked=True).
 #
-# Retuned for the fuel push: coeff 150 -> 25 and eps 1.0 -> 0.01. The old
-# eps=1.0 flattened the whole low-dv end — 150/(0.01+1)=148.5 vs
-# 150/(0.05+1)=142.9, only ~6 reward points between a near-optimal 0.01 m/s
-# dock and a 5x-worse 0.05 m/s one, so the agent had almost no incentive to
-# chase the last order of magnitude of fuel. With eps=0.01 the curve stays
-# steep exactly where the optimum lives: 25/(0.0115+0.01)=1163 at the
-# optimal V-bar dv vs 25/(0.5+0.01)=49 at a wasteful 0.5 m/s dock — a ~24x
-# reward gap that makes low fuel strongly worth it. coeff dropped to 25 so
-# the peak reward stays in a sane range for the critic to represent given
-# the smaller eps blows the magnitude up. Earlier per-step linear / log1p
-# costs were tried and dropped (vanishing low-end gradient / flat cost).
-ENV_FUEL_COEFF = 25.0
+# coeff=100 sets the peak (dv_used <= dv_ref, i.e. matching or beating the
+# reference): 100/1**3=100. Using 2x the reference dv scores ~12.5, 3x
+# scores ~3.7, 4x ~1.6, decaying further beyond that — a steep, strictly
+# decreasing schedule that still leaves a real reward gap between "close to
+# optimal" and "wasteful" docks. Replaces an earlier inverse-in-absolute-dv
+# formulation (coeff * (dv_used + eps)**-1) that needed a hand-tuned eps
+# floor and wasn't calibrated to the scenario's actual optimal dv.
+ENV_FUEL_COEFF = 100.0
 
 # Physical per-burn actuator cap (m/s). Independent of any fuel budget —
 # sized to comfortably cover a single optimal impulse for the largest
 # curriculum distance (worst case ~0.03 m/s for the R-bar two-V-bar-impulse
 # strategy at 100 m), with headroom for the policy to correct errors.
-ENV_MAX_DV = 0.02
+ENV_MAX_DV_COEFF = 1.5
 
 # Burn deadzone / minimum-impulse-bit (m/s). Any commanded burn whose
 # magnitude ‖a‖ is below this is treated as EXACTLY zero — no Δv charged, no
@@ -104,9 +103,9 @@ DV_USED_NORM_SCALE = 0.3
 
 # --- Curriculum learning defaults ---
 ENV_CURRICULUM_ENABLED = True
-ENV_CURRICULUM_START_DISTANCE = 10.0   # starting distance [m]
-ENV_CURRICULUM_MAX_DISTANCE = 100.0    # final distance [m] (matches ENV_INITIAL_STATE_VBAR norm)
-ENV_CURRICULUM_INCREMENT = 5.0         # distance added per successful dock [m]
+ENV_CURRICULUM_START_DISTANCE = 30.0   # starting distance [m]
+ENV_CURRICULUM_MAX_DISTANCE = 1000.0    # final distance [m] (matches ENV_INITIAL_STATE_VBAR norm)
+ENV_CURRICULUM_INCREMENT = 10.0         # distance added per successful dock [m]
 
 # --- Training defaults ---
 # The discount has to make the SLOW fuel-optimal transfer's terminal reward
@@ -145,15 +144,15 @@ NUM_ENVS = max(1, min((os.cpu_count() or 4) - 1, 16))
 # Linearly decayed from *_START to *_END over the first NOISE_DECAY_FRAC of
 # training so the policy can rely on its own (learned) near-zero output
 # later in training instead of noise perpetually forcing nonzero burns.
-ACTION_NOISE_SIGMA_START = 0.5 * ENV_MAX_DV
-ACTION_NOISE_SIGMA_END   = 0.02 * ENV_MAX_DV
+ACTION_NOISE_SIGMA_START = 0.5 * ENV_MAX_DV_COEFF
+ACTION_NOISE_SIGMA_END   = 0.02 * ENV_MAX_DV_COEFF
 NOISE_DECAY_FRAC = 0.7
 
 # TD3 target-policy-smoothing noise. SB3 defaults (0.2 / 0.5) assume an
 # action range of roughly [-1, 1]; ours is [-ENV_MAX_DV, ENV_MAX_DV], so the
 # defaults must be scaled down or they dwarf the action space entirely.
-TD3_TARGET_POLICY_NOISE = 0.2 * ENV_MAX_DV
-TD3_TARGET_NOISE_CLIP   = 0.5 * ENV_MAX_DV
+TD3_TARGET_POLICY_NOISE = 0.2 * ENV_MAX_DV_COEFF
+TD3_TARGET_NOISE_CLIP   = 0.5 * ENV_MAX_DV_COEFF
 
 TOTAL_TIMESTEPS = 10_000_000
 

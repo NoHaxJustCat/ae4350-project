@@ -27,7 +27,7 @@ import torch
 import gymnasium as gym
 from gymnasium import spaces
 
-from libs.constants import MODE_2D, ENV_BOUNDARY, ENV_MAX_DV, DV_USED_NORM_SCALE, OMEGA
+from libs.constants import MODE_2D, ENV_BOUNDARY, ENV_MAX_DV_COEFF, DV_USED_NORM_SCALE, OMEGA
 
 # --- Scale arrays (numpy; cast to tensor on demand) -------------------------
 _POS_SCALE = ENV_BOUNDARY           # ~200 m
@@ -42,7 +42,7 @@ if MODE_2D:
          _DV_SCALE],
         dtype=np.float64,
     )
-    ACTION_SCALE = np.array([ENV_MAX_DV, ENV_MAX_DV], dtype=np.float64)
+    ACTION_SCALE = np.array([ENV_MAX_DV_COEFF, ENV_MAX_DV_COEFF], dtype=np.float64)
 else:
     # state = [x, y, z, ẋ, ẏ, ż, dv_used]
     STATE_SCALE = np.array(
@@ -52,7 +52,7 @@ else:
         dtype=np.float64,
     )
     ACTION_SCALE = np.array(
-        [ENV_MAX_DV, ENV_MAX_DV, ENV_MAX_DV], dtype=np.float64
+        [ENV_MAX_DV_COEFF, ENV_MAX_DV_COEFF, ENV_MAX_DV_COEFF], dtype=np.float64
     )
 
 

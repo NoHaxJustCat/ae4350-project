@@ -12,8 +12,8 @@ from libs.env import CWRendezvousEnv
 from libs.normalization import NormalizedObsEnv
 from libs.symmetry import CanonicalizeDirectionEnv
 from libs.reference import (
-    dv_vbar_two_impulse,
-    dv_rbar_two_impulse,
+    dv_vbar_two_impulse_vv,
+    dv_vbar_two_impulse_rr,
     dv_rbar_strategy_rv,
     dv_rbar_strategy_vv,
 )
@@ -83,8 +83,8 @@ def print_summary(label: str, result: dict, scenario: str):
 
     if scenario == "vbar":
         # Goal 1: compare against BOTH reference two-impulse strategies.
-        ref_vbar = dv_vbar_two_impulse(dx, OMEGA)
-        ref_rbar = dv_rbar_two_impulse(dx, OMEGA)
+        ref_vbar = dv_vbar_two_impulse_vv(dx, OMEGA)
+        ref_rbar = dv_vbar_two_impulse_rr(dx, OMEGA)
         print(f"Reference two V-bar impulses (dx={dx:.1f} m): {ref_vbar:.5f} m/s "
               f"({r['total_dv'] / ref_vbar:.2f}x)" if ref_vbar > 0 else "")
         print(f"Reference two R-bar impulses (dx={dx:.1f} m): {ref_rbar:.5f} m/s "

@@ -1,1 +1,0 @@
-{"scenario": "vbar", "run_tag": "smart512_g9995", "num_timesteps": 298296, "total_timesteps": 10000000, "episode_count": 618, "recent_dock_rate": 0.1, "recent_avg_reward": 2.3339173, "curriculum_distance": 80.0, "elapsed_seconds": 5542.843357099999, "steps_per_sec": 53.816422507755604, "updated_at": "2026-07-13 00:06:58"}
