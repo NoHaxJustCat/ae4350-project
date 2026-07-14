@@ -118,7 +118,14 @@ ENV_MAX_DV_COEFF = 1.5
 # CurriculumCallback's dock-rate-gated advance/stall-regress shape.
 ENV_DV_BUDGET_COEFF_START = 50.0
 ENV_DV_BUDGET_COEFF_FLOOR = 3.0
-ENV_DV_BUDGET_SHRINK = 0.85  # multiplicative ratchet per dock-rate window
+# Multiplicative ratchet per dock-rate window. 0.85**(1/3) rather than a
+# fresh round number on purpose: a live run's dock rate was oscillating
+# hard right at each 0.85 step (e.g. 16.03x -> 13.62x, a ~15% cut in one
+# shot), swinging 100%->0%->100% and never settling — the cube root turns
+# every old single step into 3 finer ones (2 new intermediate levels
+# between each old pair), same total 50x->3x range, ~3x more (smaller)
+# ratchets to get there.
+ENV_DV_BUDGET_SHRINK = 0.85 ** (1 / 3)  # ~0.9473
 
 # Burn deadzone / minimum-impulse-bit, as a FRACTION of the episode's max_dv
 # (CWRendezvousEnv.reset() sets burn_deadzone = ENV_BURN_DEADZONE_FRAC *
