@@ -16,6 +16,21 @@ ORBIT_RADIUS = (6378 + 600) * 10 ** 3  # m
 OMEGA = np.sqrt(EARTH_MU / ORBIT_RADIUS ** 3)
 ORBIT_PERIOD = 2 * np.pi / OMEGA
 
+# --- Curriculum learning defaults ---
+# Defined before ENV_BOUNDARY below so the excursion-limit safety ceiling can
+# be derived from the curriculum range instead of hand-tuned separately —
+# raising ENV_CURRICULUM_MAX_DISTANCE used to silently desync from a fixed
+# ENV_BOUNDARY and break training past ~200 m (see libs/env.py reset()).
+ENV_CURRICULUM_ENABLED = True
+ENV_CURRICULUM_START_DISTANCE = 30.0   # starting distance [m]
+ENV_CURRICULUM_MAX_DISTANCE = 1000.0   # final distance [m] (matches ENV_INITIAL_STATE_VBAR norm)
+ENV_CURRICULUM_INCREMENT = 10.0        # distance added per successful dock [m]
+# Excursion-limit headroom: CWRendezvousEnv.reset() sets
+# excursion_limit = curriculum_distance * ENV_CURRICULUM_BOUNDARY_MULT, so an
+# episode can drift up to this many multiples of its own starting distance
+# before being flagged out-of-bounds (see libs/env.py's curriculum_boundary_mult).
+ENV_CURRICULUM_BOUNDARY_MULT = 2.0
+
 # --- Environment defaults ---
 # Two decoupled timesteps (see libs/env.py):
 #   ENV_DT_PHYS  : the fine PHYSICS/collision substep. The CW state-transition
@@ -37,7 +52,16 @@ ENV_DT_AGENT = 100.0
 # Back-compat alias: ENV_DT means the AGENT step everywhere downstream
 # (MAX_STEPS, evaluate.py, the env's default dt).
 ENV_DT = ENV_DT_AGENT
-ENV_BOUNDARY = 200.0
+# Excursion / out-of-bounds safety ceiling. Derived from the curriculum range
+# (not a hand-picked absolute) so it always covers the largest possible
+# excursion_limit CWRendezvousEnv.reset() can compute
+# (curriculum_distance * ENV_CURRICULUM_BOUNDARY_MULT, maxed out at
+# ENV_CURRICULUM_MAX_DISTANCE). Previously a fixed 200 m tuned for the old
+# 100 m curriculum max — once the curriculum max was raised to 1000 m this
+# silently clamped excursion_limit at 200 regardless of curriculum_distance,
+# so every episode past ~200 m curriculum distance spawned already outside
+# its own boundary and terminated out-of-bounds on the very first step.
+ENV_BOUNDARY = ENV_CURRICULUM_MAX_DISTANCE * ENV_CURRICULUM_BOUNDARY_MULT
 ENV_TIMEOUT = 2 * ORBIT_PERIOD
 ENV_POS_TOLERANCE = 5.0
 ENV_VEL_COEFF = 10.0
@@ -60,13 +84,20 @@ ENV_BONUS = 50.0
 # floor and wasn't calibrated to the scenario's actual optimal dv.
 ENV_FUEL_COEFF = 100.0
 
-# Physical per-burn actuator cap (m/s). Independent of any fuel budget —
-# sized to comfortably cover a single optimal impulse for the largest
-# curriculum distance (worst case ~0.03 m/s for the R-bar two-V-bar-impulse
-# strategy at 100 m), with headroom for the policy to correct errors.
+# Physical per-burn actuator cap: max_dv = dv_ref * ENV_MAX_DV_COEFF, set per
+# episode in CWRendezvousEnv.reset() from that scenario/distance's analytic
+# reference Δv (libs/reference.py). Relative to dv_ref rather than a fixed
+# m/s value on purpose — dv_ref scales linearly with distance, so this one
+# coefficient gives the same proportional headroom over the optimal transfer
+# at every curriculum distance (30 m through ENV_CURRICULUM_MAX_DISTANCE)
+# without needing retuning when the curriculum range changes.
 ENV_MAX_DV_COEFF = 1.5
 
-# Burn deadzone / minimum-impulse-bit (m/s). Any commanded burn whose
+# Burn deadzone / minimum-impulse-bit, as a FRACTION of the episode's max_dv
+# (CWRendezvousEnv.reset() sets burn_deadzone = ENV_BURN_DEADZONE_FRAC *
+# max_dv — relative to dv_ref for the same reason as ENV_MAX_DV_COEFF above,
+# so it stays proportionally sized across the whole curriculum range instead
+# of needing a hand-picked absolute m/s value). Any commanded burn whose
 # magnitude ‖a‖ is below this is treated as EXACTLY zero — no Δv charged, no
 # velocity change. Two reasons:
 #   1. Physical: real thrusters have a minimum impulse bit and an off state;
@@ -78,10 +109,9 @@ ENV_MAX_DV_COEFF = 1.5
 #      refuses to coast and docks fast (~23x optimal). The deadzone makes
 #      coasting free and representable (the actor just aims below it), which
 #      is what lets the fuel-optimal slow two-impulse transfer actually win.
-# Sized BELOW the smallest real impulse the optimal maneuver needs (~0.006
-# m/s per burn at 100 m) so genuine burns still count, but above the actor's
-# near-zero coast-leakage floor. Set to 0 to disable.
-ENV_BURN_DEADZONE = 0.002
+# 0.2 of max_dv leaves genuine correction burns well clear of the deadzone
+# while covering the actor's near-zero coast-leakage floor. Set to 0 to disable.
+ENV_BURN_DEADZONE_FRAC = 0.2
 
 # Base (max-curriculum) initial condition. Only the sign/quadrant is
 # randomized per episode (see CWRendezvousEnv._sample_initial_position) —
@@ -96,16 +126,15 @@ ENV_INITIAL_STATE_VBAR = np.array([100.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.flo
 SCENARIO = os.environ.get("AE4350_SCENARIO", "vbar")
 RBAR_X_TO_Z_RATIO = 2.0  # matches the Δx = 2·Δz relation in goal 2 strategy 1
 
-# Normalization scale for the dv_used observation element (see
-# libs/normalization.py) — a fixed reference scale covering the typical
-# range of cumulative Δv spent during an episode across both scenarios.
-DV_USED_NORM_SCALE = 0.3
-
-# --- Curriculum learning defaults ---
-ENV_CURRICULUM_ENABLED = True
-ENV_CURRICULUM_START_DISTANCE = 30.0   # starting distance [m]
-ENV_CURRICULUM_MAX_DISTANCE = 1000.0    # final distance [m] (matches ENV_INITIAL_STATE_VBAR norm)
-ENV_CURRICULUM_INCREMENT = 10.0         # distance added per successful dock [m]
+# Normalization multiplier for the dv_used observation element (see
+# libs/normalization.py): the norm scale is DV_USED_NORM_MULT * max_dv for
+# that episode, not a fixed absolute value — max_dv (= dv_ref * max_dv_coeff)
+# already varies ~12x between "vbar" and "rbar" scenarios and linearly with
+# curriculum distance, so a single fixed scale can't cover both without
+# saturating dv_used to 1.0 for most of the episode in whichever case it
+# wasn't tuned for. 5x max_dv gives headroom for a multi-burn trajectory to
+# spend a few times the single-burn cap before the feature saturates.
+DV_USED_NORM_MULT = 5.0
 
 # --- Training defaults ---
 # The discount has to make the SLOW fuel-optimal transfer's terminal reward
@@ -140,19 +169,30 @@ REPLAY_BUFFER_SIZE = 300_000
 # throughput scales ~linearly with cores). Override with --n-envs.
 NUM_ENVS = max(1, min((os.cpu_count() or 4) - 1, 16))
 
-# Exploration noise (Gaussian, TD3-style — NOT tied to any fuel budget).
+# Exploration noise (OU, TD3-style — NOT tied to any fuel budget).
 # Linearly decayed from *_START to *_END over the first NOISE_DECAY_FRAC of
 # training so the policy can rely on its own (learned) near-zero output
 # later in training instead of noise perpetually forcing nonzero burns.
-ACTION_NOISE_SIGMA_START = 0.5 * ENV_MAX_DV_COEFF
-ACTION_NOISE_SIGMA_END   = 0.02 * ENV_MAX_DV_COEFF
+#
+# Sized directly for the env's action space, which is ALWAYS the native
+# [-1, 1] box regardless of ENV_MAX_DV_COEFF — CWRendezvousEnv.step() scales
+# u in [-1,1] to the physical impulse (u * max_dv) internally, so the action
+# space the actor/noise actually operate in never changes shape with
+# max_dv_coeff. Previously these were `coeff * ENV_MAX_DV_COEFF` (a leftover
+# from an earlier design where the action space itself was physical,
+# [-ENV_MAX_DV, ENV_MAX_DV]) — with ENV_MAX_DV_COEFF=1.5 that made sigma_start
+# 0.75 on a box of half-width 1, big enough to keep |u| past the burn
+# deadzone (0.2, see ENV_BURN_DEADZONE_FRAC) on almost every step for most of
+# training (decay only completes at NOISE_DECAY_FRAC * TOTAL_TIMESTEPS),
+# masking whatever the actor had actually learned about coasting.
+ACTION_NOISE_SIGMA_START = 0.5
+ACTION_NOISE_SIGMA_END   = 0.02
 NOISE_DECAY_FRAC = 0.7
 
-# TD3 target-policy-smoothing noise. SB3 defaults (0.2 / 0.5) assume an
-# action range of roughly [-1, 1]; ours is [-ENV_MAX_DV, ENV_MAX_DV], so the
-# defaults must be scaled down or they dwarf the action space entirely.
-TD3_TARGET_POLICY_NOISE = 0.2 * ENV_MAX_DV_COEFF
-TD3_TARGET_NOISE_CLIP   = 0.5 * ENV_MAX_DV_COEFF
+# TD3 target-policy-smoothing noise. SB3 defaults (0.2 / 0.5) already assume
+# the actual action range here, [-1, 1] — no rescaling needed (see above).
+TD3_TARGET_POLICY_NOISE = 0.2
+TD3_TARGET_NOISE_CLIP   = 0.5
 
 TOTAL_TIMESTEPS = 10_000_000
 

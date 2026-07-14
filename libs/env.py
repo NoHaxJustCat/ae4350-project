@@ -7,7 +7,7 @@ from libs.constants import (
     ENV_BOUNDARY,
     ENV_DT,
     ENV_DT_PHYS,
-    ENV_BURN_DEADZONE,
+    ENV_BURN_DEADZONE_FRAC,
     ENV_FUEL_COEFF,
     ENV_MAX_DV_COEFF,
     ENV_POS_TOLERANCE,
@@ -19,6 +19,7 @@ from libs.constants import (
     ENV_CURRICULUM_START_DISTANCE,
     ENV_CURRICULUM_MAX_DISTANCE,
     ENV_CURRICULUM_INCREMENT,
+    ENV_CURRICULUM_BOUNDARY_MULT,
     SCENARIO,
     RBAR_X_TO_Z_RATIO,
     MODE_2D,
@@ -113,7 +114,7 @@ class CWRendezvousEnv(gym.Env):
         dt: float = ENV_DT,
         dt_phys: float = ENV_DT_PHYS,
         max_dv_coeff: float = ENV_MAX_DV_COEFF,
-        burn_deadzone: float = ENV_BURN_DEADZONE,
+        burn_deadzone_frac: float = ENV_BURN_DEADZONE_FRAC,
         boundary: float = ENV_BOUNDARY,
         timeout: float = ENV_TIMEOUT,
         pos_tolerance: float = ENV_POS_TOLERANCE,
@@ -125,7 +126,7 @@ class CWRendezvousEnv(gym.Env):
         curriculum_start_distance: float = ENV_CURRICULUM_START_DISTANCE,
         curriculum_max_distance: float = ENV_CURRICULUM_MAX_DISTANCE,
         curriculum_increment: float = ENV_CURRICULUM_INCREMENT,
-        curriculum_boundary_mult: float = 2.0,
+        curriculum_boundary_mult: float = ENV_CURRICULUM_BOUNDARY_MULT,
         rbar_x_to_z_ratio: float = RBAR_X_TO_Z_RATIO,
     ):
         super().__init__()
@@ -156,7 +157,8 @@ class CWRendezvousEnv(gym.Env):
             )
 
         self.max_dv_coeff = max_dv_coeff
-        self.burn_deadzone = burn_deadzone
+        self.burn_deadzone_frac = burn_deadzone_frac
+        self.burn_deadzone = 0.0  # set for real in reset(), as burn_deadzone_frac * max_dv
         self.base_boundary = boundary
         self.excursion_limit = boundary
         self.curriculum_boundary_mult = curriculum_boundary_mult
@@ -264,7 +266,7 @@ class CWRendezvousEnv(gym.Env):
             
         self.max_dv = self.dv_ref * self.max_dv_coeff
 
-        self.burn_deadzone = 0.2 * self.max_dv
+        self.burn_deadzone = self.burn_deadzone_frac * self.max_dv
 
         observation = self._build_observation()
         info = {"curriculum_distance": self.curriculum_distance}
@@ -291,13 +293,13 @@ class CWRendezvousEnv(gym.Env):
         # Action is a NORMALIZED fraction u in [-1, 1] per axis; scale it to the
         # physical impulse for this episode's distance (max_dv_ep set in reset).
         u = np.clip(action, -1.0, 1.0)
-        action = u * self.max_dv_ep
+        action = u * self.max_dv
 
         # Burn deadzone / minimum-impulse-bit: a commanded burn below the
         # threshold is treated as EXACTLY zero — no Δv charged and no velocity
         # applied — so the agent can coast for free instead of leaking a
         # little fuel every step it can't output an exact zero (see
-        # ENV_BURN_DEADZONE in constants.py). Applied to the norm so it's the
+        # ENV_BURN_DEADZONE_FRAC in constants.py). Applied to the norm so it's the
         # total impulse magnitude that must clear the threshold, and used
         # everywhere below (dv_used, the state update, and the info's
         # delta_v/applied_action) so what's charged == what's applied.
