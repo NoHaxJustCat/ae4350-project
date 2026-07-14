@@ -1,1 +1,0 @@
-{"scenario": "vbar", "run_tag": "ikitworks", "num_timesteps": 371406, "total_timesteps": 10000000, "episode_count": 28855, "recent_dock_rate": 1.0, "recent_avg_reward": 64.65349490000001, "curriculum_distance": 1000.0, "elapsed_seconds": 4536.146554899999, "steps_per_sec": 81.87698424311333, "updated_at": "2026-07-14 16:39:36"}

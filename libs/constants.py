@@ -86,7 +86,7 @@ ENV_BONUS = 50.0
 # (100/15**3=0.03, 100/16**3=0.024 — a real fuel improvement was worth
 # 0.006 points, invisible next to ordinary terminal-velocity noise); 1/ratio
 # is worth 6.7 vs 6.25 at the same two points, an actually learnable signal.
-ENV_FUEL_COEFF = 100.0
+ENV_FUEL_COEFF = 500.0
 
 # Physical per-burn actuator cap: max_dv = dv_ref * ENV_MAX_DV_COEFF, set per
 # episode in CWRendezvousEnv.reset() from that scenario/distance's analytic
@@ -201,13 +201,15 @@ NUM_ENVS = max(1, min((os.cpu_count() or 4) - 1, 16))
 # a fraction of max_dv anyway).
 OU_THETA = 0.15   # SB3 OrnsteinUhlenbeckActionNoise default; pinned explicitly
 OU_DT    = 0.01   # so the amplification-factor math below can't silently drift
-_OU_STD_PER_SIGMA = (2 * OU_THETA - OU_THETA ** 2 * OU_DT) ** -0.5
+OU_STD_PER_SIGMA = (2 * OU_THETA - OU_THETA ** 2 * OU_DT) ** -0.5
 
 ACTION_NOISE_STD_START = 0.25
 ACTION_NOISE_STD_END   = 0.02
-ACTION_NOISE_SIGMA_START = ACTION_NOISE_STD_START / _OU_STD_PER_SIGMA
-ACTION_NOISE_SIGMA_END   = ACTION_NOISE_STD_END / _OU_STD_PER_SIGMA
-NOISE_DECAY_FRAC = 0.7
+ACTION_NOISE_SIGMA_START = ACTION_NOISE_STD_START / OU_STD_PER_SIGMA
+ACTION_NOISE_SIGMA_END   = ACTION_NOISE_STD_END / OU_STD_PER_SIGMA
+NOISE_DECAY_FRAC = 0.23  # ~3x faster than the old 0.7 — noise was still near
+# sigma_start at 20% of training, starving the agent of low-noise fuel-
+# efficiency practice for the back 80% of the run.
 
 # TD3 target-policy-smoothing noise. SB3 defaults (0.2 / 0.5) already assume
 # the actual action range here, [-1, 1] — no rescaling needed (see above).

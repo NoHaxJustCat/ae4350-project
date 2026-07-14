@@ -18,7 +18,7 @@
 param(
     [string]$RunTag = "smart_cuda_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
     [string]$Scenario = "vbar",
-    [int]$TotalTimesteps = 10000000
+    [int]$TotalTimesteps = 100000
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,6 +43,6 @@ Write-Host "Launching training: scenario=$Scenario run-tag=$RunTag total-timeste
     --lr 1e-4 `
     --torch-threads 5 `
     --total-timesteps $TotalTimesteps `
-    --checkpoint-freq 100000 `
+    --checkpoint-freq 200000 `
     --keep-last-checkpoints 2 `
     --run-tag $RunTag

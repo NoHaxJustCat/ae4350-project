@@ -32,6 +32,7 @@ from libs.constants import (
     BATCH_SIZE,
     CRITIC_LR,
     DOCK_RATE_WINDOW,
+    ENV_BURN_DEADZONE_FRAC,
     ENV_CURRICULUM_ENABLED,
     ENV_CURRICULUM_INCREMENT,
     ENV_CURRICULUM_MAX_DISTANCE,
@@ -44,6 +45,7 @@ from libs.constants import (
     NUM_ENVS,
     OMEGA,
     OU_DT,
+    OU_STD_PER_SIGMA,
     OU_THETA,
     REPLAY_BUFFER_SIZE,
     SMOOTHING_WINDOW,
@@ -113,12 +115,23 @@ def build_diagnostics_figure(cb: "TrainingCallback", scenario: str):
     fig.suptitle(f"TD3 (SB3) Training Diagnostics — scenario={scenario}", fontsize=14)
 
     plot_with_smooth(axes[0, 0], cb.episode_rewards,       "reward",  "tab:blue",   "Total reward",          "reward")
-    plot_with_smooth(axes[0, 1], cb.episode_delta_vs,      "delta-v", "tab:orange", "Total Δv used",         "m/s")
+    plot_with_smooth(axes[0, 1], cb.episode_dv_ratios,     "dv_used/dv_ref", "tab:orange", "Δv used vs. analytic reference", "dv_used / dv_ref")
+    axes[0, 1].axhline(1.0, color="gray", linestyle="--", linewidth=1, label="reference (ratio=1)")
+    axes[0, 1].legend()
     plot_with_smooth(axes[0, 2], cb.episode_steps,         "steps",   "tab:green",  "Episode length",        "steps")
     plot_with_smooth(axes[1, 0], cb.episode_r_pos_totals,  "r_pos",   "tab:red",    "Position reward (sum)", "reward")
     plot_with_smooth(axes[1, 1], cb.episode_r_fuel_totals, "r_fuel",  "tab:purple", "Fuel reward (sum)",     "reward")
     plot_with_smooth(axes[1, 2], cb.episode_r_term_totals, "r_term",  "tab:brown",  "Terminal reward (sum)", "reward")
-    plot_with_smooth(axes[2, 0], cb.episode_r_mile_totals, "r_mile",  "tab:pink",   "Milestone reward (sum)","reward")
+
+    axes[2, 0].plot(cb.episode_noise_std, color="tab:pink", linewidth=2, label="noise std")
+    axes[2, 0].axhline(ENV_BURN_DEADZONE_FRAC, color="gray", linestyle="--", linewidth=1,
+                        label=f"burn deadzone ({ENV_BURN_DEADZONE_FRAC})")
+    axes[2, 0].set_title("Exploration noise (stationary std, native action units)")
+    axes[2, 0].set_ylabel("std")
+    axes[2, 0].set_xlabel("Episode")
+    axes[2, 0].set_ylim(bottom=0)
+    axes[2, 0].grid(True, alpha=0.3)
+    axes[2, 0].legend()
 
     dock_rate = [
         np.mean(cb.episode_docked[max(0, i - DOCK_RATE_WINDOW):i + 1]) * 100
@@ -353,7 +366,11 @@ class TrainingCallback(BaseCallback):
     Trajectories/actions are read from info["state"] / info["applied_action"]
     (raw physical values written by CWRendezvousEnv.step), NOT from
     new_obs — new_obs is normalized-to-[0,1] policy input and would corrupt
-    the trajectory plots.
+    the trajectory plots. Each episode's "states" list is seeded with the
+    true pre-action reset() position (from vec_env.reset_infos) before any
+    step()-produced states are appended, so trajectory plots/npz dumps start
+    at the real starting point and the first Δv arrow is anchored at the
+    position it was actually applied from, not the position one step later.
     """
 
     def __init__(self, tmp_dir: Path, n_envs: int, log_every: int = LOG_EVERY,
@@ -367,11 +384,12 @@ class TrainingCallback(BaseCallback):
         self.episode_rewards        = []
         self.episode_steps          = []
         self.episode_delta_vs       = []
+        self.episode_dv_ratios      = []
         self.episode_docked         = []
         self.episode_r_pos_totals   = []
         self.episode_r_fuel_totals  = []
         self.episode_r_term_totals  = []
-        self.episode_r_mile_totals  = []
+        self.episode_noise_std      = []
         self.episode_curriculum_distances = []
 
         self._acc = [self._new_accumulator() for _ in range(n_envs)]
@@ -379,8 +397,8 @@ class TrainingCallback(BaseCallback):
 
         print(
             f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | "
-            f"{'r_fuel':>8} | {'r_term':>8} | {'r_mile':>8} | "
-            f"{'dv':>7} | {'cur_d':>6} | {'docked':>6} | {'cur_prog':>8} | {'ms/ep':>8}"
+            f"{'r_fuel':>8} | {'r_term':>8} | {'noise':>8} | "
+            f"{'dv/ref':>7} | {'cur_d':>6} | {'docked':>6} | {'cur_prog':>8} | {'ms/ep':>8}"
         )
         print("-" * 123)
 
@@ -388,9 +406,38 @@ class TrainingCallback(BaseCallback):
     def _new_accumulator():
         return {
             "delta_v": 0.0, "r_pos": 0.0, "r_fuel": 0.0, "r_term": 0.0,
-            "r_mile": 0.0, "docked": False, "states": [], "actions": [],
+            "docked": False, "states": [], "actions": [],
             "start": time.perf_counter(),
         }
+
+    def _current_noise_std(self) -> float:
+        """Current OU stationary std in the env's native [-1,1] action
+        units (see the OU_STD_PER_SIGMA comment in constants.py) — the
+        NoiseDecayCallback writes the raw `sigma` parameter directly onto
+        the noise object, so this reads it back and converts rather than
+        recomputing the decay schedule a second time."""
+        noise = self.model.action_noise
+        if noise is None:
+            return 0.0
+        sub_noises = getattr(noise, "noises", [noise])
+        return float(sub_noises[0]._sigma[0]) * OU_STD_PER_SIGMA
+
+    def _seed_start_state(self, i: int) -> None:
+        """Seeds a fresh per-env accumulator with the true pre-action
+        position from that sub-env's most recent reset() (see
+        CWRendezvousEnv.reset()'s "state" info key) — without this, states[0]
+        is already the position AFTER the first action, so trajectory plots
+        silently skip the real starting point and the first Δv arrow.
+        Falls back to leaving "states" empty if reset_infos isn't populated
+        yet (shouldn't happen once training has actually started)."""
+        reset_info = self.training_env.reset_infos[i]
+        start_state = reset_info.get("state")
+        if start_state is not None:
+            self._acc[i]["states"].append(start_state.copy())
+
+    def _on_training_start(self) -> None:
+        for i in range(self.n_envs):
+            self._seed_start_state(i)
 
     def _on_step(self) -> bool:
         infos = self.locals["infos"]
@@ -406,7 +453,6 @@ class TrainingCallback(BaseCallback):
             acc["r_pos"]   += info.get("reward_pos", 0.0)
             acc["r_fuel"]  += info.get("reward_fuel", 0.0)
             acc["r_term"]  += info.get("reward_terminal", 0.0)
-            acc["r_mile"]  += info.get("reward_milestone", 0.0)
             if info.get("docked", False):
                 acc["docked"] = True
 
@@ -415,16 +461,20 @@ class TrainingCallback(BaseCallback):
                 reward  = ep_info.get("r", 0.0)
                 steps   = ep_info.get("l", 1)
 
-                cur_dist = info.get("curriculum_distance", float("nan"))
+                cur_dist   = info.get("curriculum_distance", float("nan"))
+                noise_std  = self._current_noise_std()
+                dv_ref     = info.get("dv_ref", float("nan"))
+                dv_ratio   = acc["delta_v"] / dv_ref if dv_ref else float("nan")
 
                 self.episode_rewards.append(reward)
                 self.episode_steps.append(steps)
                 self.episode_delta_vs.append(acc["delta_v"])
+                self.episode_dv_ratios.append(dv_ratio)
                 self.episode_docked.append(acc["docked"])
                 self.episode_r_pos_totals.append(acc["r_pos"])
                 self.episode_r_fuel_totals.append(acc["r_fuel"])
                 self.episode_r_term_totals.append(acc["r_term"])
-                self.episode_r_mile_totals.append(acc["r_mile"])
+                self.episode_noise_std.append(noise_std)
                 self.episode_curriculum_distances.append(cur_dist)
 
                 ep = self._episode_num
@@ -435,8 +485,8 @@ class TrainingCallback(BaseCallback):
                     print(
                         f"{ep:>6} | {steps:>5} | {reward:>9.2f} | "
                         f"{acc['r_pos']:>8.2f} | {acc['r_fuel']:>8.2f} | "
-                        f"{acc['r_term']:>8.2f} | {acc['r_mile']:>8.2f} | "
-                        f"{acc['delta_v']:>7.4f} | {cur_dist:>6.1f} | {dock_rate:>5.1f}% | "
+                        f"{acc['r_term']:>8.2f} | {noise_std:>8.4f} | "
+                        f"{dv_ratio:>7.2f} | {cur_dist:>6.1f} | {dock_rate:>5.1f}% | "
                         f"{cur_prog:>8} | {1000 * elapsed:>8.1f}"
                     )
 
@@ -456,10 +506,12 @@ class TrainingCallback(BaseCallback):
                         rewards=np.array([reward]),
                         steps=np.array([steps]),
                         delta_v=np.array([acc["delta_v"]]),
+                        dv_ratio=np.array([dv_ratio]),
                         docked=np.array([acc["docked"]]),
                     )
 
                 self._acc[i] = self._new_accumulator()
+                self._seed_start_state(i)
                 self._episode_num += 1
 
         return True
@@ -872,11 +924,12 @@ def main():
         rewards    = np.array(cb.episode_rewards),
         steps      = np.array(cb.episode_steps),
         delta_v    = np.array(cb.episode_delta_vs),
+        dv_ratio   = np.array(cb.episode_dv_ratios),
         docked     = np.array(cb.episode_docked),
         r_pos      = np.array(cb.episode_r_pos_totals),
         r_fuel     = np.array(cb.episode_r_fuel_totals),
         r_term     = np.array(cb.episode_r_term_totals),
-        r_mile     = np.array(cb.episode_r_mile_totals),
+        noise_std  = np.array(cb.episode_noise_std),
         curriculum_distance = np.array(cb.episode_curriculum_distances),
     )
     print("Done.")

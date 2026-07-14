@@ -261,15 +261,21 @@ class CWRendezvousEnv(gym.Env):
 
         if self.scenario == "vbar":
             self.dv_ref = 0.5 * dv_vbar_two_impulse_rr(np.linalg.norm(self.state[:half]), self.omega)
+            # We divide by half since the output of the function is the TOTAL delta v required for also stopping
         else:
             self.dv_ref = dv_rbar_strategy_rv(np.linalg.norm(self.state[:half]), self.omega)
+            # TODO: divide by the amount required actually to reach... could use half as approximation
             
         self.max_dv = self.dv_ref * self.max_dv_coeff
 
         self.burn_deadzone = self.burn_deadzone_frac * self.max_dv
 
         observation = self._build_observation()
-        info = {"curriculum_distance": self.curriculum_distance}
+        # "state" mirrors step()'s info so callers (e.g. training.py's
+        # trajectory-plot accumulator) can seed a new episode's start point
+        # from vec_env.reset_infos, instead of the plot only ever showing
+        # each episode's first POST-action position.
+        info = {"curriculum_distance": self.curriculum_distance, "state": self.state.copy()}
         return observation, info
 
     @staticmethod
@@ -382,7 +388,7 @@ class CWRendezvousEnv(gym.Env):
             reward_fuel = 0.0
 
 
-        reward_terminal = (self.bonus - self.vel_coeff * vel_error) if docked else 0.0
+        reward_terminal = self.bonus if docked else 0.0
         reward = reward_pos + reward_fuel + reward_terminal
 
         observation = self._build_observation()
@@ -397,6 +403,7 @@ class CWRendezvousEnv(gym.Env):
             "delta_v":         np.linalg.norm(action),
             "applied_action":  action.copy(),
             "dv_used":         self.dv_used,
+            "dv_ref":          self.dv_ref,
             "curriculum_distance": self.curriculum_distance,
             "excursion_limit": self.excursion_limit,
         }
