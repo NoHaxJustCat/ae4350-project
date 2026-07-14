@@ -27,8 +27,8 @@ from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
 from stable_baselines3.common.monitor import Monitor
 
 from libs.constants import (
-    ACTION_NOISE_SIGMA_END,
-    ACTION_NOISE_SIGMA_START,
+    ACTION_NOISE_STD_END,
+    ACTION_NOISE_STD_START,
     BATCH_SIZE,
     CRITIC_LR,
     DOCK_RATE_WINDOW,
@@ -158,20 +158,28 @@ def build_diagnostics_figure(cb: "TrainingCallback", scenario: str):
 
 class NoiseDecayCallback(BaseCallback):
     """Linearly anneals the exploration noise std from START to END over the
-    first `decay_frac` of training. A constant-sigma OU/Gaussian process
-    forces nonzero actions every step forever, which is exactly what starves
-    the agent of ever seeing a "coast, don't burn" trajectory."""
+    first `decay_frac` of `total_timesteps` (see `start_timesteps` below). A
+    constant-sigma OU/Gaussian process forces nonzero actions every step
+    forever, which is exactly what starves the agent of ever seeing a
+    "coast, don't burn" trajectory."""
 
     def __init__(self, total_timesteps: int, sigma_start: float, sigma_end: float,
-                 decay_frac: float = NOISE_DECAY_FRAC):
+                 decay_frac: float = NOISE_DECAY_FRAC, start_timesteps: int = 0):
         super().__init__(verbose=0)
         self.total_timesteps = total_timesteps
         self.sigma_start = sigma_start
         self.sigma_end = sigma_end
+        # Progress is measured from start_timesteps, not from absolute zero,
+        # so a --resume-from run gets its OWN decay curve over its own
+        # (typically shorter) remaining budget instead of reading as
+        # "already past decay_frac of the ORIGINAL total" and immediately
+        # pinning to sigma_end on step one — see main()'s call site.
+        self.start_timesteps = start_timesteps
         self.decay_steps = max(1, int(total_timesteps * decay_frac))
 
     def _on_step(self) -> bool:
-        progress = min(1.0, self.num_timesteps / self.decay_steps)
+        elapsed = self.num_timesteps - self.start_timesteps
+        progress = min(1.0, max(0.0, elapsed) / self.decay_steps)
         sigma = self.sigma_start + progress * (self.sigma_end - self.sigma_start)
         noise = self.model.action_noise
         if noise is None:
@@ -633,6 +641,17 @@ def parse_args():
                          "restored (not saved by the checkpoint callback), so gradient updates "
                          "pause again until it refills past MIN_BUFFER — network weights carry "
                          "over regardless.")
+    p.add_argument("--noise-std-start", type=float, default=ACTION_NOISE_STD_START,
+                    help="Exploration noise stationary std (native [-1,1] action units) at "
+                         "the START of the decay schedule. Default from constants.py. On "
+                         "--resume-from, the decay schedule restarts fresh at this value over "
+                         "the REMAINING timesteps budget (args.total_timesteps - the resumed "
+                         "model's num_timesteps), rather than continuing wherever the original "
+                         "run's schedule left off — lets a finished run be extended with its "
+                         "own separate, typically lower, noise decay for fine-tuning.")
+    p.add_argument("--noise-std-end", type=float, default=ACTION_NOISE_STD_END,
+                    help="Exploration noise stationary std at the END of the decay schedule. "
+                         "Default from constants.py.")
 
     # ── Perf knobs ──────────────────────────────────────────────────────────
     p.add_argument("--vec-env", choices=["auto", "dummy", "subproc"], default="auto",
@@ -706,6 +725,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    noise_sigma_start = args.noise_std_start / OU_STD_PER_SIGMA
+    noise_sigma_end   = args.noise_std_end / OU_STD_PER_SIGMA
 
     torch.set_num_threads(max(1, args.torch_threads))
     print(f"Platform: {platform.system()} | torch main-process threads: {args.torch_threads} "
@@ -784,12 +806,14 @@ def main():
         # consecutive steps of "coasting" (near-zero action) before it pays
         # off — i.i.d. per-step noise can't produce that by chance, since
         # each step is independent of the last; a correlated walk can.
-        # ACTION_NOISE_SIGMA_START/END are pre-corrected in constants.py for
-        # OU's sigma->stationary-std amplification (see the comment there) —
-        # theta/dt must match what that correction assumed.
+        # noise_sigma_start/end are the --noise-std-start/end CLI values
+        # (default from ACTION_NOISE_STD_START/END in constants.py),
+        # pre-corrected for OU's sigma->stationary-std amplification (see
+        # the OU_STD_PER_SIGMA comment in constants.py) — theta/dt must
+        # match what that correction assumed.
         action_noise = OrnsteinUhlenbeckActionNoise(
             mean=np.zeros(action_dim),
-            sigma=ACTION_NOISE_SIGMA_START * np.ones(action_dim),
+            sigma=noise_sigma_start * np.ones(action_dim),
             theta=OU_THETA,
             dt=OU_DT,
         )
@@ -854,12 +878,27 @@ def main():
         min_distance=ENV_CURRICULUM_START_DISTANCE,
     ) if ENV_CURRICULUM_ENABLED else None
 
+    # SB3's learn(total_timesteps, reset_num_timesteps=False) treats
+    # total_timesteps as an INCREMENT added to the model's existing
+    # num_timesteps, not an absolute target — so on resume we pass the
+    # remaining budget, not args.total_timesteps itself, to keep
+    # --total-timesteps meaning "the original full target" everywhere else.
+    # NoiseDecayCallback also uses this remaining budget (not the original
+    # total) as ITS total_timesteps, paired with start_timesteps=the
+    # resumed model's num_timesteps, so a resumed run gets its own fresh
+    # noise decay curve over just the new steps.
+    if args.resume_from:
+        remaining_timesteps = max(args.total_timesteps - model.num_timesteps, 0)
+    else:
+        remaining_timesteps = args.total_timesteps
+
     callback = [
         TrainingCallback(tmp_dir=tmp_dir, n_envs=n_envs, curriculum_callback=curriculum_callback),
         NoiseDecayCallback(
-            total_timesteps=args.total_timesteps,
-            sigma_start=ACTION_NOISE_SIGMA_START,
-            sigma_end=ACTION_NOISE_SIGMA_END,
+            total_timesteps=remaining_timesteps,
+            sigma_start=noise_sigma_start,
+            sigma_end=noise_sigma_end,
+            start_timesteps=model.num_timesteps if args.resume_from else 0,
         ),
         PeriodicCheckpointCallback(
             save_dir=run_dir / "checkpoints",
@@ -883,19 +922,6 @@ def main():
     callback.append(live_diag_callback)
     if curriculum_callback is not None:
         callback.append(curriculum_callback)
-
-    # SB3's learn(total_timesteps, reset_num_timesteps=False) treats
-    # total_timesteps as an INCREMENT added to the model's existing
-    # num_timesteps, not an absolute target — so on resume we pass the
-    # remaining budget, not args.total_timesteps itself, to keep
-    # --total-timesteps meaning "the original full target" everywhere else
-    # (NoiseDecayCallback's decay schedule in particular needs the ORIGINAL
-    # total, not the remaining one, since it compares against the model's
-    # absolute num_timesteps).
-    if args.resume_from:
-        remaining_timesteps = max(args.total_timesteps - model.num_timesteps, 0)
-    else:
-        remaining_timesteps = args.total_timesteps
 
     model.learn(
         total_timesteps      = remaining_timesteps,
