@@ -15,6 +15,7 @@ from libs.constants import (
     ENV_VEL_COEFF,
     ENV_STOP_COEFF,
     ENV_STOP_VEL_SCALE_FRAC,
+    ENV_FUEL_RATIO_EPS,
     ENV_SHAPING_COEFF,
     OMEGA,
     ENV_CURRICULUM_ENABLED,
@@ -83,27 +84,19 @@ class CWRendezvousEnv(gym.Env):
         2-D : [dvx, dvz]   (2-dim)
         3-D : [dvx, dvy, dvz]   (3-dim)
 
-    Reward is intentionally barebones: dense distance-shaping every step,
-    a docking bonus, and a fuel cost — nothing else. No milestone
-    bookkeeping, no dv ceiling/truncation tied to fuel, no malus — those
-    were the source of repeated reward-exploit debugging (fast-burn-to-
+    Reward is intentionally barebones: dense distance-shaping every step, and
+    three terminal bonuses paid only on a completed dock (in _brake_step) —
+    a flat dock bonus, a stopping bonus, and a fuel-efficiency bonus. No
+    milestone bookkeeping, no dv ceiling/truncation tied to fuel, no malus —
+    those were the source of repeated reward-exploit debugging (fast-burn-to-
     ceiling loops, reward discontinuities).
 
-    The fuel term is a terminal bonus on cumulative dv_used, paid only on a
-    successful dock: ENV_FUEL_COEFF * (dv_used + eps)**-1 (currently
-    25 * (dv_used + 0.01)**-1). Earlier versions tried a per-step linear
-    cost (-coeff * ||action||), then a per-step log1p-telescoped cost — both
-    replaced. The linear cost gives equal reward for equal *absolute* dv
-    reductions, so its gradient vanishes once dv_used is already small
-    (cutting 4->2 m/s earns far more than the equally impressive 2x cut from
-    0.05->0.025 m/s), and a real run measurably drifted back up once it
-    reached that low-signal regime. The inverse terminal bonus keeps that
-    "smaller is disproportionately better" pressure alive at low dv_used
-    without ever letting fuel cost make *failing* to dock look better than a
-    wasteful dock (it's strictly additive on top of the dock bonus, never
-    subtracted elsewhere). The small eps (0.01, ~the optimal dv scale) keeps
-    it finite as dv_used -> 0 while leaving the curve steep near the optimum;
-    see the ENV_FUEL_COEFF comment in constants.py.
+    The fuel term is constant-elasticity in ratio = dv_used/dv_ref,
+    coeff / (ratio + eps), NOT floored at the reference and GATED by
+    stop_quality so the agent keeps being rewarded for beating dv_ref (and
+    discovers its own most-efficient rendezvous) while a fly-through that skips
+    the brake can never win it back. See the ENV_FUEL_COEFF / ENV_STOP_COEFF
+    comments in constants.py for the full rationale.
 
     Scenario (2-D only, selects the initial-condition family; see
     CLAUDE.md goals 1 & 2). Sign/quadrant is randomized every reset() so a
@@ -562,14 +555,19 @@ class CWRendezvousEnv(gym.Env):
         pos_error = float(np.linalg.norm(self.state[:half]))
         vel_error = float(np.linalg.norm(self.state[half:]))
 
-        # Terminal reward, now that the dock is complete: flat dock bonus + fuel
-        # bonus on TOTAL dv (transfer + brake, floored at ratio 1 — see
-        # ENV_FUEL_COEFF) + stopping bonus on the post-brake speed (smooth toward
-        # vel_error -> 0, sized to outweigh the brake's Δv — see ENV_STOP_COEFF).
-        ratio = max(self.dv_used / self.dv_ref, 1.0)
-        reward_fuel = self.fuel_coeff / ratio
+        # Terminal reward, now that the dock is complete: flat dock bonus +
+        # stopping bonus (post-brake speed -> 0) + fuel-efficiency bonus on the
+        # TOTAL dv (transfer + brake). The fuel term is NOT floored at the
+        # reference and is GATED by stop_quality, so the agent keeps being
+        # rewarded for beating dv_ref and discovers its own most-efficient
+        # rendezvous, but a fly-through that skips the brake (lower dv, but
+        # ~zero stop_quality) can never win it back (see ENV_FUEL_COEFF /
+        # ENV_FUEL_RATIO_EPS). dv_ref here is only a distance-normalizing scale.
         v_scale = self.stop_vel_scale_frac * self.dv_ref
-        reward_stop = self.stop_coeff / (1.0 + vel_error / v_scale)
+        stop_quality = 1.0 / (1.0 + vel_error / v_scale)   # in (0, 1]
+        ratio = self.dv_used / self.dv_ref
+        reward_fuel = self.fuel_coeff / (ratio + ENV_FUEL_RATIO_EPS) * stop_quality
+        reward_stop = self.stop_coeff * stop_quality
         reward_terminal = self.bonus
         reward_pos = 0.0
         reward = reward_pos + reward_fuel + reward_stop + reward_terminal

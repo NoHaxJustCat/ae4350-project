@@ -98,26 +98,33 @@ ENV_POS_TOLERANCE = 5.0
 ENV_VEL_COEFF = 10.0
 ENV_SHAPING_COEFF = 10.0
 ENV_BONUS = 50.0
-# Fuel bonus: paid only on a successful dock, inverse (constant-elasticity)
-# decay in dv_used/dv_ref (reward_fuel = coeff / max(dv_used/dv_ref, 1) —
-# see libs/env.py::step). dv_ref is the analytic two-impulse reference for
-# this episode's scenario/distance (libs/reference.py), so the bonus is
-# graded against "how close to the optimal transfer" rather than an
-# absolute m/s scale. Strictly additive on top of the dock bonus, so it can
-# never make failing to dock look better than a wasteful dock (zero unless
-# docked=True).
+# Fuel bonus (paid only on a successful dock, in _brake_step). Constant-
+# elasticity 1/ratio decay in ratio = dv_used/dv_ref, but NO LONGER floored at
+# ratio 1: reward_fuel = coeff / (ratio + ENV_FUEL_RATIO_EPS) * stop_quality.
 #
-# coeff=100 sets the peak (dv_used <= dv_ref): 100/1=100. ratio=1.5->66.7,
-# 2->50, 3->33.3, 5->20, 10->10, 15->6.7, 20->5 — a plain 1/ratio (not
-# 1/ratio**3, an earlier version) so the reward has constant elasticity: a
-# given PROPORTIONAL fuel improvement is worth the same relative reward
-# change at ratio=20 as at ratio=1.2, instead of the gradient vanishing once
-# dv_used is already many multiples of optimal. A live run sitting at
-# ratio~13-17x showed total dv flat for 26k+ episodes under the old cubic
-# (100/15**3=0.03, 100/16**3=0.024 — a real fuel improvement was worth
-# 0.006 points, invisible next to ordinary terminal-velocity noise); 1/ratio
-# is worth 6.7 vs 6.25 at the same two points, an actually learnable signal.
+# Two deliberate design points:
+#   1. NO floor at ratio 1 (was max(ratio,1)). The floor made the reward flat
+#      once dv_used dropped below dv_ref, so the analytic reference acted as a
+#      "target" the agent had no reason to beat — a run would settle anywhere
+#      under 1x (e.g. ~0.49x) with zero pressure to go lower. Removing it lets
+#      the agent keep being rewarded for going below the reference and discover
+#      its OWN most-efficient strategy (which, with 2-D control, may beat the
+#      pure two-V-bar transfer). dv_ref now serves only as a distance-invariant
+#      NORMALIZING scale, not as a goalpost. eps bounds the peak (coeff/eps) and
+#      the divide as ratio->0; a real reach-AND-stop maneuver has a physical Δv
+#      floor (~0.42x dv_ref) so the tiny-ratio regime is never actually reached.
+#   2. GATED by stop_quality (the same 1/(1+vel/scale) in ENV_STOP_COEFF, in
+#      (0,1]). Without the floor, the lowest-Δv way to "dock" is again a
+#      fly-THROUGH that never brakes (it skips the stopping impulse, so it uses
+#      less total Δv) — an ungated fuel reward would hand that its biggest bonus
+#      and the agent would abandon braking. Multiplying by stop_quality means
+#      efficiency only counts once the rendezvous is actually completed: a
+#      fly-through's low-Δv advantage is killed by its near-zero stop_quality,
+#      so a true stop always wins, and among stops lower Δv keeps being better.
 ENV_FUEL_COEFF = 500.0
+# Small ratio offset that bounds the un-floored fuel bonus (peak coeff/eps) and
+# keeps a strong, finite gradient near the physical optimum (~0.42x dv_ref).
+ENV_FUEL_RATIO_EPS = 0.1
 
 # --- Terminal-velocity (stopping) bonus ---
 # Paid ONLY on a successful dock and strictly ADDITIVE (like the fuel bonus),
