@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from libs.constants import OMEGA, MAX_STEPS
+from libs.constants import OMEGA, MAX_STEPS, ACTION_IMPULSE_DIM
 from libs.env import CWRendezvousEnv
 from libs.normalization import NormalizedObsEnv
 from libs.symmetry import CanonicalizeDirectionEnv
@@ -42,15 +42,28 @@ def run_episode(model, scenario: str, sign: float, max_steps: int = MAX_STEPS) -
     # Must match the training wrapper stack exactly — the policy only ever
     # learned the x>=0 canonical view (see libs/symmetry.py).
     env = NormalizedObsEnv(CanonicalizeDirectionEnv(raw_env))
-    obs, _ = env.reset(options={"sign": sign})
+    obs, reset_info = env.reset(options={"sign": sign})
 
-    states, actions, rewards = [], [], []
+    # Seed the true pre-action start point (+ a placeholder action the first
+    # burn overwrites), then, as in training.py's accumulator, extend with each
+    # step's coarse coast samples so a coast-duration decision plots as a
+    # smooth arc with the Δv arrow anchored at the real burn position.
+    start_state = reset_info.get("state")
+    states = [start_state.copy()] if start_state is not None else []
+    actions = [np.zeros(ACTION_IMPULSE_DIM)] if start_state is not None else []
+    rewards = []
     info, step = {}, -1
     for step in range(max_steps):
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = env.step(action)
-        states.append(info["state"].copy())
-        actions.append(info["applied_action"].copy())
+        applied = np.asarray(info["applied_action"])
+        if actions:
+            actions[-1] = applied.copy()
+        else:
+            actions.append(applied.copy())
+        subs = info.get("substates") or [info["state"]]
+        states.extend(np.asarray(s).copy() for s in subs)
+        actions.extend(np.zeros(ACTION_IMPULSE_DIM) for _ in subs)
         rewards.append(reward)
         if terminated or truncated:
             break

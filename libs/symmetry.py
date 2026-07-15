@@ -23,6 +23,8 @@ physical x, not a normalized-to-[0,1] value.
 import numpy as np
 import gymnasium as gym
 
+from libs.constants import ACTION_IMPULSE_DIM
+
 
 class CanonicalizeDirectionEnv(gym.Wrapper):
     def __init__(self, env):
@@ -35,7 +37,15 @@ class CanonicalizeDirectionEnv(gym.Wrapper):
         return canon_obs, info
 
     def step(self, action):
-        real_action = -np.asarray(action) if self._mirror else action
+        # Mirror ONLY the physical impulse components. The trailing
+        # coast-duration scalar (action[ACTION_IMPULSE_DIM:]) is a magnitude,
+        # not a direction — negating it would flip the requested coast length
+        # under the x<0 mirror and desync the two halves of the symmetry.
+        if self._mirror:
+            real_action = np.asarray(action, dtype=np.float64).copy()
+            real_action[:ACTION_IMPULSE_DIM] *= -1
+        else:
+            real_action = action
         obs, reward, terminated, truncated, info = self.env.step(real_action)
         canon_obs, self._mirror = self._canonicalize(obs)
         return canon_obs, reward, terminated, truncated, info

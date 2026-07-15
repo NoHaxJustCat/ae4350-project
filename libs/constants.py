@@ -8,7 +8,16 @@ MODE_2D: bool = True
 PHYS_STATE_DIM: int = 4 if MODE_2D else 6
 # Observation dim = physical state + dv_used scalar
 OBS_DIM:    int = PHYS_STATE_DIM + 1       # 5 (2D) or 7 (3D)
-ACTION_DIM: int = 2 if MODE_2D else 3
+# Action = impulse (one Δv component per axis) + a COAST-DURATION scalar.
+# ACTION_IMPULSE_DIM is the physical impulse part (2 in 2D, 3 in 3D); the
+# trailing +1 is the agent's chosen coast length (see ENV_COAST_* below and
+# CWRendezvousEnv.step()). This turns the MDP from "act every 100 s for 100+
+# steps" into "burn, then say how long to coast" — a handful of decisions per
+# episode — so the fuel-optimal burn/coast/burn transfer is actually
+# reachable by exploration instead of requiring ~30 consecutive near-zero
+# actions to line up by chance.
+ACTION_IMPULSE_DIM: int = 2 if MODE_2D else 3
+ACTION_DIM: int = ACTION_IMPULSE_DIM + 1
 
 # --- Orbit / physics constants ---
 EARTH_MU = 3.986 * 10 ** 14  # m^3 / s^2
@@ -52,6 +61,21 @@ ENV_DT_AGENT = 100.0
 # Back-compat alias: ENV_DT means the AGENT step everywhere downstream
 # (MAX_STEPS, evaluate.py, the env's default dt).
 ENV_DT = ENV_DT_AGENT
+
+# --- Coast-duration action ---
+# The agent's action carries, on top of the impulse, ONE scalar in [-1, 1]
+# that CWRendezvousEnv.step() maps to an integer number of agent-dt "coast"
+# units to ballistically propagate AFTER applying the impulse (docking / OOB
+# checked every fine dt_phys substep throughout, so a fast fly-through still
+# registers). Range chosen so the physically meaningful coasts are all
+# reachable in a single decision:
+#   one orbit  = ORBIT_PERIOD / ENV_DT_AGENT ~= 58 units
+#   half orbit ~= 29 units  (the V-bar two-impulse transfer's coast leg)
+# ENV_COAST_MAX_UNITS comfortably exceeds a full orbit so both the half- and
+# full-orbit transfers, plus a short final trim coast (min 1 unit = 100 s),
+# are all one action apart. coast_frac in [-1,1] -> round to [MIN, MAX].
+ENV_COAST_MIN_UNITS = 1
+ENV_COAST_MAX_UNITS = 72
 # Excursion / out-of-bounds safety ceiling. Derived from the curriculum range
 # (not a hand-picked absolute) so it always covers the largest possible
 # excursion_limit CWRendezvousEnv.reset() can compute

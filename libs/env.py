@@ -24,6 +24,9 @@ from libs.constants import (
     RBAR_X_TO_Z_RATIO,
     MODE_2D,
     ACTION_DIM,
+    ACTION_IMPULSE_DIM,
+    ENV_COAST_MIN_UNITS,
+    ENV_COAST_MAX_UNITS,
     PHYS_STATE_DIM,
     OBS_DIM,
 )
@@ -139,7 +142,9 @@ class CWRendezvousEnv(gym.Env):
         self.mode_2d = MODE_2D
         self.phys_dim = PHYS_STATE_DIM   # 4 (2D) or 6 (3D)
         self.obs_dim  = OBS_DIM          # 5 (2D) or 7 (3D)
-        self.action_dim = ACTION_DIM     # 2 (2D) or 3 (3D)
+        # Full action = impulse components + 1 coast-duration scalar.
+        self.action_dim = ACTION_DIM             # 3 (2D) or 4 (3D)
+        self.impulse_dim = ACTION_IMPULSE_DIM    # 2 (2D) or 3 (3D)
         self.scenario = scenario
         self.rbar_x_to_z_ratio = rbar_x_to_z_ratio
 
@@ -315,10 +320,25 @@ class CWRendezvousEnv(gym.Env):
             closest = p0 + t * d
         return closest, float(np.linalg.norm(closest))
 
+    def _coast_units_from_cmd(self, coast_cmd: float) -> int:
+        """Map the coast-duration action scalar in [-1, 1] to an integer
+        number of agent-dt coast units in [ENV_COAST_MIN_UNITS,
+        ENV_COAST_MAX_UNITS]. Linear so the physically meaningful coasts (a
+        half-orbit ~29, a full orbit ~58) sit at well-resolved interior points
+        rather than saturated at an endpoint (see ENV_COAST_* in constants.py)."""
+        frac01 = (float(np.clip(coast_cmd, -1.0, 1.0)) + 1.0) * 0.5
+        span = ENV_COAST_MAX_UNITS - ENV_COAST_MIN_UNITS
+        return ENV_COAST_MIN_UNITS + int(round(frac01 * span))
+
     def step(self, action: np.ndarray):
-        # Action is a NORMALIZED fraction u in [-1, 1] per axis; scale it to the
-        # physical impulse for this episode's distance (max_dv_ep set in reset).
-        u = np.clip(action, -1.0, 1.0)
+        # Action = [impulse..., coast_cmd]. The impulse components are a
+        # NORMALIZED fraction u in [-1, 1] per axis, scaled to the physical
+        # impulse for this episode's distance (max_dv set in reset()); the
+        # trailing scalar chooses how many agent-dt units to coast AFTER the
+        # burn (see _coast_units_from_cmd).
+        action = np.asarray(action, dtype=np.float64)
+        coast_units = self._coast_units_from_cmd(action[self.impulse_dim])
+        u = np.clip(action[: self.impulse_dim], -1.0, 1.0)
         action = u * self.max_dv
 
         # Burn deadzone / minimum-impulse-bit: a commanded burn below the
@@ -355,15 +375,26 @@ class CWRendezvousEnv(gym.Env):
         prev_pos_error = np.linalg.norm(self.state[:half])
 
         # One impulsive Δv is applied ONCE at the start of the agent step,
-        # then the state coasts through n_substeps of the fine physics dt.
-        # Docking (segment test) and out-of-bounds are checked at EVERY
-        # substep so a fast pass-through the target can't tunnel between the
-        # coarse agent samples, and we stop the instant a terminal event
-        # happens instead of only looking at the agent-step endpoint.
+        # then the state coasts BALLISTICALLY for the agent-chosen number of
+        # agent-dt units (coast_units), each decomposed into n_substeps of the
+        # fine physics dt. Docking (segment test) and out-of-bounds are checked
+        # at EVERY substep so a fast pass-through the target can't tunnel
+        # between samples, and we stop the instant a terminal event happens.
+        # This is the whole point of the coast-duration action: the agent
+        # spends ONE decision on a possibly orbit-long coast instead of having
+        # to emit ~30 consecutive near-zero actions to reproduce it.
         self.state[half:] += action
 
+        # Coarse (agent-dt) samples of the coast leg for trajectory plotting,
+        # so a decision spanning a whole orbit still renders as a smooth arc
+        # rather than one straight chord. Burn point excluded (it coincides
+        # with the previous step's endpoint that callers already hold); we
+        # append interior agent-dt boundaries plus the true terminal point.
+        substates = []
+        total_substeps = coast_units * self.n_substeps
+
         docked = out_of_bounds = timeout = False
-        for _ in range(self.n_substeps):
+        for k in range(1, total_substeps + 1):
             prev_pos = self.state[:half].copy()
             self.state = self.STM_np @ self.state
             self.elapsed_time += self.dt_phys
@@ -383,6 +414,10 @@ class CWRendezvousEnv(gym.Env):
             if self.elapsed_time > self.timeout:
                 timeout = True
                 break
+            if k % self.n_substeps == 0 and k < total_substeps:
+                substates.append(self.state.copy())
+
+        substates.append(self.state.copy())  # true terminal / final endpoint
 
         pos_error = np.linalg.norm(self.state[:half])
         vel_error = np.linalg.norm(self.state[half:])
@@ -430,6 +465,8 @@ class CWRendezvousEnv(gym.Env):
         observation = self._build_observation()
         info = {
             "state":           self.state.copy(),
+            "substates":       substates,
+            "coast_units":     coast_units,
             "distance":        pos_error,
             "docked":          docked,
             "reward_pos":      reward_pos,

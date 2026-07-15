@@ -27,6 +27,7 @@ from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
 from stable_baselines3.common.monitor import Monitor
 
 from libs.constants import (
+    ACTION_IMPULSE_DIM,
     ACTION_NOISE_STD_END,
     ACTION_NOISE_STD_START,
     BATCH_SIZE,
@@ -610,7 +611,11 @@ class TrainingCallback(BaseCallback):
         reset_info = self.training_env.reset_infos[i]
         start_state = reset_info.get("state")
         if start_state is not None:
+            # Seed states AND a parallel placeholder action so the two lists
+            # stay index-aligned; the first real burn overwrites this
+            # placeholder in _on_step (it is applied leaving the start point).
             self._acc[i]["states"].append(start_state.copy())
+            self._acc[i]["actions"].append(np.zeros(ACTION_IMPULSE_DIM))
 
     def _on_training_start(self) -> None:
         for i in range(self.n_envs):
@@ -624,8 +629,22 @@ class TrainingCallback(BaseCallback):
             info = infos[i]
             acc  = self._acc[i]
 
-            acc["states"].append(info["state"])
-            acc["actions"].append(info.get("applied_action", np.zeros(2)))
+            # A single agent step now covers an impulse plus a possibly
+            # orbit-long ballistic coast. The burn is applied leaving the
+            # CURRENT last recorded position, so overwrite the placeholder
+            # action there; then extend the trajectory with the coast's coarse
+            # (agent-dt) samples, each carrying no further burn. This keeps
+            # states/actions index-aligned (so the Δv arrow stays anchored at
+            # the position the burn was actually applied from) and renders the
+            # coast as a smooth arc instead of one straight chord.
+            applied = info.get("applied_action", np.zeros(ACTION_IMPULSE_DIM))
+            if acc["actions"]:
+                acc["actions"][-1] = applied
+            else:
+                acc["actions"].append(applied)
+            subs = info.get("substates") or [info["state"]]
+            acc["states"].extend(np.asarray(s).copy() for s in subs)
+            acc["actions"].extend(np.zeros(ACTION_IMPULSE_DIM) for _ in subs)
             acc["delta_v"] += info.get("delta_v", 0.0)
             acc["r_pos"]   += info.get("reward_pos", 0.0)
             acc["r_fuel"]  += info.get("reward_fuel", 0.0)
@@ -999,7 +1018,22 @@ def main():
           f"gradient_steps: {args.gradient_steps}")
 
     if args.resume_from:
-        model = TD3.load(args.resume_from, env=env, device=args.device)
+        try:
+            model = TD3.load(args.resume_from, env=env, device=args.device)
+        except ValueError as exc:
+            if "Action spaces do not match" in str(exc):
+                raise SystemExit(
+                    f"\nCannot --resume-from {args.resume_from}: its action space "
+                    f"does not match this env's {tuple(env.action_space.shape)}.\n"
+                    "This model predates the coast-duration action (see "
+                    "constants.py ACTION_IMPULSE_DIM / ENV_COAST_* and "
+                    "libs/env.py::step) - its actor outputs a pure impulse with "
+                    "no coast component, so its weights cannot be loaded into the "
+                    "new policy. Train FRESH (drop --resume-from); resuming from a "
+                    "pre-coast model would also just re-seed the old fuel-wasteful "
+                    "fly-straight-in basin the coast action exists to escape."
+                ) from exc
+            raise
         print(f"Resumed model from {args.resume_from} at {model.num_timesteps} timesteps "
               f"({args.total_timesteps - model.num_timesteps} remaining toward "
               f"--total-timesteps {args.total_timesteps})")
