@@ -6,8 +6,15 @@ MODE_2D: bool = True
 # Derived convenience constants (do not edit these directly)
 # Physical state dim: 4 (2D) or 6 (3D)
 PHYS_STATE_DIM: int = 4 if MODE_2D else 6
-# Observation dim = physical state + dv_used scalar
-OBS_DIM:    int = PHYS_STATE_DIM + 1       # 5 (2D) or 7 (3D)
+# Observation dim = physical state + dv_used scalar + braking-phase flag.
+# The trailing flag is 1.0 exactly on the one observation the agent acts on to
+# fire its terminal BRAKING impulse (set the instant it reaches the target;
+# see CWRendezvousEnv braking_phase / _brake_step) and 0.0 otherwise. It has to
+# be an explicit feature, not inferred from "position ~ 0": at the target the
+# normalized position is only ~0.1% of its range away from any other small
+# position, which LayerNorm washes out — the agent could not reliably tell it
+# is in the brake window without this bit.
+OBS_DIM:    int = PHYS_STATE_DIM + 2       # 6 (2D) or 8 (3D)
 # Action = impulse (one Δv component per axis) + a COAST-DURATION scalar.
 # ACTION_IMPULSE_DIM is the physical impulse part (2 in 2D, 3 in 3D); the
 # trailing +1 is the agent's chosen coast length (see ENV_COAST_* below and
@@ -133,7 +140,19 @@ ENV_FUEL_COEFF = 500.0
 # while a true stop gets ~1x — a clear, learnable gap. COEFF=300 makes a
 # stopped dock decisively better than a fly-through even though both saturate
 # the (floored-at-ratio-1) fuel bonus when below dv_ref.
-ENV_STOP_COEFF = 300.0
+#
+# The bonus is paid at the terminal state AFTER the agent's dedicated braking
+# impulse (CWRendezvousEnv._brake_step): reaching the target opens a one-step
+# braking phase whose action nulls the arrival velocity, and this bonus scores
+# how close to a full stop it got. COEFF must OUTWEIGH the extra Δv the brake
+# costs so braking is unambiguously worth it: the worst case is the fuel bonus
+# dropping from its 500 peak toward 500/2.5 when a full max_dv (1.5·dv_ref)
+# brake is spent from around ratio 1 — a loss of ~300. COEFF=500 (peak parity
+# with the fuel bonus) clears that with margin, and at the actual optimum
+# (fly-through arrival ~0.21·dv_ref + equal braking impulse -> ~0.42·dv_ref
+# total, still under dv_ref so the fuel bonus stays floored at 500) the brake
+# costs zero fuel bonus, so a near-perfect stop is worth ~+500 for free.
+ENV_STOP_COEFF = 500.0
 ENV_STOP_VEL_SCALE_FRAC = 0.05
 
 # Physical per-burn actuator cap: max_dv = dv_ref * ENV_MAX_DV_COEFF, set per
@@ -184,16 +203,24 @@ ENV_DV_BUDGET_SHRINK = 0.85 ** (1 / 3)  # ~0.9473
 # velocity change. Two reasons:
 #   1. Physical: real thrusters have a minimum impulse bit and an off state;
 #      an arbitrarily small continuous burn isn't realizable anyway.
-#   2. RL-critical: dv_used sums ‖aₜ‖ over EVERY agent step, but a neural-net
-#      actor can't output exactly zero, so without a deadzone every "coast"
-#      step leaks a little Δv and a long low-fuel coast accumulates MORE waste
-#      than a fast burn-straight-in dock — which is exactly why the policy
-#      refuses to coast and docks fast (~23x optimal). The deadzone makes
-#      coasting free and representable (the actor just aims below it), which
-#      is what lets the fuel-optimal slow two-impulse transfer actually win.
-# 0.2 of max_dv leaves genuine correction burns well clear of the deadzone
-# while covering the actor's near-zero coast-leakage floor. Set to 0 to disable.
-ENV_BURN_DEADZONE_FRAC = 0.2
+#   2. RL-critical (HISTORICAL, pre-coast-action): dv_used sums ‖aₜ‖ over EVERY
+#      agent step, but a neural-net actor can't output exactly zero, so in the
+#      old per-step regime every "coast" step leaked a little Δv and a long
+#      low-fuel coast accumulated MORE waste than a fast burn-straight-in dock.
+#      The coast-duration action removed that failure mode entirely: an episode
+#      is now ~2-3 deliberate impulses (transfer burn, optional trims, terminal
+#      brake) with the coasting done by a SINGLE action's duration, not by a
+#      long run of near-zero steps — so there is no per-step leakage to floor.
+#
+# Consequently the deadzone was LOWERED from 0.2. At 0.2 the deadzone was
+# 0.3·dv_ref, which is LARGER than the fuel-optimal transfer burn itself
+# (~0.21·dv_ref for the ~1-orbit V-bar coast) — it would have zeroed exactly
+# the soft, efficient burns the coast action exists to enable, capping
+# achievable efficiency. 0.05 (deadzone = 0.075·dv_ref) sits well below that
+# optimum so soft burns are representable, while still swallowing the actor's
+# near-zero output on an intended pure-coast step. The terminal brake bypasses
+# the deadzone entirely (see CWRendezvousEnv._brake_step). Set to 0 to disable.
+ENV_BURN_DEADZONE_FRAC = 0.05
 
 # Base (max-curriculum) initial condition. Only the sign/quadrant is
 # randomized per episode (see CWRendezvousEnv._sample_initial_position) —

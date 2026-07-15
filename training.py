@@ -1025,17 +1025,19 @@ def main():
         try:
             model = TD3.load(args.resume_from, env=env, device=args.device)
         except ValueError as exc:
-            if "Action spaces do not match" in str(exc):
+            if "spaces do not match" in str(exc):
                 raise SystemExit(
-                    f"\nCannot --resume-from {args.resume_from}: its action space "
-                    f"does not match this env's {tuple(env.action_space.shape)}.\n"
-                    "This model predates the coast-duration action (see "
-                    "constants.py ACTION_IMPULSE_DIM / ENV_COAST_* and "
-                    "libs/env.py::step) - its actor outputs a pure impulse with "
-                    "no coast component, so its weights cannot be loaded into the "
-                    "new policy. Train FRESH (drop --resume-from); resuming from a "
-                    "pre-coast model would also just re-seed the old fuel-wasteful "
-                    "fly-straight-in basin the coast action exists to escape."
+                    f"\nCannot --resume-from {args.resume_from}: its observation/action "
+                    f"space does not match this env's "
+                    f"(obs {tuple(env.observation_space.shape)}, "
+                    f"act {tuple(env.action_space.shape)}).\n"
+                    "This model predates the coast-duration action and/or the "
+                    "braking-phase observation flag (see constants.py "
+                    "ACTION_IMPULSE_DIM / OBS_DIM / ENV_COAST_* and libs/env.py::step) "
+                    "- its network shapes cannot be loaded into the new policy. Train "
+                    "FRESH (drop --resume-from); resuming from a pre-coast model would "
+                    "also just re-seed the old fuel-wasteful fly-straight-in basin the "
+                    "coast action exists to escape."
                 ) from exc
             raise
         print(f"Resumed model from {args.resume_from} at {model.num_timesteps} timesteps "

@@ -95,6 +95,12 @@ class NormalizedObsEnv(gym.ObservationWrapper):
         # dv_used's scale is per-episode (depends on that episode's
         # scenario/distance via max_dv, set in CWRendezvousEnv.reset()), so
         # it's computed fresh here rather than baked into a fixed array.
+        # The trailing braking-phase flag is already a 0/1 indicator (see
+        # OBS_DIM in constants.py) — pass it through unnormalized rather than
+        # squashing it toward 0.5 like a signed physical quantity.
+        observation = np.asarray(observation, dtype=np.float64)
         dv_scale = DV_USED_NORM_MULT * self.unwrapped.max_dv
         scale = np.concatenate([_PHYS_SCALE, [dv_scale]])
-        return normalize_state(observation, scale)
+        core = normalize_state(observation[:-1], scale)  # phys state + dv_used
+        flag = observation[-1:]                          # braking-phase flag
+        return np.concatenate([core, flag])

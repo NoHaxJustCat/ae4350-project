@@ -23,7 +23,7 @@ physical x, not a normalized-to-[0,1] value.
 import numpy as np
 import gymnasium as gym
 
-from libs.constants import ACTION_IMPULSE_DIM
+from libs.constants import ACTION_IMPULSE_DIM, PHYS_STATE_DIM
 
 
 class CanonicalizeDirectionEnv(gym.Wrapper):
@@ -56,5 +56,8 @@ class CanonicalizeDirectionEnv(gym.Wrapper):
         if not mirror:
             return obs, False
         canon = obs.copy()
-        canon[:-1] *= -1  # negate everything except the trailing dv_used scalar
+        # Negate only the physical state (position + velocity). The trailing
+        # dv_used and braking-phase flag are sign-invariant magnitudes and must
+        # be left untouched.
+        canon[:PHYS_STATE_DIM] *= -1
         return canon, True

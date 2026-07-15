@@ -269,7 +269,8 @@ class CWRendezvousEnv(gym.Env):
     # ── Observation ──────────────────────────────────────────────────────────
 
     def _build_observation(self) -> np.ndarray:
-        return np.concatenate([self.state, [self.dv_used]]).astype(np.float64)
+        flag = 1.0 if self.braking_phase else 0.0
+        return np.concatenate([self.state, [self.dv_used, flag]]).astype(np.float64)
 
     # ── Gym API ──────────────────────────────────────────────────────────────
 
@@ -284,6 +285,12 @@ class CWRendezvousEnv(gym.Env):
         )
         self.elapsed_time = 0.0
         self.dv_used      = 0.0
+        # Reaching the target opens a one-step "braking phase" (see step() /
+        # _brake_step): the episode does NOT end at arrival — the agent gets
+        # one more action to fire a terminal impulse nulling its velocity, and
+        # only then terminates. False during the whole transfer, True on the
+        # single observation the agent acts on to brake.
+        self.braking_phase = False
 
         half = self.phys_dim // 2
 
@@ -343,6 +350,11 @@ class CWRendezvousEnv(gym.Env):
         # trailing scalar chooses how many agent-dt units to coast AFTER the
         # burn (see _coast_units_from_cmd).
         action = np.asarray(action, dtype=np.float64)
+        # If the target was reached on the previous step, this action is the
+        # terminal braking impulse — a different, no-coast code path.
+        if self.braking_phase:
+            return self._brake_step(action)
+
         coast_units = self._coast_units_from_cmd(action[self.impulse_dim])
         u = np.clip(action[: self.impulse_dim], -1.0, 1.0)
         action = u * self.max_dv
@@ -428,54 +440,26 @@ class CWRendezvousEnv(gym.Env):
         pos_error = np.linalg.norm(self.state[:half])
         vel_error = np.linalg.norm(self.state[half:])
 
-        delta      = prev_pos_error - pos_error
-        terminated = bool(docked or out_of_bounds)
-        truncated  = bool(timeout)
+        delta = prev_pos_error - pos_error
 
-        # --- Reward: dense distance-shaping + docking bonus + a fuel bonus
-        # paid only on a successful dock, inverse-sqrt in cumulative
-        # dv_used so smaller dv_used is disproportionately rewarded even
-        # once it's already small (see class docstring). eps floors it so
-        # an extremely low-fuel dock can't spike to +inf / divide by zero.
+        # Dense distance shaping only. Terminal bonuses (dock / fuel / stopping)
+        # are NOT paid here: reaching the target opens the braking phase, and
+        # _brake_step pays them on the post-brake terminal state after the agent
+        # fires its velocity-nulling impulse next step. This mirrors the analytic
+        # two-impulse maneuver whose SECOND burn brakes exactly at the target.
+        # OOB / timeout still end the episode immediately (no brake, no dock).
         reward_pos = ENV_SHAPING_COEFF * delta / self.curriculum_distance
+        reward_fuel = reward_stop = reward_terminal = 0.0
 
         if docked:
-            # Reward is coeff/ratio, ratio = dv_used/dv_ref (the analytic
-            # two-impulse reference computed in reset()) floored at 1 so
-            # matching-or-beating the reference all saturates at the same
-            # peak (fuel_coeff) instead of blowing up as dv_used -> 0.
-            #
-            # A plain inverse (not inverse-CUBE, as an earlier version used)
-            # is a deliberate choice: 1/ratio has constant elasticity
-            # (d(reward)/reward == -d(ratio)/ratio everywhere), so a given
-            # PROPORTIONAL fuel improvement is worth the same reward change
-            # at ratio=1.2 as at ratio=20 — unlike 1/ratio**3, which is steep
-            # near ratio=1 but has essentially zero gradient by ratio~10
-            # (100/10**3=0.1, 100/11**3=0.075 — a 10% fuel cut is worth
-            # 0.025 points, invisible next to ordinary terminal-velocity
-            # noise). That flat-tail problem was real: a live run sitting at
-            # ratio~13-17x reference showed total dv NOT improving over
-            # 26k+ episodes because the fuel term had nothing left to say.
-            # With 1/ratio: ratio=1->100, 1.5->66.7, 2->50, 3->33.3, 5->20,
-            # 10->10, 15->6.7, 20->5 — strong near the optimum (as before)
-            # AND still a meaningful, non-vanishing gradient at 20x+.
-            ratio = max(self.dv_used / self.dv_ref, 1.0)
-            reward_fuel = self.fuel_coeff / ratio
-            # Terminal-velocity (stopping) bonus: rewards arriving with LOW
-            # relative speed so the agent performs a real rendezvous (burn /
-            # coast / brake) instead of the min-Δv fly-through that
-            # position-only docking would otherwise favour — see
-            # ENV_STOP_COEFF in constants.py. Smooth 1/(1+v/scale) so the
-            # gradient keeps pulling toward vel_error -> 0; strictly additive,
-            # paid only on dock.
-            v_scale = self.stop_vel_scale_frac * self.dv_ref
-            reward_stop = self.stop_coeff / (1.0 + vel_error / v_scale)
+            self.braking_phase = True
+            terminated = False
+            truncated = False
         else:
-            reward_fuel = 0.0
-            reward_stop = 0.0
+            terminated = bool(out_of_bounds)
+            truncated = bool(timeout)
 
-        reward_terminal = self.bonus if docked else 0.0
-        reward = reward_pos + reward_fuel + reward_stop + reward_terminal
+        reward = reward_pos
 
         observation = self._build_observation()
         info = {
@@ -483,7 +467,9 @@ class CWRendezvousEnv(gym.Env):
             "substates":       substates,
             "coast_units":     coast_units,
             "distance":        pos_error,
-            "docked":          docked,
+            # Dock is completed only after the brake; report False here so the
+            # episode is credited as docked on the terminal _brake_step.
+            "docked":          False,
             "reward_pos":      reward_pos,
             "reward_fuel":     reward_fuel,
             "reward_stop":     reward_stop,
@@ -496,6 +482,76 @@ class CWRendezvousEnv(gym.Env):
             "dv_budget_coeff": self.dv_budget_coeff,
             "curriculum_distance": self.curriculum_distance,
             "excursion_limit": self.excursion_limit,
+            "braking_phase":   self.braking_phase,
         }
 
         return observation, reward, terminated, truncated, info
+
+    def _brake_step(self, action: np.ndarray):
+        """Terminal braking phase (entered the step AFTER the target is
+        reached; see step()). This action is the agent's final impulse to null
+        its arrival velocity — a true rendezvous rather than a fly-through.
+        There is NO coast: the impulse is applied at the target and the episode
+        terminates immediately, scored on the post-brake speed.
+
+        The minimum-impulse deadzone is deliberately NOT applied here: the
+        optimal brake can be well below it (a fly-through arrives at ~0.21·dv_ref
+        while the coast deadzone is 0.3·dv_ref), so zeroing sub-deadzone burns
+        would make a full stop physically unrepresentable. The total-episode Δv
+        budget still applies (clip, don't zero), same as the transfer step."""
+        half = self.phys_dim // 2
+        u = np.clip(action[: self.impulse_dim], -1.0, 1.0)
+        impulse = u * self.max_dv
+        burn = float(np.linalg.norm(impulse))
+
+        if self.dv_budget is not None:
+            remaining = self.dv_budget - self.dv_used
+            if remaining <= 0.0:
+                impulse = np.zeros_like(impulse)
+                burn = 0.0
+            elif burn > remaining:
+                impulse = impulse * (remaining / burn)
+                burn = remaining
+        self.dv_used += burn
+
+        # Impulsive brake changes velocity only; position stays at the snapped
+        # closest-approach point recorded at arrival.
+        self.state[half:] += impulse
+        pos_error = float(np.linalg.norm(self.state[:half]))
+        vel_error = float(np.linalg.norm(self.state[half:]))
+
+        # Terminal reward, now that the dock is complete: flat dock bonus + fuel
+        # bonus on TOTAL dv (transfer + brake, floored at ratio 1 — see
+        # ENV_FUEL_COEFF) + stopping bonus on the post-brake speed (smooth toward
+        # vel_error -> 0, sized to outweigh the brake's Δv — see ENV_STOP_COEFF).
+        ratio = max(self.dv_used / self.dv_ref, 1.0)
+        reward_fuel = self.fuel_coeff / ratio
+        v_scale = self.stop_vel_scale_frac * self.dv_ref
+        reward_stop = self.stop_coeff / (1.0 + vel_error / v_scale)
+        reward_terminal = self.bonus
+        reward_pos = 0.0
+        reward = reward_pos + reward_fuel + reward_stop + reward_terminal
+
+        self.braking_phase = False
+        observation = self._build_observation()
+        info = {
+            "state":           self.state.copy(),
+            "substates":       [self.state.copy()],
+            "coast_units":     0,
+            "distance":        pos_error,
+            "docked":          True,
+            "reward_pos":      reward_pos,
+            "reward_fuel":     reward_fuel,
+            "reward_stop":     reward_stop,
+            "reward_terminal": reward_terminal,
+            "vel_error":       vel_error,
+            "delta_v":         burn,
+            "applied_action":  impulse.copy(),
+            "dv_used":         self.dv_used,
+            "dv_ref":          self.dv_ref,
+            "dv_budget_coeff": self.dv_budget_coeff,
+            "curriculum_distance": self.curriculum_distance,
+            "excursion_limit": self.excursion_limit,
+            "braking_phase":   False,
+        }
+        return observation, reward, True, False, info
