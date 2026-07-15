@@ -13,6 +13,8 @@ from libs.constants import (
     ENV_POS_TOLERANCE,
     ENV_TIMEOUT,
     ENV_VEL_COEFF,
+    ENV_STOP_COEFF,
+    ENV_STOP_VEL_SCALE_FRAC,
     ENV_SHAPING_COEFF,
     OMEGA,
     ENV_CURRICULUM_ENABLED,
@@ -124,6 +126,8 @@ class CWRendezvousEnv(gym.Env):
         pos_tolerance: float = ENV_POS_TOLERANCE,
         vel_coeff: float = ENV_VEL_COEFF,
         fuel_coeff: float = ENV_FUEL_COEFF,
+        stop_coeff: float = ENV_STOP_COEFF,
+        stop_vel_scale_frac: float = ENV_STOP_VEL_SCALE_FRAC,
         bonus: float = ENV_BONUS,
         scenario: str = SCENARIO,
         curriculum_enabled: bool = ENV_CURRICULUM_ENABLED,
@@ -179,6 +183,8 @@ class CWRendezvousEnv(gym.Env):
         self.pos_tolerance = pos_tolerance
         self.vel_coeff = vel_coeff
         self.fuel_coeff = fuel_coeff
+        self.stop_coeff = stop_coeff
+        self.stop_vel_scale_frac = stop_vel_scale_frac
         self.bonus = bonus
 
         # --- Curriculum ---
@@ -455,12 +461,21 @@ class CWRendezvousEnv(gym.Env):
             # AND still a meaningful, non-vanishing gradient at 20x+.
             ratio = max(self.dv_used / self.dv_ref, 1.0)
             reward_fuel = self.fuel_coeff / ratio
+            # Terminal-velocity (stopping) bonus: rewards arriving with LOW
+            # relative speed so the agent performs a real rendezvous (burn /
+            # coast / brake) instead of the min-Δv fly-through that
+            # position-only docking would otherwise favour — see
+            # ENV_STOP_COEFF in constants.py. Smooth 1/(1+v/scale) so the
+            # gradient keeps pulling toward vel_error -> 0; strictly additive,
+            # paid only on dock.
+            v_scale = self.stop_vel_scale_frac * self.dv_ref
+            reward_stop = self.stop_coeff / (1.0 + vel_error / v_scale)
         else:
             reward_fuel = 0.0
-
+            reward_stop = 0.0
 
         reward_terminal = self.bonus if docked else 0.0
-        reward = reward_pos + reward_fuel + reward_terminal
+        reward = reward_pos + reward_fuel + reward_stop + reward_terminal
 
         observation = self._build_observation()
         info = {
@@ -471,6 +486,7 @@ class CWRendezvousEnv(gym.Env):
             "docked":          docked,
             "reward_pos":      reward_pos,
             "reward_fuel":     reward_fuel,
+            "reward_stop":     reward_stop,
             "reward_terminal": reward_terminal,
             "vel_error":       vel_error,
             "delta_v":         np.linalg.norm(action),

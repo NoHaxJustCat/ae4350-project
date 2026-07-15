@@ -76,6 +76,7 @@ def run_episode(model, scenario: str, sign: float, max_steps: int = MAX_STEPS) -
         "steps": step + 1,
         "docked": info.get("docked", False),
         "final_distance": info.get("distance", np.nan),
+        "final_vel": info.get("vel_error", np.nan),
         "total_dv": info.get("dv_used", 0.0),
         "start_state": states[0] if states else None,
         "total_reward": float(np.sum(rewards)) if rewards else 0.0,
@@ -87,7 +88,10 @@ def print_summary(label: str, result: dict, scenario: str):
     print(f"\n=== {label} ===")
     print(f"Steps: {r['steps']}  docked: {r['docked']}  "
           f"final distance: {r['final_distance']:.4f} m  total reward: {r['total_reward']:.2f}")
-    print(f"Total dv used: {r['total_dv']:.5f} m/s")
+    # Arrival speed: with position-only docking a fly-through arrives fast; the
+    # references assume a full stop, so this tells you whether the learned Δv is
+    # a like-for-like comparison (arrival speed -> 0 = true rendezvous).
+    print(f"Total dv used: {r['total_dv']:.5f} m/s   arrival speed: {r.get('final_vel', float('nan')):.5f} m/s")
 
     start = r["start_state"]
     if start is None:

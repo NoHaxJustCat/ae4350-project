@@ -648,7 +648,11 @@ class TrainingCallback(BaseCallback):
             acc["delta_v"] += info.get("delta_v", 0.0)
             acc["r_pos"]   += info.get("reward_pos", 0.0)
             acc["r_fuel"]  += info.get("reward_fuel", 0.0)
-            acc["r_term"]  += info.get("reward_terminal", 0.0)
+            # r_term panel = dock bonus + stopping (terminal-velocity) bonus;
+            # both are dock-conditional terminal terms, so folding stop in here
+            # keeps r_pos+r_fuel+r_term == total reward and lets the panel rise
+            # as arrivals get slower (see ENV_STOP_COEFF in constants.py).
+            acc["r_term"]  += info.get("reward_terminal", 0.0) + info.get("reward_stop", 0.0)
             if info.get("docked", False):
                 acc["docked"] = True
 

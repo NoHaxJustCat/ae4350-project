@@ -112,6 +112,30 @@ ENV_BONUS = 50.0
 # is worth 6.7 vs 6.25 at the same two points, an actually learnable signal.
 ENV_FUEL_COEFF = 500.0
 
+# --- Terminal-velocity (stopping) bonus ---
+# Paid ONLY on a successful dock and strictly ADDITIVE (like the fuel bonus),
+# so it can never make failing to dock look better than docking. It rewards
+# arriving with LOW relative velocity — an actual rendezvous rather than a
+# fly-through. This is necessary because docking is position-only (within
+# ENV_POS_TOLERANCE, no velocity gate): the minimum-Δv way to satisfy that is a
+# SINGLE impulse coasting through the origin at speed (~0.21x dv_ref, arriving
+# at ~0.0575 m/s for a 1000 m V-bar transfer), which BEATS the analytic
+# references purely because it never brakes. Both classical strategies in
+# CLAUDE.md include the stopping burn, so without this term the learned Δv
+# isn't comparable to them. With it, the optimum becomes burn / coast ~1 orbit
+# / brake — which reproduces the two-V-bar reference Δv (0.1149 m/s) exactly.
+#
+# Smooth 1/(1 + vel_error/v_scale) decay (NOT the fuel term's floored 1/ratio)
+# so the gradient keeps pulling toward vel_error -> 0 instead of saturating
+# once "close enough". v_scale is per-episode (a fraction of dv_ref, m/s) for
+# the same distance-invariance reason as ENV_MAX_DV_COEFF & friends. At 0.05, a
+# fly-through arriving at ~0.21x dv_ref lands at ~1/(1+4.2) ≈ 0.19x the peak,
+# while a true stop gets ~1x — a clear, learnable gap. COEFF=300 makes a
+# stopped dock decisively better than a fly-through even though both saturate
+# the (floored-at-ratio-1) fuel bonus when below dv_ref.
+ENV_STOP_COEFF = 300.0
+ENV_STOP_VEL_SCALE_FRAC = 0.05
+
 # Physical per-burn actuator cap: max_dv = dv_ref * ENV_MAX_DV_COEFF, set per
 # episode in CWRendezvousEnv.reset() from that scenario/distance's analytic
 # reference Δv (libs/reference.py). Relative to dv_ref rather than a fixed
