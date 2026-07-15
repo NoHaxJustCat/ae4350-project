@@ -10,10 +10,10 @@
         --lr 1e-4 --torch-threads 5 --total-timesteps 10000000
         --checkpoint-freq 100000 --keep-last-checkpoints 2 --run-tag ikitworks
 
-    Also enables --fuel-curriculum: a no-op until the distance curriculum
-    reaches ENV_CURRICULUM_MAX_DISTANCE (1000 m), at which point it starts
-    ratcheting down a total per-episode Δv budget (see
-    training.py's DvBudgetCurriculumCallback / CLAUDE.md).
+    Does NOT enable --fuel-curriculum (the Δv-budget ratchet): with the
+    terminal braking phase + stopping bonus now driving Δv efficiency
+    directly, the budget's generous 3x floor is non-binding and just adds a
+    moving part. Re-add --fuel-curriculum below if you want it back.
 .USAGE
     .\runs\smart_cuda.ps1                  # auto-generated timestamp run-tag
     .\runs\smart_cuda.ps1 -RunTag mytag2    # named run-tag
@@ -23,7 +23,7 @@
 param(
     [string]$RunTag = "smart_cuda_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
     [string]$Scenario = "vbar",
-    [int]$TotalTimesteps = 200000
+    [int]$TotalTimesteps = 300000
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,5 +50,4 @@ Write-Host "Launching training: scenario=$Scenario run-tag=$RunTag total-timeste
     --total-timesteps $TotalTimesteps `
     --checkpoint-freq 200000 `
     --keep-last-checkpoints 2 `
-    --fuel-curriculum `
     --run-tag $RunTag
