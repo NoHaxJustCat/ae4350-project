@@ -23,7 +23,7 @@
 param(
     [string]$RunTag = "smart_cuda_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
     [string]$Scenario = "vbar",
-    [int]$TotalTimesteps = 300000
+    [int]$TotalTimesteps = 200000
 )
 
 $ErrorActionPreference = "Stop"

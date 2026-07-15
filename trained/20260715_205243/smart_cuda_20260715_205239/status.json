@@ -1,0 +1,1 @@
+{"scenario": "vbar", "run_tag": "smart_cuda_20260715_205239", "num_timesteps": 149628, "total_timesteps": 150000, "episode_count": 81505, "recent_dock_rate": 1.0, "recent_avg_reward": 604.5805983499998, "curriculum_distance": 1000.0, "dv_budget_coeff": NaN, "elapsed_seconds": 2316.4767098999946, "steps_per_sec": 64.59292224287445, "updated_at": "2026-07-15 21:31:27"}

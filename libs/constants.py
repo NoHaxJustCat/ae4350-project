@@ -316,10 +316,10 @@ OU_DT    = 0.01   # so the amplification-factor math below can't silently drift
 OU_STD_PER_SIGMA = (2 * OU_THETA - OU_THETA ** 2 * OU_DT) ** -0.5
 
 ACTION_NOISE_STD_START = 0.15
-ACTION_NOISE_STD_END   = 0.001
+ACTION_NOISE_STD_END   = 0.005
 ACTION_NOISE_SIGMA_START = ACTION_NOISE_STD_START / OU_STD_PER_SIGMA
 ACTION_NOISE_SIGMA_END   = ACTION_NOISE_STD_END / OU_STD_PER_SIGMA
-NOISE_DECAY_FRAC = 0.25  # ~3x faster than the old 0.7 — noise was still near
+NOISE_DECAY_FRAC = 0.75  # ~3x faster than the old 0.7 — noise was still near
 # sigma_start at 20% of training, starving the agent of low-noise fuel-
 # efficiency practice for the back 80% of the run.
 
