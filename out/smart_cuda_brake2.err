@@ -1,0 +1,6 @@
+E:\Github\AE4350 Project\.conda\Lib\site-packages\gymnasium\utils\env_checker.py:317: UserWarning: [33mWARN: A Box observation space minimum value is -infinity. This is probably too low.[0m
+  logger.warn(
+E:\Github\AE4350 Project\.conda\Lib\site-packages\gymnasium\utils\env_checker.py:321: UserWarning: [33mWARN: A Box observation space maximum value is infinity. This is probably too high.[0m
+  logger.warn(
+E:\Github\AE4350 Project\.conda\Lib\site-packages\gymnasium\utils\env_checker.py:440: UserWarning: [33mWARN: Not able to test alternative render modes due to the environment not having a spec. Try instantiating the environment through `gymnasium.make`[0m
+  logger.warn(

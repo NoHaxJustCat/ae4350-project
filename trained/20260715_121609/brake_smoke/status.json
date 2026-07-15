@@ -1,0 +1,1 @@
+{"scenario": "vbar", "run_tag": "brake_smoke", "num_timesteps": 6500, "total_timesteps": 6500, "episode_count": 3098, "recent_dock_rate": 0.0, "recent_avg_reward": -10.00926365, "curriculum_distance": 30.0, "dv_budget_coeff": NaN, "elapsed_seconds": 232.24631000000045, "steps_per_sec": 27.987527552106155, "updated_at": "2026-07-15 12:20:04"}

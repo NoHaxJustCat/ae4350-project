@@ -1,0 +1,27 @@
+Platform: Windows | torch main-process threads: 5 | cpu_count: 6
+E:\Github\AE4350 Project\.conda\Lib\site-packages\gymnasium\utils\env_checker.py:317: UserWarning: WARN: A Box observation space minimum value is -infinity. This is probably too low.
+  logger.warn(
+E:\Github\AE4350 Project\.conda\Lib\site-packages\gymnasium\utils\env_checker.py:321: UserWarning: WARN: A Box observation space maximum value is infinity. This is probably too high.
+  logger.warn(
+E:\Github\AE4350 Project\.conda\Lib\site-packages\gymnasium\utils\env_checker.py:440: UserWarning: WARN: Not able to test alternative render modes due to the environment not having a spec. Try instantiating the environment through `gymnasium.make`
+  logger.warn(
+Environment check completed in 0.02s
+run_dir: trained\20260715_103412\smart_cuda_20260714_203727_ft
+WARNING: no curriculum sidecar at out\smart_cuda_1000\vbar_td3.curriculum.json ù curriculum will restart at 30.0 m
+vec_env: DummyVecEnv
+net_arch: [256, 256] | train_freq: 1 | gradient_steps: -1
+Resumed model from out/smart_cuda_1000/vbar_td3.zip at 200004 timesteps (199996 remaining toward --total-timesteps 400000)
+    ep | steps |    reward |    r_pos |   r_fuel |   r_term |    noise |  dv/ref |  cur_d | docked | cur_prog |    ms/ep
+---------------------------------------------------------------------------------------------------------------------------
+     0 |     7 |     94.49 |     8.38 |    36.11 |    50.00 |   0.0500 |   13.85 |   30.0 | 100.0% |      0/0 |    911.7
+    10 |    11 |    -10.02 |   -10.02 |     0.00 |     0.00 |   0.0499 |   23.16 |   30.0 |  50.0% |      6/6 |    794.5
+    20 |     6 |    103.33 |     8.41 |    44.92 |    50.00 |   0.0498 |   11.13 |   30.0 |  90.0% |    11/17 |    451.4
+[curriculum] dock rate >= 50% -> advancing to 40.0 m
+    30 |    12 |    -10.11 |   -10.11 |     0.00 |     0.00 |   0.0497 |   22.27 |   40.0 |  10.0% |      0/7 |   1981.6
+    40 |    15 |    -10.13 |   -10.13 |     0.00 |     0.00 |   0.0496 |   27.22 |   40.0 |   0.0% |     0/18 |   1080.4
+    50 |    13 |    -10.17 |   -10.17 |     0.00 |     0.00 |   0.0494 |   23.60 |   40.0 |   0.0% |      0/6 |    923.7
+    60 |     6 |    102.81 |     8.80 |    44.01 |    50.00 |   0.0491 |   11.36 |   40.0 |  90.0% |     8/18 |    423.8
+[curriculum] dock rate >= 50% -> advancing to 50.0 m
+    70 |     6 |    103.50 |     9.10 |    44.39 |    50.00 |   0.0491 |   11.26 |   50.0 | 100.0% |      6/6 |    427.2
+    80 |     6 |    101.02 |     9.08 |    41.94 |    50.00 |   0.0490 |   11.92 |   50.0 | 100.0% |    15/15 |    422.3
+[curriculum] dock rate >= 50% -> advancing to 60.0 m

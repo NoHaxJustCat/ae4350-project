@@ -1,0 +1,1 @@
+{"scenario": "vbar", "run_tag": "stop_smoke", "num_timesteps": 6500, "total_timesteps": 6500, "episode_count": 4179, "recent_dock_rate": 0.6, "recent_avg_reward": 319.11460185, "curriculum_distance": 60.0, "dv_budget_coeff": NaN, "elapsed_seconds": 276.23798110000007, "steps_per_sec": 23.530435511136155, "updated_at": "2026-07-15 11:29:21"}
