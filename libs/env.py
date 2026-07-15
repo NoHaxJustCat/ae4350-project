@@ -215,6 +215,20 @@ class CWRendezvousEnv(gym.Env):
         else:
             self.STM_np = _build_stm_full(omega, dt_phys)
 
+        # Precompute STM_phys^k for k = 1..(max coast length in substeps). A
+        # coast decision can span a whole orbit (~1440 fine substeps); stepping
+        # that as a Python loop dominated runtime. With these stacked powers the
+        # entire coast is ONE batched matmul (seq = powers[:total] @ s0) plus
+        # vectorized docking/OOB/timeout tests — byte-for-byte the same substep
+        # trajectory as the loop, just computed at once. Built once per env.
+        max_total_substeps = ENV_COAST_MAX_UNITS * self.n_substeps
+        powers = np.empty((max_total_substeps, self.phys_dim, self.phys_dim))
+        acc = np.eye(self.phys_dim)
+        for _k in range(max_total_substeps):
+            acc = self.STM_np @ acc
+            powers[_k] = acc
+        self._coast_powers = powers
+
         # --- Gym spaces ---
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float64
@@ -402,40 +416,68 @@ class CWRendezvousEnv(gym.Env):
         # spends ONE decision on a possibly orbit-long coast instead of having
         # to emit ~30 consecutive near-zero actions to reproduce it.
         self.state[half:] += action
-
-        # Coarse (agent-dt) samples of the coast leg for trajectory plotting,
-        # so a decision spanning a whole orbit still renders as a smooth arc
-        # rather than one straight chord. Burn point excluded (it coincides
-        # with the previous step's endpoint that callers already hold); we
-        # append interior agent-dt boundaries plus the true terminal point.
-        substates = []
+        s0 = self.state.copy()  # state at the burn point (start of the coast)
         total_substeps = coast_units * self.n_substeps
 
-        docked = out_of_bounds = timeout = False
-        for k in range(1, total_substeps + 1):
-            prev_pos = self.state[:half].copy()
-            self.state = self.STM_np @ self.state
-            self.elapsed_time += self.dt_phys
-            new_pos = self.state[:half]
+        # Whole coast in one batched matmul: seq[i] = STM_phys^(i+1) @ s0 for
+        # i = 0..total-1. EXACTLY the substep sequence the old per-substep loop
+        # produced (verified byte-identical), just vectorized.
+        seq = self._coast_powers[:total_substeps] @ s0     # (total, phys_dim)
+        pos_seq = seq[:, :half]                             # pos after each substep
+        prev_seq = np.vstack([s0[:half], pos_seq[:-1]])     # pos before each substep
 
-            closest, closest_dist = self._segment_closest_to_origin(prev_pos, new_pos)
-            if closest_dist < self.pos_tolerance:
-                docked = True
-                # Snap the recorded position to the closest-approach point so
-                # pos_error reflects the true miss distance; keep the coasted
-                # velocity for the terminal (vel_error) penalty.
-                self.state[:half] = closest
-                break
-            if np.linalg.norm(new_pos) > self.excursion_limit:
-                out_of_bounds = True
-                break
-            if self.elapsed_time > self.timeout:
-                timeout = True
-                break
-            if k % self.n_substeps == 0 and k < total_substeps:
-                substates.append(self.state.copy())
+        # Vectorized segment-closest-to-origin for every (prev, new) chord, so a
+        # fast fly-through the tolerance circle still registers between samples.
+        dvec = pos_seq - prev_seq
+        denom = np.einsum("ij,ij->i", dvec, dvec)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            tparam = np.where(
+                denom > 0.0,
+                np.clip(-np.einsum("ij,ij->i", prev_seq, dvec) / denom, 0.0, 1.0),
+                0.0,
+            )
+        closest = prev_seq + tparam[:, None] * dvec
+        closest_dist = np.linalg.norm(closest, axis=1)
+        new_dist = np.linalg.norm(pos_seq, axis=1)
 
-        substates.append(self.state.copy())  # true terminal / final endpoint
+        # First substep index (0-based) at which each terminal condition fires.
+        BIG = total_substeps + 1
+        dock_hits = np.flatnonzero(closest_dist < self.pos_tolerance)
+        oob_hits = np.flatnonzero(new_dist > self.excursion_limit)
+        i_dock = int(dock_hits[0]) if dock_hits.size else BIG
+        i_oob = int(oob_hits[0]) if oob_hits.size else BIG
+        # timeout: elapsed + (i+1)*dt_phys > timeout  ->  first i is floor(thresh)
+        thresh = (self.timeout - self.elapsed_time) / self.dt_phys
+        i_timeout = int(np.floor(thresh))
+        if not (0 <= i_timeout < total_substeps):
+            i_timeout = BIG
+
+        # Earliest event wins; within one substep the old loop's priority was
+        # dock > out-of-bounds > timeout, reproduced by the tie ordering here.
+        i_event = min(i_dock, i_oob, i_timeout)
+        if i_event == BIG:
+            i_end = total_substeps - 1
+            docked = out_of_bounds = timeout = False
+        else:
+            i_end = i_event
+            docked = i_event == i_dock
+            out_of_bounds = (not docked) and i_event == i_oob
+            timeout = (not docked) and (not out_of_bounds) and i_event == i_timeout
+
+        self.elapsed_time += (i_end + 1) * self.dt_phys
+        self.state = seq[i_end].copy()
+        if docked:
+            # Snap position to the closest-approach point (true miss distance);
+            # keep the coasted velocity for the terminal vel_error / stop bonus.
+            self.state[:half] = closest[i_end]
+
+        # Coarse (agent-dt) samples of the coast leg for trajectory plotting, so
+        # a decision spanning a whole orbit still renders as a smooth arc rather
+        # than one straight chord. Interior agent-dt boundaries reached before
+        # the terminal substep, plus the true terminal endpoint (matching the
+        # old loop's substate bookkeeping exactly).
+        substates = [seq[i].copy() for i in range(self.n_substeps - 1, i_end, self.n_substeps)]
+        substates.append(self.state.copy())
 
         pos_error = np.linalg.norm(self.state[:half])
         vel_error = np.linalg.norm(self.state[half:])
