@@ -576,7 +576,7 @@ class TrainingCallback(BaseCallback):
         print(
             f"{'ep':>6} | {'steps':>5} | {'reward':>9} | {'r_pos':>8} | "
             f"{'r_fuel':>8} | {'r_term':>8} | {'noise':>8} | "
-            f"{'dv/ref':>7} | {'cur_d':>6} | {'docked':>6} | {'cur_prog':>8} | {'ms/ep':>8}"
+            f"{'dv/opt':>7} | {'cur_d':>6} | {'docked':>6} | {'cur_prog':>8} | {'ms/ep':>8}"
         )
         print("-" * 123)
 
@@ -663,8 +663,11 @@ class TrainingCallback(BaseCallback):
 
                 cur_dist   = info.get("curriculum_distance", float("nan"))
                 noise_std  = self._current_noise_std()
-                dv_ref     = info.get("dv_ref", float("nan"))
-                dv_ratio   = acc["delta_v"] / dv_ref if dv_ref else float("nan")
+                # Graded against the TRUE achievable optimum for this episode's
+                # geometry (see libs/reference.py), so the column reads directly
+                # as "x optimal": 1.00 == matched the best maneuver that exists.
+                dv_opt     = info.get("dv_opt", float("nan"))
+                dv_ratio   = acc["delta_v"] / dv_opt if dv_opt else float("nan")
                 dv_budget_coeff = info.get("dv_budget_coeff")
                 dv_budget_coeff = float(dv_budget_coeff) if dv_budget_coeff is not None else float("nan")
 

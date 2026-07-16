@@ -15,6 +15,7 @@ from libs.constants import (
     ENV_VEL_COEFF,
     ENV_STOP_COEFF,
     ENV_STOP_VEL_SCALE_FRAC,
+    ENV_FUEL_OPT_FLOOR,
     ENV_SHAPING_COEFF,
     OMEGA,
     ENV_CURRICULUM_ENABLED,
@@ -34,7 +35,11 @@ from libs.constants import (
 )
 from scipy.linalg import expm
 
-from libs.reference import dv_rbar_strategy_rv, dv_vbar_two_impulse_rr
+from libs.reference import (
+    dv_rbar_strategy_rv,
+    dv_vbar_two_impulse_rr,
+    optimal_two_impulse_stop_dv_per_m,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -229,10 +234,31 @@ class CWRendezvousEnv(gym.Env):
             low=-1.0, high=1.0, shape=(self.action_dim,), dtype=np.float64
         )
 
+        # True achievable optimum Δv for THIS scenario's geometry, per metre of
+        # initial distance (CW is linear, so it scales exactly with the spawn
+        # distance — see libs/reference.py). Computed once here, not per reset.
+        # The fuel bonus is graded against this rather than dv_ref so the agent
+        # is pushed toward the best maneuver that actually exists for its own
+        # initial condition, in BOTH scenarios: for "vbar" that is the analytic
+        # two-V-bar transfer; for "rbar" it is ~33% better than the analytic
+        # R-bar+V-bar strategy (and strategy 2's cheaper figure is unreachable
+        # from this geometry, so it must NOT be the target).
+        self._dv_opt_per_m = optimal_two_impulse_stop_dv_per_m(
+            self._sample_direction_for(sign=1.0), omega
+        )
+
         self.state = None
         self._forced_sign = None
 
     # ── Initial-condition sampling ───────────────────────────────────────────
+
+    def _sample_direction_for(self, sign: float) -> np.ndarray:
+        """Unit in-plane displacement direction ([x, z]) for a given sign."""
+        if self.scenario == "vbar":
+            return np.array([sign, 0.0], dtype=np.float64)
+        # "rbar": (+x,-z) or (-x,+z) — opposite-sign coupled displacement
+        raw = np.array([sign * self.rbar_x_to_z_ratio, -sign], dtype=np.float64)
+        return raw / np.linalg.norm(raw)
 
     def _sample_direction(self) -> np.ndarray:
         """Unit direction vector for this episode's initial displacement.
@@ -243,11 +269,7 @@ class CWRendezvousEnv(gym.Env):
             sign = float(self._forced_sign)
         else:
             sign = 1.0 if self.np_random.random() < 0.5 else -1.0
-        if self.scenario == "vbar":
-            return np.array([sign, 0.0], dtype=np.float64)
-        # "rbar": (+x,-z) or (-x,+z) — opposite-sign coupled displacement
-        raw = np.array([sign * self.rbar_x_to_z_ratio, -sign], dtype=np.float64)
-        return raw / np.linalg.norm(raw)
+        return self._sample_direction_for(sign)
 
     def _sample_initial_state(self) -> np.ndarray:
         direction = self._sample_direction()
@@ -307,6 +329,13 @@ class CWRendezvousEnv(gym.Env):
             self.dv_ref = dv_rbar_strategy_rv(np.linalg.norm(self.state[:half]), self.omega)
             # TODO: divide by the amount required actually to reach... could use half as approximation
             
+        # True achievable optimum for this episode's start (scales linearly with
+        # distance). Used ONLY to grade the fuel bonus / report efficiency —
+        # deliberately NOT used for max_dv, the deadzone, the Δv budget or the
+        # dv_used observation scale, which all stay pinned to dv_ref so the
+        # action semantics (and therefore existing trained models) are unchanged.
+        self.dv_opt = self._dv_opt_per_m * np.linalg.norm(self.state[:half])
+
         self.max_dv = self.dv_ref * self.max_dv_coeff
         self.dv_budget = (
             None if self.dv_budget_coeff is None else self.dv_ref * self.dv_budget_coeff
@@ -513,6 +542,7 @@ class CWRendezvousEnv(gym.Env):
             "applied_action":  action.copy(),
             "dv_used":         self.dv_used,
             "dv_ref":          self.dv_ref,
+            "dv_opt":          self.dv_opt,
             "dv_budget_coeff": self.dv_budget_coeff,
             "curriculum_distance": self.curriculum_distance,
             "excursion_limit": self.excursion_limit,
@@ -555,27 +585,34 @@ class CWRendezvousEnv(gym.Env):
         vel_error = float(np.linalg.norm(self.state[half:]))
 
         # Terminal reward, now that the dock is complete: flat dock bonus + fuel
-        # bonus on TOTAL dv (transfer + brake, FLOORED at ratio 1 — see
-        # ENV_FUEL_COEFF) + stopping bonus on the post-brake speed.
+        # bonus on TOTAL dv (transfer + brake) + stopping bonus on the post-brake
+        # speed.
         #
-        # The floor is deliberate, and was RESTORED after an un-floored variant
-        # (coeff/(ratio+eps), gated by stop_quality) collapsed training. Without
-        # it, "less Δv is always better" makes the optimizer ride the physical
-        # feasibility edge (~0.42x dv_ref — the softest burn that still reaches),
-        # where the transfer burn is only ~0.14 in normalized action units and
-        # exploration noise is ~25% of it. The actor saturated, every episode
-        # flew to the excursion boundary, the buffer filled with failures and the
-        # curriculum regressed 1000 -> 630 m. It bought ~1% (1.15x -> 1.14x of
-        # the two-V-bar optimum) before breaking. The floor instead leaves a wide
-        # STABLE plateau: everything at or below dv_ref scores the same, so the
-        # policy settles with margin (the proven ~1.15x rendezvous) instead of on
-        # a knife edge. NOTE for scenarios whose optimal strategy is far below
-        # dv_ref (e.g. "rbar", where two V-bar impulses cost only ~1/6 of the
-        # R-bar+V-bar dv_ref) the floor also removes any pressure to find it.
+        # The fuel bonus is graded against dv_opt — the TRUE achievable optimum
+        # for this episode's own geometry (libs/reference.py) — not against
+        # dv_ref, so ratio_opt reads directly as "x optimal" (1.0 == matched the
+        # best maneuver that physically exists from this start). This is what
+        # pushes the policy toward the optimum in BOTH scenarios; grading against
+        # dv_ref instead left everything below the reference on one flat plateau,
+        # which for "rbar" would have let the policy stop at the worse analytic
+        # strategy.
+        #
+        # FLOORED at ENV_FUEL_OPT_FLOOR (just BELOW 1.0) — this floor is lore:
+        #   * It must not be removed. An un-floored coeff/(ratio+eps) collapsed
+        #     training: "less Δv is always better" drove the optimizer onto the
+        #     physical feasibility edge, the actor saturated, every episode flew
+        #     to the excursion boundary and the curriculum regressed 1000->630 m,
+        #     all for ~1% of Δv. Lowering noise 0.15->0.05 did not prevent it.
+        #   * It must not be raised to 1.0 either, or matching the optimum would
+        #     saturate and there'd be no pressure to beat it.
+        # Sitting just under 1.0 gives a small, BOUNDED headroom for beating the
+        # analytic optimum (peak = coeff/floor, only ~11% above the at-optimum
+        # reward) so the pull is a gentle nudge rather than the runaway chase
+        # that broke the un-floored version.
         v_scale = self.stop_vel_scale_frac * self.dv_ref
         stop_quality = 1.0 / (1.0 + vel_error / v_scale)   # in (0, 1]
-        ratio = max(self.dv_used / self.dv_ref, 1.0)
-        reward_fuel = self.fuel_coeff / ratio
+        ratio_opt = max(self.dv_used / self.dv_opt, ENV_FUEL_OPT_FLOOR)
+        reward_fuel = self.fuel_coeff / ratio_opt
         reward_stop = self.stop_coeff * stop_quality
         reward_terminal = self.bonus
         reward_pos = 0.0
@@ -598,6 +635,7 @@ class CWRendezvousEnv(gym.Env):
             "applied_action":  impulse.copy(),
             "dv_used":         self.dv_used,
             "dv_ref":          self.dv_ref,
+            "dv_opt":          self.dv_opt,
             "dv_budget_coeff": self.dv_budget_coeff,
             "curriculum_distance": self.curriculum_distance,
             "excursion_limit": self.excursion_limit,

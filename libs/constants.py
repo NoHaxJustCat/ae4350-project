@@ -99,37 +99,41 @@ ENV_VEL_COEFF = 10.0
 ENV_SHAPING_COEFF = 10.0
 ENV_BONUS = 50.0
 # Fuel bonus (paid only on a successful dock, in _brake_step):
-#     reward_fuel = coeff / max(dv_used/dv_ref, 1)
+#     reward_fuel = coeff / max(dv_used/dv_opt, ENV_FUEL_OPT_FLOOR)
 # Constant-elasticity 1/ratio decay (a given PROPORTIONAL fuel improvement is
 # worth the same relative reward change at ratio=20 as at ratio=1.2, so the
 # gradient never vanishes at high ratio — an earlier 1/ratio**3 went flat by
-# ratio~10 and a live run sat at 13-17x for 26k+ episodes), graded against
-# dv_ref, the analytic reference for this episode's scenario/distance
-# (libs/reference.py). Strictly additive on top of the dock bonus, so it can
-# never make failing to dock look better than a wasteful dock.
+# ratio~10 and a live run sat at 13-17x for 26k+ episodes). Strictly additive on
+# top of the dock bonus, so it can never make failing to dock look better than a
+# wasteful dock.
 #
-# THE FLOOR AT ratio 1 IS LORE — do not remove it without reading this.
-# It makes the reward FLAT for every solution at or below dv_ref, i.e. a wide
-# stable plateau rather than a peak. That looks like "no incentive to beat the
-# reference", and an un-floored variant was tried to fix exactly that
-# (coeff/(ratio+eps), gated by stop_quality so a brake-skipping fly-through
-# couldn't win). It collapsed training: with no floor, "less Δv is always
-# better" drives the optimizer onto the physical feasibility edge (~0.42x
-# dv_ref, the softest burn that still reaches the target), where the transfer
-# burn is only ~0.14 in normalized action units while exploration noise is ~25%
-# of it. The actor saturated, every episode flew to the excursion boundary, the
-# replay buffer filled with failures, and the curriculum regressed 1000 -> 630 m
-# — after buying just ~1% (1.15x -> 1.14x of the two-V-bar optimum). Lowering
-# noise (0.15 -> 0.05) did NOT prevent it. With the floor, the policy settles
-# with margin at the proven ~1.15x rendezvous.
-#
-# CAVEAT for new scenarios: the floor also removes any pressure to go below
-# dv_ref. That is harmless for "vbar" (the two-V-bar optimum is 4/(3*pi) ~= 0.42
-# of dv_ref and the policy lands near it anyway), but for "rbar" dv_ref is the
-# R-bar+V-bar strategy (3*w*dz) while the two-V-bar strategy costs only
-# (w/2)*dz ~= 1/6 of it — so the floor would let an rbar policy stop at the
-# WORSE reference strategy. Revisit the floor level there if goal 2 needs it.
+# Graded against dv_opt — the TRUE achievable optimum for the episode's own
+# geometry (libs/reference.py::optimal_two_impulse_stop_dv_per_m) — NOT against
+# dv_ref. So the ratio reads directly as "x optimal" and the policy is pushed to
+# match/beat the best maneuver that physically exists, in BOTH scenarios.
+# Grading against dv_ref instead put every solution below the reference on one
+# flat plateau: harmless for "vbar" (its optimum is 0.42x dv_ref and the policy
+# lands near it anyway) but for "rbar" it would have let the policy settle on
+# the WORSE analytic strategy, since rbar's dv_ref is the R-bar+V-bar maneuver
+# and the true optimum is ~33% cheaper than that.
 ENV_FUEL_COEFF = 500.0
+# Floor on dv_used/dv_opt. BOTH SIDES OF THIS NUMBER ARE LOAD-BEARING:
+#   * Do NOT remove the floor. An un-floored coeff/(ratio+eps) collapsed
+#     training: "less Δv is always better" drove the optimizer onto the physical
+#     feasibility edge (the softest burn that still reaches), the actor
+#     saturated, every episode flew to the excursion boundary, the replay buffer
+#     filled with failures and the curriculum regressed 1000 -> 630 m — all for
+#     ~1% of Δv (1.15x -> 1.14x of optimal). Lowering exploration noise
+#     0.15 -> 0.05 did NOT prevent it.
+#   * Do NOT raise it to 1.0, or merely MATCHING the analytic optimum would
+#     saturate the bonus and nothing would push the policy to beat it.
+# 0.9 gives 10% headroom below the optimum: enough to reward genuinely beating
+# it, while capping the peak at coeff/0.9 — only ~11% above the at-optimum
+# reward — so the incentive is a gentle nudge, not the runaway chase that broke
+# the un-floored version. For scale: a MISS forfeits the whole ~1050-point
+# terminal reward, so shaving the last few % of Δv only pays if it adds under
+# ~6% miss risk. That is exactly the margin-preserving trade we want.
+ENV_FUEL_OPT_FLOOR = 0.9
 
 # --- Terminal-velocity (stopping) bonus ---
 # Paid ONLY on a successful dock and strictly ADDITIVE (like the fuel bonus),

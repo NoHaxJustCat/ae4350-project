@@ -77,6 +77,7 @@ def run_episode(model, scenario: str, sign: float, max_steps: int = MAX_STEPS) -
         "docked": info.get("docked", False),
         "final_distance": info.get("distance", np.nan),
         "final_vel": info.get("vel_error", np.nan),
+        "dv_opt": info.get("dv_opt"),
         "total_dv": info.get("dv_used", 0.0),
         "start_state": states[0] if states else None,
         "total_reward": float(np.sum(rewards)) if rewards else 0.0,
@@ -97,6 +98,15 @@ def print_summary(label: str, result: dict, scenario: str):
     if start is None:
         return
     dx, dz = abs(start[0]), abs(start[1])
+
+    # The headline number: the best Δv physically achievable from THIS start
+    # (libs/reference.py). Unlike the analytic formulas below, each of which
+    # assumes its own maneuver geometry, this is always applicable — so
+    # "x optimal" is the meaningful score. 1.00x == matched the true optimum.
+    dv_opt = r.get("dv_opt")
+    if dv_opt:
+        print(f"True achievable optimum (2-impulse, this geometry): {dv_opt:.5f} m/s "
+              f"({r['total_dv'] / dv_opt:.2f}x optimal)")
 
     if scenario == "vbar":
         # Goal 1: compare against BOTH reference two-impulse strategies.
