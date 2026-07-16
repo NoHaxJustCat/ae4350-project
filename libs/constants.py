@@ -98,33 +98,38 @@ ENV_POS_TOLERANCE = 5.0
 ENV_VEL_COEFF = 10.0
 ENV_SHAPING_COEFF = 10.0
 ENV_BONUS = 50.0
-# Fuel bonus (paid only on a successful dock, in _brake_step). Constant-
-# elasticity 1/ratio decay in ratio = dv_used/dv_ref, but NO LONGER floored at
-# ratio 1: reward_fuel = coeff / (ratio + ENV_FUEL_RATIO_EPS) * stop_quality.
+# Fuel bonus (paid only on a successful dock, in _brake_step):
+#     reward_fuel = coeff / max(dv_used/dv_ref, 1)
+# Constant-elasticity 1/ratio decay (a given PROPORTIONAL fuel improvement is
+# worth the same relative reward change at ratio=20 as at ratio=1.2, so the
+# gradient never vanishes at high ratio — an earlier 1/ratio**3 went flat by
+# ratio~10 and a live run sat at 13-17x for 26k+ episodes), graded against
+# dv_ref, the analytic reference for this episode's scenario/distance
+# (libs/reference.py). Strictly additive on top of the dock bonus, so it can
+# never make failing to dock look better than a wasteful dock.
 #
-# Two deliberate design points:
-#   1. NO floor at ratio 1 (was max(ratio,1)). The floor made the reward flat
-#      once dv_used dropped below dv_ref, so the analytic reference acted as a
-#      "target" the agent had no reason to beat — a run would settle anywhere
-#      under 1x (e.g. ~0.49x) with zero pressure to go lower. Removing it lets
-#      the agent keep being rewarded for going below the reference and discover
-#      its OWN most-efficient strategy (which, with 2-D control, may beat the
-#      pure two-V-bar transfer). dv_ref now serves only as a distance-invariant
-#      NORMALIZING scale, not as a goalpost. eps bounds the peak (coeff/eps) and
-#      the divide as ratio->0; a real reach-AND-stop maneuver has a physical Δv
-#      floor (~0.42x dv_ref) so the tiny-ratio regime is never actually reached.
-#   2. GATED by stop_quality (the same 1/(1+vel/scale) in ENV_STOP_COEFF, in
-#      (0,1]). Without the floor, the lowest-Δv way to "dock" is again a
-#      fly-THROUGH that never brakes (it skips the stopping impulse, so it uses
-#      less total Δv) — an ungated fuel reward would hand that its biggest bonus
-#      and the agent would abandon braking. Multiplying by stop_quality means
-#      efficiency only counts once the rendezvous is actually completed: a
-#      fly-through's low-Δv advantage is killed by its near-zero stop_quality,
-#      so a true stop always wins, and among stops lower Δv keeps being better.
+# THE FLOOR AT ratio 1 IS LORE — do not remove it without reading this.
+# It makes the reward FLAT for every solution at or below dv_ref, i.e. a wide
+# stable plateau rather than a peak. That looks like "no incentive to beat the
+# reference", and an un-floored variant was tried to fix exactly that
+# (coeff/(ratio+eps), gated by stop_quality so a brake-skipping fly-through
+# couldn't win). It collapsed training: with no floor, "less Δv is always
+# better" drives the optimizer onto the physical feasibility edge (~0.42x
+# dv_ref, the softest burn that still reaches the target), where the transfer
+# burn is only ~0.14 in normalized action units while exploration noise is ~25%
+# of it. The actor saturated, every episode flew to the excursion boundary, the
+# replay buffer filled with failures, and the curriculum regressed 1000 -> 630 m
+# — after buying just ~1% (1.15x -> 1.14x of the two-V-bar optimum). Lowering
+# noise (0.15 -> 0.05) did NOT prevent it. With the floor, the policy settles
+# with margin at the proven ~1.15x rendezvous.
+#
+# CAVEAT for new scenarios: the floor also removes any pressure to go below
+# dv_ref. That is harmless for "vbar" (the two-V-bar optimum is 4/(3*pi) ~= 0.42
+# of dv_ref and the policy lands near it anyway), but for "rbar" dv_ref is the
+# R-bar+V-bar strategy (3*w*dz) while the two-V-bar strategy costs only
+# (w/2)*dz ~= 1/6 of it — so the floor would let an rbar policy stop at the
+# WORSE reference strategy. Revisit the floor level there if goal 2 needs it.
 ENV_FUEL_COEFF = 500.0
-# Small ratio offset that bounds the un-floored fuel bonus (peak coeff/eps) and
-# keeps a strong, finite gradient near the physical optimum (~0.42x dv_ref).
-ENV_FUEL_RATIO_EPS = 0.1
 
 # --- Terminal-velocity (stopping) bonus ---
 # Paid ONLY on a successful dock and strictly ADDITIVE (like the fuel bonus),
@@ -315,7 +320,7 @@ OU_THETA = 0.15   # SB3 OrnsteinUhlenbeckActionNoise default; pinned explicitly
 OU_DT    = 0.01   # so the amplification-factor math below can't silently drift
 OU_STD_PER_SIGMA = (2 * OU_THETA - OU_THETA ** 2 * OU_DT) ** -0.5
 
-ACTION_NOISE_STD_START = 0.15
+ACTION_NOISE_STD_START = 0.05
 ACTION_NOISE_STD_END   = 0.005
 ACTION_NOISE_SIGMA_START = ACTION_NOISE_STD_START / OU_STD_PER_SIGMA
 ACTION_NOISE_SIGMA_END   = ACTION_NOISE_STD_END / OU_STD_PER_SIGMA

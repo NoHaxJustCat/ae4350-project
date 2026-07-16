@@ -15,7 +15,6 @@ from libs.constants import (
     ENV_VEL_COEFF,
     ENV_STOP_COEFF,
     ENV_STOP_VEL_SCALE_FRAC,
-    ENV_FUEL_RATIO_EPS,
     ENV_SHAPING_COEFF,
     OMEGA,
     ENV_CURRICULUM_ENABLED,
@@ -92,11 +91,11 @@ class CWRendezvousEnv(gym.Env):
     ceiling loops, reward discontinuities).
 
     The fuel term is constant-elasticity in ratio = dv_used/dv_ref,
-    coeff / (ratio + eps), NOT floored at the reference and GATED by
-    stop_quality so the agent keeps being rewarded for beating dv_ref (and
-    discovers its own most-efficient rendezvous) while a fly-through that skips
-    the brake can never win it back. See the ENV_FUEL_COEFF / ENV_STOP_COEFF
-    comments in constants.py for the full rationale.
+    coeff / max(ratio, 1) — floored at the reference so every solution at or
+    below dv_ref shares one stable plateau rather than a knife-edge peak at the
+    physical Δv limit (an un-floored variant rode that edge and collapsed; see
+    _brake_step). See the ENV_FUEL_COEFF / ENV_STOP_COEFF comments in
+    constants.py for the full rationale.
 
     Scenario (2-D only, selects the initial-condition family; see
     CLAUDE.md goals 1 & 2). Sign/quadrant is randomized every reset() so a
@@ -555,18 +554,28 @@ class CWRendezvousEnv(gym.Env):
         pos_error = float(np.linalg.norm(self.state[:half]))
         vel_error = float(np.linalg.norm(self.state[half:]))
 
-        # Terminal reward, now that the dock is complete: flat dock bonus +
-        # stopping bonus (post-brake speed -> 0) + fuel-efficiency bonus on the
-        # TOTAL dv (transfer + brake). The fuel term is NOT floored at the
-        # reference and is GATED by stop_quality, so the agent keeps being
-        # rewarded for beating dv_ref and discovers its own most-efficient
-        # rendezvous, but a fly-through that skips the brake (lower dv, but
-        # ~zero stop_quality) can never win it back (see ENV_FUEL_COEFF /
-        # ENV_FUEL_RATIO_EPS). dv_ref here is only a distance-normalizing scale.
+        # Terminal reward, now that the dock is complete: flat dock bonus + fuel
+        # bonus on TOTAL dv (transfer + brake, FLOORED at ratio 1 — see
+        # ENV_FUEL_COEFF) + stopping bonus on the post-brake speed.
+        #
+        # The floor is deliberate, and was RESTORED after an un-floored variant
+        # (coeff/(ratio+eps), gated by stop_quality) collapsed training. Without
+        # it, "less Δv is always better" makes the optimizer ride the physical
+        # feasibility edge (~0.42x dv_ref — the softest burn that still reaches),
+        # where the transfer burn is only ~0.14 in normalized action units and
+        # exploration noise is ~25% of it. The actor saturated, every episode
+        # flew to the excursion boundary, the buffer filled with failures and the
+        # curriculum regressed 1000 -> 630 m. It bought ~1% (1.15x -> 1.14x of
+        # the two-V-bar optimum) before breaking. The floor instead leaves a wide
+        # STABLE plateau: everything at or below dv_ref scores the same, so the
+        # policy settles with margin (the proven ~1.15x rendezvous) instead of on
+        # a knife edge. NOTE for scenarios whose optimal strategy is far below
+        # dv_ref (e.g. "rbar", where two V-bar impulses cost only ~1/6 of the
+        # R-bar+V-bar dv_ref) the floor also removes any pressure to find it.
         v_scale = self.stop_vel_scale_frac * self.dv_ref
         stop_quality = 1.0 / (1.0 + vel_error / v_scale)   # in (0, 1]
-        ratio = self.dv_used / self.dv_ref
-        reward_fuel = self.fuel_coeff / (ratio + ENV_FUEL_RATIO_EPS) * stop_quality
+        ratio = max(self.dv_used / self.dv_ref, 1.0)
+        reward_fuel = self.fuel_coeff / ratio
         reward_stop = self.stop_coeff * stop_quality
         reward_terminal = self.bonus
         reward_pos = 0.0
