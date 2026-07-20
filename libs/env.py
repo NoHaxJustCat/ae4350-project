@@ -25,6 +25,8 @@ from libs.constants import (
     ENV_CURRICULUM_BOUNDARY_MULT,
     SCENARIO,
     RBAR_X_TO_Z_RATIO,
+    ENV_RANDOM_DV_REF_MULT,
+    ENV_RANDOM_ANGLE_TABLE_N,
     MODE_2D,
     ACTION_DIM,
     ACTION_IMPULSE_DIM,
@@ -39,6 +41,8 @@ from libs.reference import (
     dv_rbar_strategy_rv,
     dv_vbar_two_impulse_rr,
     optimal_two_impulse_stop_dv_per_m,
+    dv_opt_per_m_table,
+    dv_opt_per_m_lookup,
 )
 
 
@@ -135,10 +139,10 @@ class CWRendezvousEnv(gym.Env):
         rbar_x_to_z_ratio: float = RBAR_X_TO_Z_RATIO,
     ):
         super().__init__()
-        if scenario not in ("vbar", "rbar"):
+        if scenario not in ("vbar", "rbar", "random"):
             raise ValueError(f"Unknown scenario: {scenario!r}")
-        if not MODE_2D and scenario == "rbar":
-            raise ValueError("scenario='rbar' is only defined for MODE_2D")
+        if not MODE_2D and scenario in ("rbar", "random"):
+            raise ValueError(f"scenario={scenario!r} is only defined for MODE_2D")
 
         self.mode_2d = MODE_2D
         self.phys_dim = PHYS_STATE_DIM   # 4 (2D) or 6 (3D)
@@ -234,21 +238,29 @@ class CWRendezvousEnv(gym.Env):
             low=-1.0, high=1.0, shape=(self.action_dim,), dtype=np.float64
         )
 
-        # True achievable optimum Δv for THIS scenario's geometry, per metre of
-        # initial distance (CW is linear, so it scales exactly with the spawn
-        # distance — see libs/reference.py). Computed once here, not per reset.
-        # The fuel bonus is graded against this rather than dv_ref so the agent
-        # is pushed toward the best maneuver that actually exists for its own
-        # initial condition, in BOTH scenarios: for "vbar" that is the analytic
-        # two-V-bar transfer; for "rbar" it is ~33% better than the analytic
-        # R-bar+V-bar strategy (and strategy 2's cheaper figure is unreachable
-        # from this geometry, so it must NOT be the target).
-        self._dv_opt_per_m = optimal_two_impulse_stop_dv_per_m(
-            self._sample_direction_for(sign=1.0), omega
-        )
+        # True achievable optimum Δv per metre of initial distance (CW is
+        # linear, so it scales exactly with the spawn distance — see
+        # libs/reference.py). The fuel bonus is graded against this, not dv_ref,
+        # so the agent is pushed toward the best maneuver that actually exists
+        # for its own initial condition (for "vbar" the analytic two-V-bar
+        # transfer; for "rbar" ~33% better than the analytic R-bar+V-bar one).
+        #
+        # For "vbar"/"rbar" the direction is fixed up to sign, so a single scalar
+        # (computed once here) suffices. For "random" the direction — and hence
+        # the optimum, which varies ~23x with angle — changes every episode, so
+        # instead we build a per-angle table once and look it up in reset().
+        if self.scenario == "random":
+            self._dv_opt_per_m = None
+            self._dv_opt_table = dv_opt_per_m_table(omega, ENV_RANDOM_ANGLE_TABLE_N)
+        else:
+            self._dv_opt_per_m = optimal_two_impulse_stop_dv_per_m(
+                self._sample_direction_for(sign=1.0), omega
+            )
+            self._dv_opt_table = None
 
         self.state = None
         self._forced_sign = None
+        self._forced_angle = None
 
     # ── Initial-condition sampling ───────────────────────────────────────────
 
@@ -262,9 +274,16 @@ class CWRendezvousEnv(gym.Env):
 
     def _sample_direction(self) -> np.ndarray:
         """Unit direction vector for this episode's initial displacement.
-        Sign/quadrant is randomized so a single model sees both cases
-        required by CLAUDE.md goals 1 & 2, instead of always the same one.
-        Pass reset(options={"sign": +1 or -1}) to force a side for eval."""
+        For "vbar"/"rbar" only the sign/quadrant is randomized (CLAUDE.md goals
+        1 & 2); force a side with reset(options={"sign": +1 or -1}). For
+        "random" a uniformly random angle on the full circle is drawn; force one
+        with reset(options={"angle": theta_radians}) for a reproducible eval."""
+        if self.scenario == "random":
+            if self._forced_angle is not None:
+                theta = float(self._forced_angle)
+            else:
+                theta = float(self.np_random.uniform(0.0, 2.0 * np.pi))
+            return np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
         if self._forced_sign is not None:
             sign = float(self._forced_sign)
         else:
@@ -306,6 +325,7 @@ class CWRendezvousEnv(gym.Env):
         super().reset(seed=seed)
 
         self._forced_sign = (options or {}).get("sign")
+        self._forced_angle = (options or {}).get("angle")  # "random" scenario eval
         self.state = self._sample_initial_state()
         self.excursion_limit = min(
             self.base_boundary,
@@ -321,20 +341,33 @@ class CWRendezvousEnv(gym.Env):
         self.braking_phase = False
 
         half = self.phys_dim // 2
+        dist = float(np.linalg.norm(self.state[:half]))
 
-        if self.scenario == "vbar":
-            self.dv_ref = 0.5 * dv_vbar_two_impulse_rr(np.linalg.norm(self.state[:half]), self.omega)
-            # We divide by half since the output of the function is the TOTAL delta v required for also stopping
+        # dv_opt: TRUE achievable optimum for THIS episode's start (scales
+        # linearly with distance). For "vbar"/"rbar" the per-metre value is a
+        # fixed scalar; for "random" it is looked up from this episode's actual
+        # direction (it varies ~23x with angle). The fuel bonus grades against
+        # dv_opt (see _brake_step).
+        if self.scenario == "random":
+            direction = self.state[:half] / dist
+            dv_opt_per_m = dv_opt_per_m_lookup(direction, self._dv_opt_table)
         else:
-            self.dv_ref = dv_rbar_strategy_rv(np.linalg.norm(self.state[:half]), self.omega)
-            # TODO: divide by the amount required actually to reach... could use half as approximation
-            
-        # True achievable optimum for this episode's start (scales linearly with
-        # distance). Used ONLY to grade the fuel bonus / report efficiency —
-        # deliberately NOT used for max_dv, the deadzone, the Δv budget or the
-        # dv_used observation scale, which all stay pinned to dv_ref so the
-        # action semantics (and therefore existing trained models) are unchanged.
-        self.dv_opt = self._dv_opt_per_m * np.linalg.norm(self.state[:half])
+            dv_opt_per_m = self._dv_opt_per_m
+        self.dv_opt = dv_opt_per_m * dist
+
+        # dv_ref: the actuator/observation SCALE (sizes max_dv, the deadzone, the
+        # Δv budget, and the dv_used obs norm — NOT the fuel grading). For
+        # "vbar"/"rbar" it is the analytic reference maneuver's Δv. For "random"
+        # the analytic formulas do not apply, so it is derived from the numeric
+        # optimum (ENV_RANDOM_DV_REF_MULT * dv_opt) to give the same proportional
+        # per-burn headroom the analytic scale gives the other scenarios.
+        if self.scenario == "vbar":
+            self.dv_ref = 0.5 * dv_vbar_two_impulse_rr(dist, self.omega)
+            # divide by half: the formula returns the TOTAL Δv including stopping
+        elif self.scenario == "rbar":
+            self.dv_ref = dv_rbar_strategy_rv(dist, self.omega)
+        else:  # random
+            self.dv_ref = ENV_RANDOM_DV_REF_MULT * self.dv_opt
 
         self.max_dv = self.dv_ref * self.max_dv_coeff
         self.dv_budget = (

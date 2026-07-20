@@ -118,3 +118,41 @@ def optimal_two_impulse_stop_dv_per_m(
     hi = grid[min(i + 1, n_coarse - 1)]
     fine = np.linspace(lo, hi, n_refine)
     return float(min(values[i], min(total_dv(t) for t in fine)))
+
+
+# --- Per-direction optimum table (for the "random" scenario) --------------
+# In the "random" scenario the initial displacement can point ANY direction on
+# the circle, and the achievable optimum varies ~23x with that angle (cheapest
+# along-track / V-bar, ~23x costlier near radial / R-bar). So dv_opt has to be
+# looked up per episode from the sampled angle rather than precomputed once.
+# Evaluating optimal_two_impulse_stop_dv_per_m() every reset would be far too
+# slow, so we build a fine table over the angle once and interpolate. By the
+# point-reflection symmetry of the CW dynamics (negate position+velocity) the
+# optimum has period pi, so the table only spans [0, pi). Memoized per (omega,
+# resolution) so the parallel sub-envs of a DummyVecEnv share one build.
+_DV_OPT_TABLE_CACHE: dict = {}
+
+
+def dv_opt_per_m_table(omega: float, n_angles: int = 180):
+    """(angles, values) table of optimal_two_impulse_stop_dv_per_m over the
+    in-plane direction angle in [0, pi). Built once per (omega, n_angles)."""
+    key = (round(float(omega), 12), int(n_angles))
+    if key not in _DV_OPT_TABLE_CACHE:
+        angles = np.linspace(0.0, np.pi, n_angles, endpoint=False)
+        values = np.array([
+            optimal_two_impulse_stop_dv_per_m(
+                np.array([np.cos(a), np.sin(a)]), omega
+            )
+            for a in angles
+        ])
+        _DV_OPT_TABLE_CACHE[key] = (angles, values)
+    return _DV_OPT_TABLE_CACHE[key]
+
+
+def dv_opt_per_m_lookup(direction: np.ndarray, table) -> float:
+    """Interpolate the per-metre optimum for an in-plane unit `direction`
+    ([x, z]) from a table built by dv_opt_per_m_table(). The angle is folded
+    into [0, pi) (period-pi by the point-reflection symmetry)."""
+    angles, values = table
+    a = np.arctan2(float(direction[1]), float(direction[0])) % np.pi
+    return float(np.interp(a, angles, values, period=np.pi))

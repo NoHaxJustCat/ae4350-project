@@ -108,7 +108,12 @@ def print_summary(label: str, result: dict, scenario: str):
         print(f"True achievable optimum (2-impulse, this geometry): {dv_opt:.5f} m/s "
               f"({r['total_dv'] / dv_opt:.2f}x optimal)")
 
-    if scenario == "vbar":
+    if scenario == "random":
+        # No analytic maneuver formula applies to an arbitrary direction — the
+        # numeric "x optimal" printed above is the only meaningful comparison.
+        print(f"Initial direction: ({start[0]:.1f}, {start[1]:.1f}) m "
+              f"(angle {np.degrees(np.arctan2(start[1], start[0])):.1f} deg)")
+    elif scenario == "vbar":
         # Goal 1: compare against BOTH reference two-impulse strategies.
         ref_vbar = dv_vbar_two_impulse_vv(dx, OMEGA)
         ref_rbar = dv_vbar_two_impulse_rr(dx, OMEGA)

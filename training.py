@@ -800,7 +800,7 @@ class LiveDiagnosticsCallback(BaseCallback):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--scenario", choices=["vbar", "rbar"], default="vbar")
+    p.add_argument("--scenario", choices=["vbar", "rbar", "random"], default="vbar")
     p.add_argument("--n-envs", type=int, default=NUM_ENVS)
     p.add_argument("--total-timesteps", type=int, default=TOTAL_TIMESTEPS)
     p.add_argument("--seed", type=int, default=None,

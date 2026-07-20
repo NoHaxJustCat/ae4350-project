@@ -244,12 +244,36 @@ ENV_BURN_DEADZONE_FRAC = 0.05
 # distance for the default "vbar" scenario.
 ENV_INITIAL_STATE_VBAR = np.array([100.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
-# --- Scenario config (mandatory goals 1 & 2 from CLAUDE.md) ---
-# "vbar": pure V-bar (x) displacement, sign randomized each episode (+x/-x).
-# "rbar": coupled x/z displacement with opposite signs, sign-combo
-#         randomized each episode between (+x,-z) and (-x,+z).
+# --- Scenario config (goals 1 & 2 from CLAUDE.md, plus a generalisation) ---
+# "vbar"  : pure V-bar (x) displacement, sign randomized each episode (+x/-x).
+# "rbar"  : coupled x/z displacement with opposite signs, sign-combo randomized
+#           each episode between (+x,-z) and (-x,+z).
+# "random": the hardest generalisation — the initial displacement points a
+#           UNIFORMLY random direction on the in-plane circle at the curriculum
+#           distance, so a single policy must dock from every angle. The analytic
+#           two-impulse formulas (libs/reference.py) each assume a fixed geometry
+#           and are meaningless here, so dv_ref/dv_opt cannot use them: the
+#           optimum is looked up per episode from the numeric per-direction table
+#           (dv_opt_per_m_table) and the actuator scale dv_ref is derived from it
+#           (see ENV_RANDOM_DV_REF_MULT). 2-D only.
 SCENARIO = os.environ.get("AE4350_SCENARIO", "vbar")
 RBAR_X_TO_Z_RATIO = 2.0  # matches the Δx = 2·Δz relation in goal 2 strategy 1
+
+# "random" scenario actuator scale. There is no analytic dv_ref, so dv_ref is
+# set to ENV_RANDOM_DV_REF_MULT * dv_opt (the numeric optimum for THIS episode's
+# direction). dv_ref only sizes max_dv / deadzone / dv-budget / the dv_used obs
+# scale — the fuel bonus still grades against dv_opt itself. 2.5 gives
+# max_dv = ENV_MAX_DV_COEFF * dv_ref = 3.75 * dv_opt of per-burn headroom, which
+# comfortably clears the largest single optimal burn (measured max 0.875*dv_opt
+# over all directions) with room to explore/correct, and matches the ~3.5-5x
+# headroom "vbar"/"rbar" get from their analytic dv_ref. The transfer burn is
+# always >= 0.5*dv_opt so it clears the deadzone (0.05*max_dv = 0.19*dv_opt);
+# the small terminal brake bypasses the deadzone anyway.
+ENV_RANDOM_DV_REF_MULT = 2.5
+# Resolution of the per-direction optimum table over [0, pi) (period-pi by the
+# CW point-reflection symmetry). 180 = 1 deg; dv_opt is smooth in the angle so
+# linear interpolation error is negligible.
+ENV_RANDOM_ANGLE_TABLE_N = 180
 
 # Normalization multiplier for the dv_used observation element (see
 # libs/normalization.py): the norm scale is DV_USED_NORM_MULT * max_dv for
@@ -324,8 +348,8 @@ OU_THETA = 0.15   # SB3 OrnsteinUhlenbeckActionNoise default; pinned explicitly
 OU_DT    = 0.01   # so the amplification-factor math below can't silently drift
 OU_STD_PER_SIGMA = (2 * OU_THETA - OU_THETA ** 2 * OU_DT) ** -0.5
 
-ACTION_NOISE_STD_START = 0.05
-ACTION_NOISE_STD_END   = 0.005
+ACTION_NOISE_STD_START = 0.4
+ACTION_NOISE_STD_END   = 0.1
 ACTION_NOISE_SIGMA_START = ACTION_NOISE_STD_START / OU_STD_PER_SIGMA
 ACTION_NOISE_SIGMA_END   = ACTION_NOISE_STD_END / OU_STD_PER_SIGMA
 NOISE_DECAY_FRAC = 0.75  # ~3x faster than the old 0.7 — noise was still near
