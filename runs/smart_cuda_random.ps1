@@ -26,7 +26,7 @@
 param(
     [string]$RunTag = "smart_cuda_random_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
     [string]$Scenario = "random",
-    [int]$TotalTimesteps = 3000000
+    [int]$TotalTimesteps = 2000000
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,14 +43,15 @@ Write-Host "Launching training: scenario=$Scenario run-tag=$RunTag total-timeste
     --device cuda `
     --n-envs 6 `
     --vec-env dummy `
-    --net-arch 256,256 `
-    --features-dim 256 `
+    --net-arch 64,64,64 `
+    --features-dim 64 `
     --n-blocks 2 `
     --activation relu `
     --gamma 0.99 `
     --lr 1e-4 `
     --torch-threads 5 `
     --total-timesteps $TotalTimesteps `
-    --checkpoint-freq 100000 `
+    --checkpoint-freq 10000 `
     --keep-last-checkpoints 3 `
+    --resume-from trained/20260723_204210/smart_cuda_random_20260723_204148/checkpoints/random_td3_1499802_steps.zip `
     --run-tag $RunTag
