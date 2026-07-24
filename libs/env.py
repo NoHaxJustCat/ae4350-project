@@ -47,29 +47,25 @@ from libs.reference import (
 
 
 # ---------------------------------------------------------------------------
-#   Build State Transition Matrices
+#   State transition matrices (Clohessy-Wiltshire)
 # ---------------------------------------------------------------------------
-# Full 6×6 CW matrix (always built; 2-D mode selects a 4×4 sub-block).
+
 def _build_stm_full(omega: float, dt: float) -> np.ndarray:
+    """Full 6x6 CW state-transition matrix for one timestep dt."""
     A = np.zeros((6, 6))
     A[0, 3] = 1.0
     A[1, 4] = 1.0
     A[2, 5] = 1.0
-    A[3, 5] =  2 * omega       # ẍ couples ż
-    A[4, 1] = -omega ** 2      # ÿ (cross-track, decoupled)
-    A[5, 2] =  3 * omega ** 2  # z̈ couples ẋ/z
+    A[3, 5] = 2 * omega        # x_ddot couples z_dot
+    A[4, 1] = -omega ** 2      # y_ddot (cross-track, decoupled)
+    A[5, 2] = 3 * omega ** 2   # z_ddot couples x/z
     A[5, 3] = -2 * omega
     return expm(A * dt)
 
 
 def _build_stm_2d(omega: float, dt: float) -> np.ndarray:
-    """
-    In-plane (V-bar / R-bar) CW sub-block: state = [x, z, ẋ, ż].
-
-    The cross-track (y / H-bar) direction is fully decoupled from the
-    in-plane motion, so we can just drop it.  The in-plane indices in the
-    full 6-D state are [0, 2, 3, 5] → x, z, ẋ, ż.
-    """
+    """In-plane (V-bar/R-bar) 4x4 sub-block, state = [x, z, xdot, zdot].
+    Cross-track (y) is fully decoupled, so we just drop those rows/cols."""
     idx = np.ix_([0, 2, 3, 5], [0, 2, 3, 5])
     return _build_stm_full(omega, dt)[idx]
 
@@ -78,40 +74,22 @@ class CWRendezvousEnv(gym.Env):
     """
     Clohessy-Wiltshire spacecraft rendezvous environment.
 
-    Operates in either full 3-D (MODE_2D=False) or decoupled in-plane 2-D
-    (MODE_2D=True) according to the flag in constants.py.
+    State (2-D): [x, z, xdot, zdot]. Observation adds cumulative Δv used and a
+    braking-phase flag. Action = [impulse per axis, coast-duration scalar]:
+    one impulsive burn is applied, then the state coasts ballistically for an
+    agent-chosen number of steps. Reaching the target opens a one-step braking
+    phase (see _brake_step) instead of ending the episode immediately, so the
+    agent fires a dedicated final impulse to null its arrival velocity.
 
-    2-D state  : [x, z, ẋ, ż]           — V-bar / R-bar only (y = ẏ = 0)
-    3-D state  : [x, y, z, ẋ, ẏ, ż]
+    Reward = dense distance shaping every step, plus three bonuses paid only
+    on a completed dock (in _brake_step): a flat dock bonus, a fuel-efficiency
+    bonus graded against the true achievable optimum Δv (dv_opt), and a
+    stopping bonus graded on arrival speed.
 
-    Observation appends cumulative Δv used so far:
-        2-D obs : [x, z, ẋ, ż, dv_used]           (5-dim)
-        3-D obs : [x, y, z, ẋ, ẏ, ż, dv_used]     (7-dim)
-
-    Action:
-        2-D : [dvx, dvz]   (2-dim)
-        3-D : [dvx, dvy, dvz]   (3-dim)
-
-    Reward is intentionally barebones: dense distance-shaping every step, and
-    three terminal bonuses paid only on a completed dock (in _brake_step) —
-    a flat dock bonus, a stopping bonus, and a fuel-efficiency bonus. No
-    milestone bookkeeping, no dv ceiling/truncation tied to fuel, no malus —
-    those were the source of repeated reward-exploit debugging (fast-burn-to-
-    ceiling loops, reward discontinuities).
-
-    The fuel term is constant-elasticity in ratio = dv_used/dv_ref,
-    coeff / max(ratio, 1) — floored at the reference so every solution at or
-    below dv_ref shares one stable plateau rather than a knife-edge peak at the
-    physical Δv limit (an un-floored variant rode that edge and collapsed; see
-    _brake_step). See the ENV_FUEL_COEFF / ENV_STOP_COEFF comments in
-    constants.py for the full rationale.
-
-    Scenario (2-D only, selects the initial-condition family; see
-    CLAUDE.md goals 1 & 2). Sign/quadrant is randomized every reset() so a
-    single model learns both directions rather than only ever seeing one:
-        "vbar" : pure V-bar displacement, x = ±distance, z = 0
-        "rbar" : coupled displacement, (x, z) = ±distance · (ratio, -1)/norm
-                 restricted to the two mirrored quadrants (+x,-z)/(-x,+z)
+    Scenarios (2-D only):
+        "vbar"   : pure V-bar (x) displacement, random sign each episode.
+        "rbar"   : coupled x/z displacement, random sign each episode.
+        "random" : displacement at a uniformly random angle each episode.
     """
 
     def __init__(
@@ -145,18 +123,16 @@ class CWRendezvousEnv(gym.Env):
             raise ValueError(f"scenario={scenario!r} is only defined for MODE_2D")
 
         self.mode_2d = MODE_2D
-        self.phys_dim = PHYS_STATE_DIM   # 4 (2D) or 6 (3D)
-        self.obs_dim  = OBS_DIM          # 5 (2D) or 7 (3D)
-        # Full action = impulse components + 1 coast-duration scalar.
-        self.action_dim = ACTION_DIM             # 3 (2D) or 4 (3D)
-        self.impulse_dim = ACTION_IMPULSE_DIM    # 2 (2D) or 3 (3D)
+        self.phys_dim = PHYS_STATE_DIM     # 4 (2D) or 6 (3D)
+        self.obs_dim = OBS_DIM             # phys_dim + dv_used + braking flag
+        self.action_dim = ACTION_DIM       # impulse_dim + 1 coast scalar
+        self.impulse_dim = ACTION_IMPULSE_DIM
         self.scenario = scenario
         self.rbar_x_to_z_ratio = rbar_x_to_z_ratio
 
         self.omega = omega
-        # dt is the AGENT step (one impulse + one observation + one stored
-        # transition); dt_phys is the fine physics/collision substep it is
-        # decomposed into. Must divide evenly — the substep count is exact.
+        # dt = agent step (one impulse + coast decision); dt_phys = fine
+        # physics substep it's decomposed into for docking/OOB sampling.
         self.dt = dt
         self.dt_phys = dt_phys
         n_sub = dt / dt_phys
@@ -168,15 +144,11 @@ class CWRendezvousEnv(gym.Env):
             )
 
         self.max_dv_coeff = max_dv_coeff
-        # None = unconstrained (default — matches all prior behavior). Once
-        # set (training.py's DvBudgetCurriculumCallback, via
-        # set_dv_budget_coeff()), dv_budget = dv_ref * dv_budget_coeff caps
-        # TOTAL cumulative dv_used for the whole episode, not just one burn
-        # — see the ENV_DV_BUDGET_COEFF_START comment in constants.py.
+        # dv_budget caps TOTAL episode dv_used once set (see set_dv_budget_coeff).
         self.dv_budget_coeff = dv_budget_coeff
-        self.dv_budget = None  # set for real in reset(), as dv_budget_coeff * dv_ref
+        self.dv_budget = None              # set in reset(): dv_budget_coeff * dv_ref
         self.burn_deadzone_frac = burn_deadzone_frac
-        self.burn_deadzone = 0.0  # set for real in reset(), as burn_deadzone_frac * max_dv
+        self.burn_deadzone = 0.0           # set in reset(): burn_deadzone_frac * max_dv
         self.base_boundary = boundary
         self.excursion_limit = boundary
         self.curriculum_boundary_mult = curriculum_boundary_mult
@@ -188,14 +160,8 @@ class CWRendezvousEnv(gym.Env):
         self.stop_vel_scale_frac = stop_vel_scale_frac
         self.bonus = bonus
 
-        # --- Curriculum ---
-        # NOTE: this env does NOT self-advance the curriculum anymore. With
-        # N parallel sub-envs each doing their own local "3 consecutive
-        # docks" count, curriculum_distance drifted out of sync across
-        # workers with no visibility into it — that's what looked like
-        # "random" spawn distances. A single authority (CurriculumCallback
-        # in training.py) now tracks dock rate across ALL envs and pushes
-        # one shared distance to every sub-env via set_curriculum_distance().
+        # Curriculum distance is pushed in externally (training.py's
+        # CurriculumCallback), not self-advanced — see set_curriculum_distance.
         self.curriculum_enabled = curriculum_enabled
         self.curriculum_increment = curriculum_increment
         self.curriculum_max_distance = curriculum_max_distance
@@ -205,32 +171,24 @@ class CWRendezvousEnv(gym.Env):
             else curriculum_max_distance
         )
 
-        # --- State Transition Matrix ---
-        # Built for the fine PHYSICS substep, not the agent step. Propagating
-        # n_substeps of dt_phys is exactly propagating one dt_agent (the CW
-        # STM is a matrix exponential: expm(A*dt_phys)**n == expm(A*n*dt_phys)),
-        # so this changes nothing about the physics — it only lets us sample
-        # the trajectory finely for the docking/collision test.
+        # STM for the fine physics substep. n_substeps of dt_phys == one dt
+        # exactly (expm(A*dt_phys)**n == expm(A*n*dt_phys)); this only buys
+        # finer sampling for the docking/OOB test, not different physics.
         if self.mode_2d:
-            self.STM_np = _build_stm_2d(omega, dt_phys)
+            self.stm = _build_stm_2d(omega, dt_phys)
         else:
-            self.STM_np = _build_stm_full(omega, dt_phys)
+            self.stm = _build_stm_full(omega, dt_phys)
 
-        # Precompute STM_phys^k for k = 1..(max coast length in substeps). A
-        # coast decision can span a whole orbit (~1440 fine substeps); stepping
-        # that as a Python loop dominated runtime. With these stacked powers the
-        # entire coast is ONE batched matmul (seq = powers[:total] @ s0) plus
-        # vectorized docking/OOB/timeout tests — byte-for-byte the same substep
-        # trajectory as the loop, just computed at once. Built once per env.
+        # Precompute stm^k for k = 1..max_coast_substeps so a whole coast (up
+        # to ~1 orbit) is one batched matmul in step() instead of a Python loop.
         max_total_substeps = ENV_COAST_MAX_UNITS * self.n_substeps
         powers = np.empty((max_total_substeps, self.phys_dim, self.phys_dim))
         acc = np.eye(self.phys_dim)
-        for _k in range(max_total_substeps):
-            acc = self.STM_np @ acc
-            powers[_k] = acc
+        for k in range(max_total_substeps):
+            acc = self.stm @ acc
+            powers[k] = acc
         self._coast_powers = powers
 
-        # --- Gym spaces ---
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float64
         )
@@ -238,17 +196,11 @@ class CWRendezvousEnv(gym.Env):
             low=-1.0, high=1.0, shape=(self.action_dim,), dtype=np.float64
         )
 
-        # True achievable optimum Δv per metre of initial distance (CW is
-        # linear, so it scales exactly with the spawn distance — see
-        # libs/reference.py). The fuel bonus is graded against this, not dv_ref,
-        # so the agent is pushed toward the best maneuver that actually exists
-        # for its own initial condition (for "vbar" the analytic two-V-bar
-        # transfer; for "rbar" ~33% better than the analytic R-bar+V-bar one).
-        #
-        # For "vbar"/"rbar" the direction is fixed up to sign, so a single scalar
-        # (computed once here) suffices. For "random" the direction — and hence
-        # the optimum, which varies ~23x with angle — changes every episode, so
-        # instead we build a per-angle table once and look it up in reset().
+        # True achievable optimum Δv per metre of distance (CW is linear, so it
+        # scales exactly with distance). Used to grade the fuel bonus. Fixed
+        # direction (up to sign) for vbar/rbar -> one scalar; "random" varies
+        # the direction every episode, so we build a per-angle table instead
+        # and look it up in reset() (see libs/reference.py).
         if self.scenario == "random":
             self._dv_opt_per_m = None
             self._dv_opt_table = dv_opt_per_m_table(omega, ENV_RANDOM_ANGLE_TABLE_N)
@@ -262,22 +214,19 @@ class CWRendezvousEnv(gym.Env):
         self._forced_sign = None
         self._forced_angle = None
 
-    # ── Initial-condition sampling ───────────────────────────────────────────
+    # ── Initial-condition sampling ──────────────────────────────────────────
 
     def _sample_direction_for(self, sign: float) -> np.ndarray:
         """Unit in-plane displacement direction ([x, z]) for a given sign."""
         if self.scenario == "vbar":
             return np.array([sign, 0.0], dtype=np.float64)
-        # "rbar": (+x,-z) or (-x,+z) — opposite-sign coupled displacement
         raw = np.array([sign * self.rbar_x_to_z_ratio, -sign], dtype=np.float64)
         return raw / np.linalg.norm(raw)
 
     def _sample_direction(self) -> np.ndarray:
-        """Unit direction vector for this episode's initial displacement.
-        For "vbar"/"rbar" only the sign/quadrant is randomized (CLAUDE.md goals
-        1 & 2); force a side with reset(options={"sign": +1 or -1}). For
-        "random" a uniformly random angle on the full circle is drawn; force one
-        with reset(options={"angle": theta_radians}) for a reproducible eval."""
+        """Unit direction for this episode's initial displacement. vbar/rbar
+        randomize only the sign (force with reset(options={"sign": +-1}));
+        random draws a uniform angle (force with options={"angle": radians})."""
         if self.scenario == "random":
             if self._forced_angle is not None:
                 theta = float(self._forced_angle)
@@ -297,20 +246,15 @@ class CWRendezvousEnv(gym.Env):
         return np.concatenate([pos, vel]).astype(np.float64)
 
     def set_curriculum_distance(self, distance: float):
-        """External control hook — called by training.py's CurriculumCallback
-        (via VecEnv.env_method) so every parallel sub-env shares one
-        synchronized curriculum distance instead of drifting independently."""
+        """Set by training.py's CurriculumCallback so every parallel sub-env
+        shares one synchronized curriculum distance."""
         self.curriculum_distance = float(
             np.clip(distance, 0.0, self.curriculum_max_distance)
         )
 
     def set_dv_budget_coeff(self, coeff: Optional[float]):
-        """External control hook — called by training.py's
-        DvBudgetCurriculumCallback (via VecEnv.env_method), mirroring
-        set_curriculum_distance(). None disables the budget (unconstrained,
-        the default); a float takes effect from the NEXT reset() onward
-        (dv_budget is recomputed from dv_budget_coeff * dv_ref there), not
-        retroactively on whatever episode is already in flight."""
+        """Set by training.py's DvBudgetCurriculumCallback. None disables the
+        budget; takes effect from the next reset() onward."""
         self.dv_budget_coeff = None if coeff is None else max(float(coeff), 1e-3)
 
     # ── Observation ──────────────────────────────────────────────────────────
@@ -325,29 +269,24 @@ class CWRendezvousEnv(gym.Env):
         super().reset(seed=seed)
 
         self._forced_sign = (options or {}).get("sign")
-        self._forced_angle = (options or {}).get("angle")  # "random" scenario eval
+        self._forced_angle = (options or {}).get("angle")
         self.state = self._sample_initial_state()
         self.excursion_limit = min(
             self.base_boundary,
             self.curriculum_distance * self.curriculum_boundary_mult,
         )
         self.elapsed_time = 0.0
-        self.dv_used      = 0.0
-        # Reaching the target opens a one-step "braking phase" (see step() /
-        # _brake_step): the episode does NOT end at arrival — the agent gets
-        # one more action to fire a terminal impulse nulling its velocity, and
-        # only then terminates. False during the whole transfer, True on the
-        # single observation the agent acts on to brake.
+        self.dv_used = 0.0
+        # Reaching the target opens a one-step braking phase (see step() /
+        # _brake_step) instead of ending the episode immediately.
         self.braking_phase = False
 
         half = self.phys_dim // 2
         dist = float(np.linalg.norm(self.state[:half]))
 
-        # dv_opt: TRUE achievable optimum for THIS episode's start (scales
-        # linearly with distance). For "vbar"/"rbar" the per-metre value is a
-        # fixed scalar; for "random" it is looked up from this episode's actual
-        # direction (it varies ~23x with angle). The fuel bonus grades against
-        # dv_opt (see _brake_step).
+        # dv_opt: true achievable optimum for this episode's start, used to
+        # grade the fuel bonus (see _brake_step). Fixed scalar for vbar/rbar;
+        # looked up from the actual direction for "random".
         if self.scenario == "random":
             direction = self.state[:half] / dist
             dv_opt_per_m = dv_opt_per_m_lookup(direction, self._dv_opt_table)
@@ -355,43 +294,31 @@ class CWRendezvousEnv(gym.Env):
             dv_opt_per_m = self._dv_opt_per_m
         self.dv_opt = dv_opt_per_m * dist
 
-        # dv_ref: the actuator/observation SCALE (sizes max_dv, the deadzone, the
-        # Δv budget, and the dv_used obs norm — NOT the fuel grading). For
-        # "vbar"/"rbar" it is the analytic reference maneuver's Δv. For "random"
-        # the analytic formulas do not apply, so it is derived from the numeric
-        # optimum (ENV_RANDOM_DV_REF_MULT * dv_opt) to give the same proportional
-        # per-burn headroom the analytic scale gives the other scenarios.
+        # dv_ref: actuator/observation scale only (max_dv, deadzone, Δv budget,
+        # dv_used obs norm) — NOT the fuel-grading target. Analytic reference
+        # maneuver for vbar/rbar; derived from dv_opt for "random" since no
+        # analytic formula applies there.
         if self.scenario == "vbar":
             self.dv_ref = 0.5 * dv_vbar_two_impulse_rr(dist, self.omega)
-            # divide by half: the formula returns the TOTAL Δv including stopping
         elif self.scenario == "rbar":
             self.dv_ref = dv_rbar_strategy_rv(dist, self.omega)
-        else:  # random
+        else:
             self.dv_ref = ENV_RANDOM_DV_REF_MULT * self.dv_opt
 
         self.max_dv = self.dv_ref * self.max_dv_coeff
         self.dv_budget = (
             None if self.dv_budget_coeff is None else self.dv_ref * self.dv_budget_coeff
         )
-
         self.burn_deadzone = self.burn_deadzone_frac * self.max_dv
 
         observation = self._build_observation()
-        # "state" mirrors step()'s info so callers (e.g. training.py's
-        # trajectory-plot accumulator) can seed a new episode's start point
-        # from vec_env.reset_infos, instead of the plot only ever showing
-        # each episode's first POST-action position.
         info = {"curriculum_distance": self.curriculum_distance, "state": self.state.copy()}
         return observation, info
 
     @staticmethod
     def _segment_closest_to_origin(p0: np.ndarray, p1: np.ndarray):
-        """Closest point on the segment [p0, p1] to the origin, and its
-        distance. Used for the docking test so a fast fly-through of the
-        pos_tolerance circle registers a dock even if neither endpoint sample
-        happens to land inside it (the tunnelling the larger agent step would
-        otherwise cause). Exact for a straight chord; over one fine dt_phys the
-        real curved CW arc is essentially straight, so this is accurate."""
+        """Closest point on segment [p0, p1] to the origin, and its distance —
+        catches a fast fly-through the tolerance circle between samples."""
         d = p1 - p0
         denom = float(d @ d)
         if denom <= 0.0:
@@ -402,24 +329,14 @@ class CWRendezvousEnv(gym.Env):
         return closest, float(np.linalg.norm(closest))
 
     def _coast_units_from_cmd(self, coast_cmd: float) -> int:
-        """Map the coast-duration action scalar in [-1, 1] to an integer
-        number of agent-dt coast units in [ENV_COAST_MIN_UNITS,
-        ENV_COAST_MAX_UNITS]. Linear so the physically meaningful coasts (a
-        half-orbit ~29, a full orbit ~58) sit at well-resolved interior points
-        rather than saturated at an endpoint (see ENV_COAST_* in constants.py)."""
+        """Map the coast action scalar [-1, 1] to an integer number of
+        agent-dt coast units in [ENV_COAST_MIN_UNITS, ENV_COAST_MAX_UNITS]."""
         frac01 = (float(np.clip(coast_cmd, -1.0, 1.0)) + 1.0) * 0.5
         span = ENV_COAST_MAX_UNITS - ENV_COAST_MIN_UNITS
         return ENV_COAST_MIN_UNITS + int(round(frac01 * span))
 
     def step(self, action: np.ndarray):
-        # Action = [impulse..., coast_cmd]. The impulse components are a
-        # NORMALIZED fraction u in [-1, 1] per axis, scaled to the physical
-        # impulse for this episode's distance (max_dv set in reset()); the
-        # trailing scalar chooses how many agent-dt units to coast AFTER the
-        # burn (see _coast_units_from_cmd).
         action = np.asarray(action, dtype=np.float64)
-        # If the target was reached on the previous step, this action is the
-        # terminal braking impulse — a different, no-coast code path.
         if self.braking_phase:
             return self._brake_step(action)
 
@@ -427,27 +344,13 @@ class CWRendezvousEnv(gym.Env):
         u = np.clip(action[: self.impulse_dim], -1.0, 1.0)
         action = u * self.max_dv
 
-        # Burn deadzone / minimum-impulse-bit: a commanded burn below the
-        # threshold is treated as EXACTLY zero — no Δv charged and no velocity
-        # applied — so the agent can coast for free instead of leaking a
-        # little fuel every step it can't output an exact zero (see
-        # ENV_BURN_DEADZONE_FRAC in constants.py). Applied to the norm so it's the
-        # total impulse magnitude that must clear the threshold, and used
-        # everywhere below (dv_used, the state update, and the info's
-        # delta_v/applied_action) so what's charged == what's applied.
+        # Below-deadzone burns are zeroed (free coasting); otherwise clip to
+        # whatever remains of the total-episode Δv budget, if one is active.
         burn = float(np.linalg.norm(action))
         if burn < self.burn_deadzone:
             action = np.zeros_like(action)
             burn = 0.0
         elif self.dv_budget is not None:
-            # Total-episode Δv BUDGET (distinct from max_dv above, which
-            # only caps THIS one burn): clip — don't zero — any burn that
-            # would push cumulative dv_used past dv_budget down to whatever
-            # remains, preserving direction. The tank runs genuinely dry
-            # instead of the agent being free to keep re-burning at the
-            # per-burst cap indefinitely (see the ENV_DV_BUDGET_COEFF_START
-            # comment in constants.py for why a per-burst cap alone doesn't
-            # limit burn COUNT).
             remaining = self.dv_budget - self.dv_used
             if remaining <= 0.0:
                 action = np.zeros_like(action)
@@ -460,28 +363,18 @@ class CWRendezvousEnv(gym.Env):
         half = self.phys_dim // 2
         prev_pos_error = np.linalg.norm(self.state[:half])
 
-        # One impulsive Δv is applied ONCE at the start of the agent step,
-        # then the state coasts BALLISTICALLY for the agent-chosen number of
-        # agent-dt units (coast_units), each decomposed into n_substeps of the
-        # fine physics dt. Docking (segment test) and out-of-bounds are checked
-        # at EVERY substep so a fast pass-through the target can't tunnel
-        # between samples, and we stop the instant a terminal event happens.
-        # This is the whole point of the coast-duration action: the agent
-        # spends ONE decision on a possibly orbit-long coast instead of having
-        # to emit ~30 consecutive near-zero actions to reproduce it.
+        # Impulse changes velocity only (instantaneous burn); position moves
+        # only during the coast that follows.
         self.state[half:] += action
-        s0 = self.state.copy()  # state at the burn point (start of the coast)
+        s0 = self.state.copy()
         total_substeps = coast_units * self.n_substeps
 
-        # Whole coast in one batched matmul: seq[i] = STM_phys^(i+1) @ s0 for
-        # i = 0..total-1. EXACTLY the substep sequence the old per-substep loop
-        # produced (verified byte-identical), just vectorized.
-        seq = self._coast_powers[:total_substeps] @ s0     # (total, phys_dim)
-        pos_seq = seq[:, :half]                             # pos after each substep
-        prev_seq = np.vstack([s0[:half], pos_seq[:-1]])     # pos before each substep
+        # Whole coast as one batched matmul: seq[i] = stm^(i+1) @ s0.
+        seq = self._coast_powers[:total_substeps] @ s0
+        pos_seq = seq[:, :half]
+        prev_seq = np.vstack([s0[:half], pos_seq[:-1]])
 
-        # Vectorized segment-closest-to-origin for every (prev, new) chord, so a
-        # fast fly-through the tolerance circle still registers between samples.
+        # Vectorized closest-approach test over every substep chord.
         dvec = pos_seq - prev_seq
         denom = np.einsum("ij,ij->i", dvec, dvec)
         with np.errstate(invalid="ignore", divide="ignore"):
@@ -494,20 +387,18 @@ class CWRendezvousEnv(gym.Env):
         closest_dist = np.linalg.norm(closest, axis=1)
         new_dist = np.linalg.norm(pos_seq, axis=1)
 
-        # First substep index (0-based) at which each terminal condition fires.
+        # First substep index at which each terminal condition fires.
         BIG = total_substeps + 1
         dock_hits = np.flatnonzero(closest_dist < self.pos_tolerance)
         oob_hits = np.flatnonzero(new_dist > self.excursion_limit)
         i_dock = int(dock_hits[0]) if dock_hits.size else BIG
         i_oob = int(oob_hits[0]) if oob_hits.size else BIG
-        # timeout: elapsed + (i+1)*dt_phys > timeout  ->  first i is floor(thresh)
         thresh = (self.timeout - self.elapsed_time) / self.dt_phys
         i_timeout = int(np.floor(thresh))
         if not (0 <= i_timeout < total_substeps):
             i_timeout = BIG
 
-        # Earliest event wins; within one substep the old loop's priority was
-        # dock > out-of-bounds > timeout, reproduced by the tie ordering here.
+        # Earliest event wins; ties break dock > out-of-bounds > timeout.
         i_event = min(i_dock, i_oob, i_timeout)
         if i_event == BIG:
             i_end = total_substeps - 1
@@ -521,36 +412,26 @@ class CWRendezvousEnv(gym.Env):
         self.elapsed_time += (i_end + 1) * self.dt_phys
         self.state = seq[i_end].copy()
         if docked:
-            # Snap position to the closest-approach point (true miss distance);
-            # keep the coasted velocity for the terminal vel_error / stop bonus.
+            # Snap to the true closest-approach point; keep the coasted
+            # velocity for the terminal vel_error / stop bonus.
             self.state[:half] = closest[i_end]
 
-        # Coarse (agent-dt) samples of the coast leg for trajectory plotting, so
-        # a decision spanning a whole orbit still renders as a smooth arc rather
-        # than one straight chord. Interior agent-dt boundaries reached before
-        # the terminal substep, plus the true terminal endpoint (matching the
-        # old loop's substate bookkeeping exactly).
+        # Coarse agent-dt samples of the coast, for trajectory plotting.
         substates = [seq[i].copy() for i in range(self.n_substeps - 1, i_end, self.n_substeps)]
         substates.append(self.state.copy())
 
         pos_error = np.linalg.norm(self.state[:half])
         vel_error = np.linalg.norm(self.state[half:])
-
         delta = prev_pos_error - pos_error
 
-        # Dense distance shaping only. Terminal bonuses (dock / fuel / stopping)
-        # are NOT paid here: reaching the target opens the braking phase, and
-        # _brake_step pays them on the post-brake terminal state after the agent
-        # fires its velocity-nulling impulse next step. This mirrors the analytic
-        # two-impulse maneuver whose SECOND burn brakes exactly at the target.
-        # OOB / timeout still end the episode immediately (no brake, no dock).
+        # Dense shaping only; terminal bonuses are paid in _brake_step once the
+        # dock is actually completed (docking here just opens that phase).
         reward_pos = ENV_SHAPING_COEFF * delta / self.curriculum_distance
         reward_fuel = reward_stop = reward_terminal = 0.0
 
         if docked:
             self.braking_phase = True
-            terminated = False
-            truncated = False
+            terminated = truncated = False
         else:
             terminated = bool(out_of_bounds)
             truncated = bool(timeout)
@@ -559,43 +440,33 @@ class CWRendezvousEnv(gym.Env):
 
         observation = self._build_observation()
         info = {
-            "state":           self.state.copy(),
-            "substates":       substates,
-            "coast_units":     coast_units,
-            "distance":        pos_error,
-            # Dock is completed only after the brake; report False here so the
-            # episode is credited as docked on the terminal _brake_step.
-            "docked":          False,
-            "reward_pos":      reward_pos,
-            "reward_fuel":     reward_fuel,
-            "reward_stop":     reward_stop,
+            "state": self.state.copy(),
+            "substates": substates,
+            "coast_units": coast_units,
+            "distance": pos_error,
+            "docked": False,  # credited on the terminal _brake_step instead
+            "reward_pos": reward_pos,
+            "reward_fuel": reward_fuel,
+            "reward_stop": reward_stop,
             "reward_terminal": reward_terminal,
-            "vel_error":       vel_error,
-            "delta_v":         np.linalg.norm(action),
-            "applied_action":  action.copy(),
-            "dv_used":         self.dv_used,
-            "dv_ref":          self.dv_ref,
-            "dv_opt":          self.dv_opt,
+            "vel_error": vel_error,
+            "delta_v": np.linalg.norm(action),
+            "applied_action": action.copy(),
+            "dv_used": self.dv_used,
+            "dv_ref": self.dv_ref,
+            "dv_opt": self.dv_opt,
             "dv_budget_coeff": self.dv_budget_coeff,
             "curriculum_distance": self.curriculum_distance,
             "excursion_limit": self.excursion_limit,
-            "braking_phase":   self.braking_phase,
+            "braking_phase": self.braking_phase,
         }
-
         return observation, reward, terminated, truncated, info
 
     def _brake_step(self, action: np.ndarray):
-        """Terminal braking phase (entered the step AFTER the target is
-        reached; see step()). This action is the agent's final impulse to null
-        its arrival velocity — a true rendezvous rather than a fly-through.
-        There is NO coast: the impulse is applied at the target and the episode
-        terminates immediately, scored on the post-brake speed.
-
-        The minimum-impulse deadzone is deliberately NOT applied here: the
-        optimal brake can be well below it (a fly-through arrives at ~0.21·dv_ref
-        while the coast deadzone is 0.3·dv_ref), so zeroing sub-deadzone burns
-        would make a full stop physically unrepresentable. The total-episode Δv
-        budget still applies (clip, don't zero), same as the transfer step."""
+        """Terminal braking impulse, entered the step after the target is
+        reached. No coast: applied instantly at the target, episode ends here.
+        The deadzone is skipped (the optimal brake can be smaller than it) but
+        the Δv budget still applies."""
         half = self.phys_dim // 2
         u = np.clip(action[: self.impulse_dim], -1.0, 1.0)
         impulse = u * self.max_dv
@@ -611,39 +482,17 @@ class CWRendezvousEnv(gym.Env):
                 burn = remaining
         self.dv_used += burn
 
-        # Impulsive brake changes velocity only; position stays at the snapped
-        # closest-approach point recorded at arrival.
+        # Velocity change only; position stays at the snapped dock point.
         self.state[half:] += impulse
         pos_error = float(np.linalg.norm(self.state[:half]))
         vel_error = float(np.linalg.norm(self.state[half:]))
 
-        # Terminal reward, now that the dock is complete: flat dock bonus + fuel
-        # bonus on TOTAL dv (transfer + brake) + stopping bonus on the post-brake
-        # speed.
-        #
-        # The fuel bonus is graded against dv_opt — the TRUE achievable optimum
-        # for this episode's own geometry (libs/reference.py) — not against
-        # dv_ref, so ratio_opt reads directly as "x optimal" (1.0 == matched the
-        # best maneuver that physically exists from this start). This is what
-        # pushes the policy toward the optimum in BOTH scenarios; grading against
-        # dv_ref instead left everything below the reference on one flat plateau,
-        # which for "rbar" would have let the policy stop at the worse analytic
-        # strategy.
-        #
-        # FLOORED at ENV_FUEL_OPT_FLOOR (just BELOW 1.0) — this floor is lore:
-        #   * It must not be removed. An un-floored coeff/(ratio+eps) collapsed
-        #     training: "less Δv is always better" drove the optimizer onto the
-        #     physical feasibility edge, the actor saturated, every episode flew
-        #     to the excursion boundary and the curriculum regressed 1000->630 m,
-        #     all for ~1% of Δv. Lowering noise 0.15->0.05 did not prevent it.
-        #   * It must not be raised to 1.0 either, or matching the optimum would
-        #     saturate and there'd be no pressure to beat it.
-        # Sitting just under 1.0 gives a small, BOUNDED headroom for beating the
-        # analytic optimum (peak = coeff/floor, only ~11% above the at-optimum
-        # reward) so the pull is a gentle nudge rather than the runaway chase
-        # that broke the un-floored version.
+        # Fuel bonus graded against dv_opt (true optimum for this geometry),
+        # floored at ENV_FUEL_OPT_FLOOR (see constants.py — do not remove the
+        # floor or raise it to 1.0, both break the incentive). Stop bonus
+        # graded on post-brake speed.
         v_scale = self.stop_vel_scale_frac * self.dv_ref
-        stop_quality = 1.0 / (1.0 + vel_error / v_scale)   # in (0, 1]
+        stop_quality = 1.0 / (1.0 + vel_error / v_scale)
         ratio_opt = max(self.dv_used / self.dv_opt, ENV_FUEL_OPT_FLOOR)
         reward_fuel = self.fuel_coeff / ratio_opt
         reward_stop = self.stop_coeff * stop_quality
@@ -654,24 +503,24 @@ class CWRendezvousEnv(gym.Env):
         self.braking_phase = False
         observation = self._build_observation()
         info = {
-            "state":           self.state.copy(),
-            "substates":       [self.state.copy()],
-            "coast_units":     0,
-            "distance":        pos_error,
-            "docked":          True,
-            "reward_pos":      reward_pos,
-            "reward_fuel":     reward_fuel,
-            "reward_stop":     reward_stop,
+            "state": self.state.copy(),
+            "substates": [self.state.copy()],
+            "coast_units": 0,
+            "distance": pos_error,
+            "docked": True,
+            "reward_pos": reward_pos,
+            "reward_fuel": reward_fuel,
+            "reward_stop": reward_stop,
             "reward_terminal": reward_terminal,
-            "vel_error":       vel_error,
-            "delta_v":         burn,
-            "applied_action":  impulse.copy(),
-            "dv_used":         self.dv_used,
-            "dv_ref":          self.dv_ref,
-            "dv_opt":          self.dv_opt,
+            "vel_error": vel_error,
+            "delta_v": burn,
+            "applied_action": impulse.copy(),
+            "dv_used": self.dv_used,
+            "dv_ref": self.dv_ref,
+            "dv_opt": self.dv_opt,
             "dv_budget_coeff": self.dv_budget_coeff,
             "curriculum_distance": self.curriculum_distance,
             "excursion_limit": self.excursion_limit,
-            "braking_phase":   False,
+            "braking_phase": False,
         }
         return observation, reward, True, False, info

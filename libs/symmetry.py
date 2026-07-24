@@ -1,23 +1,15 @@
 """
-Exploits the exact mirror symmetry of the CW rendezvous MDP.
+Enforces the CW rendezvous MDP's exact mirror symmetry: dynamics are linear
+and reward is built from norms, so the MDP is invariant under
+(position, velocity, action) -> -(position, velocity, action).
 
-CW dynamics are linear and every reward term (reward_pos, reward_fuel,
-reward_terminal) is built from norms / abs() values, so the whole MDP is
-invariant under the joint transform:
-    (position, velocity, action) -> -(position, velocity, action)
-(dv_used is a scalar magnitude and is left untouched by the mirror.)
+Rather than hope a generic MLP learns this from data (a policy trained mostly
+on x>0 would have to extrapolate to x<0), this wrapper enforces it
+structurally: an x<0 observation is mirrored into the x>=0 canonical view
+before the policy sees it, and the resulting action is mirrored back before
+being applied. The policy only ever solves the x>=0 half.
 
-Rather than hope a generic MLP discovers this symmetry from data alone —
-unreliable, since a policy trained mostly on x>0 has to *extrapolate* to
-x<0, which is exactly what causes a trained policy to apply the wrong-side
-orbit — this wrapper enforces it structurally: whenever x<0 the observation
-handed to the policy is mirrored into the x>=0 canonical view, and the
-resulting action is mirrored back before being applied to the real
-environment. The policy only ever has to solve the x>=0 half of the
-problem; the x<0 half is exact by construction, not learned.
-
-Must wrap the RAW env (before NormalizedObsEnv) — it needs the true signed
-physical x, not a normalized-to-[0,1] value.
+Must wrap the RAW env (before NormalizedObsEnv) — needs the true signed x.
 """
 
 import numpy as np

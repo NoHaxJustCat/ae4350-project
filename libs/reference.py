@@ -31,32 +31,22 @@ def dv_rbar_strategy_rv(dz: float, omega: float) -> float:
 def dv_rbar_strategy_vv(dz: float, omega: float) -> float:
     """Two V-bar impulses (goal 2, strategy 2). Δv_tot = (ω/2)·Δz.
 
-    CAUTION: this strategy is only realisable when the initial displacement has
-    the specific geometry it assumes, Δx = (3π/4)·Δz ≈ 2.356·Δz (see CLAUDE.md).
-    The "rbar" scenario is configured with Δx = 2·Δz (RBAR_X_TO_Z_RATIO), which
-    is strategy 1's geometry, so this number is NOT achievable from that start —
-    it is a comparison figure only. Do not use it as a reward target: grading
-    against an unreachable Δv makes the fuel bonus pull forever and collapses
-    training. Use optimal_two_impulse_stop_dv_per_m() for the real optimum.
+    CAUTION: only realisable at Δx = (3π/4)·Δz ≈ 2.356·Δz. The "rbar" scenario
+    uses Δx = 2·Δz (strategy 1's geometry), so this figure is NOT achievable
+    from that start — comparison only, never a reward target (grading against
+    an unreachable Δv collapses training). Use
+    optimal_two_impulse_stop_dv_per_m() for the real optimum.
     """
     return omega / 2.0 * abs(dz)
 
 
-# ---------------------------------------------------------------------------
-#   True achievable optimum (numeric)
-# ---------------------------------------------------------------------------
-# The analytic formulas above are each tied to a particular maneuver geometry.
-# For grading a learned policy (and for the fuel reward) what we actually want
-# is the best Δv PHYSICALLY achievable from the scenario's real initial state.
-#
-# A two-impulse rendezvous with fixed endpoints (start at rest at r0, finish at
-# rest at the origin) is a one-parameter family: pick the coast time T, and the
-# first impulse is forced (it is whatever puts an initially at-rest chaser on
-# the trajectory that reaches the origin at T) and so is the second (it cancels
-# the arrival velocity). So the optimum is just a 1-D minimisation over T.
-#
-# A local CW state-transition matrix is built here rather than imported from
-# libs/env.py to avoid a circular import (env imports this module).
+# --- True achievable optimum (numeric) --------------------------------------
+# The formulas above each assume a fixed maneuver geometry. For grading a
+# learned policy we want the best Δv physically achievable from the actual
+# start: a fixed-endpoint two-impulse rendezvous is a 1-D family in the coast
+# time T (the first impulse is whatever reaches the origin at T from rest, the
+# second cancels the arrival velocity), so the optimum is a 1-D minimisation.
+# STM built locally to avoid a circular import with libs/env.py.
 
 
 def _stm_inplane(omega: float, t: float) -> np.ndarray:

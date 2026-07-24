@@ -3,304 +3,138 @@ import numpy as np
 
 MODE_2D: bool = True
 
-# Derived convenience constants (do not edit these directly)
-# Physical state dim: 4 (2D) or 6 (3D)
-PHYS_STATE_DIM: int = 4 if MODE_2D else 6
-# Observation dim = physical state + dv_used scalar + braking-phase flag.
-# The trailing flag is 1.0 exactly on the one observation the agent acts on to
-# fire its terminal BRAKING impulse (set the instant it reaches the target;
-# see CWRendezvousEnv braking_phase / _brake_step) and 0.0 otherwise. It has to
-# be an explicit feature, not inferred from "position ~ 0": at the target the
-# normalized position is only ~0.1% of its range away from any other small
-# position, which LayerNorm washes out — the agent could not reliably tell it
-# is in the brake window without this bit.
-OBS_DIM:    int = PHYS_STATE_DIM + 2       # 6 (2D) or 8 (3D)
-# Action = impulse (one Δv component per axis) + a COAST-DURATION scalar.
-# ACTION_IMPULSE_DIM is the physical impulse part (2 in 2D, 3 in 3D); the
-# trailing +1 is the agent's chosen coast length (see ENV_COAST_* below and
-# CWRendezvousEnv.step()). This turns the MDP from "act every 100 s for 100+
-# steps" into "burn, then say how long to coast" — a handful of decisions per
-# episode — so the fuel-optimal burn/coast/burn transfer is actually
-# reachable by exploration instead of requiring ~30 consecutive near-zero
-# actions to line up by chance.
+# Derived dims (do not edit directly)
+PHYS_STATE_DIM: int = 4 if MODE_2D else 6   # [x,z,xdot,zdot] or [x,y,z,xdot,ydot,zdot]
+# obs = phys state + dv_used + braking-phase flag. The flag is an explicit
+# feature (not inferred from "position ~ 0") because at the target the
+# normalized position is too close to other small positions for LayerNorm to
+# distinguish reliably — see CWRendezvousEnv.braking_phase / _brake_step.
+OBS_DIM: int = PHYS_STATE_DIM + 2           # 6 (2D) or 8 (3D)
+# action = impulse per axis + 1 coast-duration scalar (see ENV_COAST_* below
+# and CWRendezvousEnv.step()) so an episode is a handful of decisions instead
+# of one every 100 s for 100+ steps.
 ACTION_IMPULSE_DIM: int = 2 if MODE_2D else 3
 ACTION_DIM: int = ACTION_IMPULSE_DIM + 1
 
 # --- Orbit / physics constants ---
-EARTH_MU = 3.986 * 10 ** 14  # m^3 / s^2
+EARTH_MU = 3.986 * 10 ** 14            # m^3/s^2
 ORBIT_RADIUS = (6378 + 600) * 10 ** 3  # m
 OMEGA = np.sqrt(EARTH_MU / ORBIT_RADIUS ** 3)
 ORBIT_PERIOD = 2 * np.pi / OMEGA
 
-# --- Curriculum learning defaults ---
-# Defined before ENV_BOUNDARY below so the excursion-limit safety ceiling can
-# be derived from the curriculum range instead of hand-tuned separately —
-# raising ENV_CURRICULUM_MAX_DISTANCE used to silently desync from a fixed
-# ENV_BOUNDARY and break training past ~200 m (see libs/env.py reset()).
+# --- Curriculum learning ---
 ENV_CURRICULUM_ENABLED = True
 ENV_CURRICULUM_START_DISTANCE = 30.0   # starting distance [m]
-ENV_CURRICULUM_MAX_DISTANCE = 1000.0   # final distance [m] (matches ENV_INITIAL_STATE_VBAR norm)
+ENV_CURRICULUM_MAX_DISTANCE = 1000.0   # final distance [m]
 ENV_CURRICULUM_INCREMENT = 10.0        # distance added per successful dock [m]
-# Excursion-limit headroom: CWRendezvousEnv.reset() sets
-# excursion_limit = curriculum_distance * ENV_CURRICULUM_BOUNDARY_MULT, so an
-# episode can drift up to this many multiples of its own starting distance
-# before being flagged out-of-bounds (see libs/env.py's curriculum_boundary_mult).
+# excursion_limit = curriculum_distance * this (see CWRendezvousEnv.reset()).
 ENV_CURRICULUM_BOUNDARY_MULT = 2.0
 
-# --- Environment defaults ---
-# Two decoupled timesteps (see libs/env.py):
-#   ENV_DT_PHYS  : the fine PHYSICS/collision substep. The CW state-transition
-#                  matrix is the exact closed-form solution of the linear
-#                  dynamics, so this introduces NO integration error at any
-#                  size — it exists only to sample the trajectory finely
-#                  enough that (a) the straight-chord docking test is accurate
-#                  and (b) a fast pass-through the 1 m circle can't tunnel
-#                  between samples. Kept at the historical 5 s so the physics
-#                  is byte-identical to every prior run.
-#   ENV_DT_AGENT : the interval at which the RL agent actually acts (applies
-#                  one impulsive Δv), observes, and writes a transition to the
-#                  replay buffer. Larger than dt_phys so an episode spans far
-#                  fewer agent steps, which lets a MUCH lower gamma still
-#                  "see" the terminal reward (see GAMMA below). Must be an
-#                  integer multiple of ENV_DT_PHYS.
+# --- Environment timesteps ---
+# ENV_DT_PHYS: fine physics/collision substep (CW's STM is exact, so this adds
+#   no integration error — it only controls docking/OOB sampling resolution).
+# ENV_DT_AGENT: the agent's decision interval (impulse + coast choice). Larger
+#   than dt_phys so an episode spans far fewer agent steps, letting a lower
+#   gamma still see the terminal reward (see GAMMA below).
 ENV_DT_PHYS = 5.0
 ENV_DT_AGENT = 100.0
-# Back-compat alias: ENV_DT means the AGENT step everywhere downstream
-# (MAX_STEPS, evaluate.py, the env's default dt).
-ENV_DT = ENV_DT_AGENT
+ENV_DT = ENV_DT_AGENT  # alias used throughout (MAX_STEPS, evaluate.py, env default)
 
 # --- Coast-duration action ---
-# The agent's action carries, on top of the impulse, ONE scalar in [-1, 1]
-# that CWRendezvousEnv.step() maps to an integer number of agent-dt "coast"
-# units to ballistically propagate AFTER applying the impulse (docking / OOB
-# checked every fine dt_phys substep throughout, so a fast fly-through still
-# registers). Range chosen so the physically meaningful coasts are all
-# reachable in a single decision:
-#   one orbit  = ORBIT_PERIOD / ENV_DT_AGENT ~= 58 units
-#   half orbit ~= 29 units  (the V-bar two-impulse transfer's coast leg)
-# ENV_COAST_MAX_UNITS comfortably exceeds a full orbit so both the half- and
-# full-orbit transfers, plus a short final trim coast (min 1 unit = 100 s),
-# are all one action apart. coast_frac in [-1,1] -> round to [MIN, MAX].
+# Coast length in agent-dt units. ~58 units = 1 orbit, ~29 = half orbit (the
+# V-bar two-impulse transfer's coast leg); MAX comfortably exceeds a full
+# orbit so both are reachable in one decision.
 ENV_COAST_MIN_UNITS = 1
 ENV_COAST_MAX_UNITS = 72
-# Excursion / out-of-bounds safety ceiling. Derived from the curriculum range
-# (not a hand-picked absolute) so it always covers the largest possible
-# excursion_limit CWRendezvousEnv.reset() can compute
-# (curriculum_distance * ENV_CURRICULUM_BOUNDARY_MULT, maxed out at
-# ENV_CURRICULUM_MAX_DISTANCE). Previously a fixed 200 m tuned for the old
-# 100 m curriculum max — once the curriculum max was raised to 1000 m this
-# silently clamped excursion_limit at 200 regardless of curriculum_distance,
-# so every episode past ~200 m curriculum distance spawned already outside
-# its own boundary and terminated out-of-bounds on the very first step.
+
+# Out-of-bounds safety ceiling, derived from the curriculum range so it always
+# covers the largest excursion_limit reset() can compute.
 ENV_BOUNDARY = ENV_CURRICULUM_MAX_DISTANCE * ENV_CURRICULUM_BOUNDARY_MULT
 ENV_TIMEOUT = 2 * ORBIT_PERIOD
 ENV_POS_TOLERANCE = 5.0
 ENV_VEL_COEFF = 10.0
 ENV_SHAPING_COEFF = 10.0
 ENV_BONUS = 50.0
-# Fuel bonus (paid only on a successful dock, in _brake_step):
+
+# Fuel bonus (paid only on a dock, in _brake_step):
 #     reward_fuel = coeff / max(dv_used/dv_opt, ENV_FUEL_OPT_FLOOR)
-# Constant-elasticity 1/ratio decay (a given PROPORTIONAL fuel improvement is
-# worth the same relative reward change at ratio=20 as at ratio=1.2, so the
-# gradient never vanishes at high ratio — an earlier 1/ratio**3 went flat by
-# ratio~10 and a live run sat at 13-17x for 26k+ episodes). Strictly additive on
-# top of the dock bonus, so it can never make failing to dock look better than a
-# wasteful dock.
-#
-# Graded against dv_opt — the TRUE achievable optimum for the episode's own
-# geometry (libs/reference.py::optimal_two_impulse_stop_dv_per_m) — NOT against
-# dv_ref. So the ratio reads directly as "x optimal" and the policy is pushed to
-# match/beat the best maneuver that physically exists, in BOTH scenarios.
-# Grading against dv_ref instead put every solution below the reference on one
-# flat plateau: harmless for "vbar" (its optimum is 0.42x dv_ref and the policy
-# lands near it anyway) but for "rbar" it would have let the policy settle on
-# the WORSE analytic strategy, since rbar's dv_ref is the R-bar+V-bar maneuver
-# and the true optimum is ~33% cheaper than that.
+# Constant-elasticity 1/ratio (a proportional Δv improvement is worth the same
+# relative reward at any ratio, so the gradient never vanishes at high ratio).
+# Graded against dv_opt, the TRUE achievable optimum for the episode's own
+# geometry (libs/reference.py), not dv_ref — otherwise every solution below the
+# analytic reference sits on one flat plateau, which for "rbar" would let the
+# policy settle on the worse of the two classical strategies.
 ENV_FUEL_COEFF = 500.0
-# Floor on dv_used/dv_opt. BOTH SIDES OF THIS NUMBER ARE LOAD-BEARING:
-#   * Do NOT remove the floor. An un-floored coeff/(ratio+eps) collapsed
-#     training: "less Δv is always better" drove the optimizer onto the physical
-#     feasibility edge (the softest burn that still reaches), the actor
-#     saturated, every episode flew to the excursion boundary, the replay buffer
-#     filled with failures and the curriculum regressed 1000 -> 630 m — all for
-#     ~1% of Δv (1.15x -> 1.14x of optimal). Lowering exploration noise
-#     0.15 -> 0.05 did NOT prevent it.
-#   * Do NOT raise it to 1.0, or merely MATCHING the analytic optimum would
-#     saturate the bonus and nothing would push the policy to beat it.
-# 0.9 gives 10% headroom below the optimum: enough to reward genuinely beating
-# it, while capping the peak at coeff/0.9 — only ~11% above the at-optimum
-# reward — so the incentive is a gentle nudge, not the runaway chase that broke
-# the un-floored version. For scale: a MISS forfeits the whole ~1050-point
-# terminal reward, so shaving the last few % of Δv only pays if it adds under
-# ~6% miss risk. That is exactly the margin-preserving trade we want.
+# Floor on dv_used/dv_opt: must stay < 1.0 (matching the optimum must not
+# saturate the bonus) and must not be removed (an un-floored version let the
+# optimizer ride the physical feasibility edge and collapsed training — see
+# git history "Restore the fuel-bonus floor..."). 0.9 gives 10% headroom to
+# reward beating the optimum, capped at ~11% above the at-optimum reward.
 ENV_FUEL_OPT_FLOOR = 0.9
 
-# --- Terminal-velocity (stopping) bonus ---
-# Paid ONLY on a successful dock and strictly ADDITIVE (like the fuel bonus),
-# so it can never make failing to dock look better than docking. It rewards
-# arriving with LOW relative velocity — an actual rendezvous rather than a
-# fly-through. This is necessary because docking is position-only (within
-# ENV_POS_TOLERANCE, no velocity gate): the minimum-Δv way to satisfy that is a
-# SINGLE impulse coasting through the origin at speed (~0.21x dv_ref, arriving
-# at ~0.0575 m/s for a 1000 m V-bar transfer), which BEATS the analytic
-# references purely because it never brakes. Both classical strategies in
-# CLAUDE.md include the stopping burn, so without this term the learned Δv
-# isn't comparable to them. With it, the optimum becomes burn / coast ~1 orbit
-# / brake — which reproduces the two-V-bar reference Δv (0.1149 m/s) exactly.
-#
-# Smooth 1/(1 + vel_error/v_scale) decay (NOT the fuel term's floored 1/ratio)
-# so the gradient keeps pulling toward vel_error -> 0 instead of saturating
-# once "close enough". v_scale is per-episode (a fraction of dv_ref, m/s) for
-# the same distance-invariance reason as ENV_MAX_DV_COEFF & friends. At 0.05, a
-# fly-through arriving at ~0.21x dv_ref lands at ~1/(1+4.2) ≈ 0.19x the peak,
-# while a true stop gets ~1x — a clear, learnable gap. COEFF=300 makes a
-# stopped dock decisively better than a fly-through even though both saturate
-# the (floored-at-ratio-1) fuel bonus when below dv_ref.
-#
-# The bonus is paid at the terminal state AFTER the agent's dedicated braking
-# impulse (CWRendezvousEnv._brake_step): reaching the target opens a one-step
-# braking phase whose action nulls the arrival velocity, and this bonus scores
-# how close to a full stop it got. COEFF must OUTWEIGH the extra Δv the brake
-# costs so braking is unambiguously worth it: the worst case is the fuel bonus
-# dropping from its 500 peak toward 500/2.5 when a full max_dv (1.5·dv_ref)
-# brake is spent from around ratio 1 — a loss of ~300. COEFF=500 (peak parity
-# with the fuel bonus) clears that with margin, and at the actual optimum
-# (fly-through arrival ~0.21·dv_ref + equal braking impulse -> ~0.42·dv_ref
-# total, still under dv_ref so the fuel bonus stays floored at 500) the brake
-# costs zero fuel bonus, so a near-perfect stop is worth ~+500 for free.
+# Stopping bonus: rewards low arrival speed after the terminal brake, so the
+# agent performs a real rendezvous instead of a fly-through (docking is
+# position-only, so a fly-through would otherwise be the cheapest "dock").
+# Smooth 1/(1+vel_error/v_scale) decay, paid alongside the fuel bonus in
+# _brake_step; COEFF is sized to always outweigh the brake's extra Δv cost.
 ENV_STOP_COEFF = 500.0
 ENV_STOP_VEL_SCALE_FRAC = 0.05
 
-# Physical per-burn actuator cap: max_dv = dv_ref * ENV_MAX_DV_COEFF, set per
-# episode in CWRendezvousEnv.reset() from that scenario/distance's analytic
-# reference Δv (libs/reference.py). Relative to dv_ref rather than a fixed
-# m/s value on purpose — dv_ref scales linearly with distance, so this one
-# coefficient gives the same proportional headroom over the optimal transfer
-# at every curriculum distance (30 m through ENV_CURRICULUM_MAX_DISTANCE)
-# without needing retuning when the curriculum range changes.
+# Per-burn actuator cap: max_dv = dv_ref * this. Relative to dv_ref (not a
+# fixed m/s value) so the headroom over the optimal transfer is the same
+# proportion at every curriculum distance.
 ENV_MAX_DV_COEFF = 1.5
 
-# --- Total Δv BUDGET curriculum, opt-in via --fuel-curriculum ---
-# A SECOND, independent curriculum axis (training.py's
-# DvBudgetCurriculumCallback), gated behind the distance curriculum reaching
-# ENV_CURRICULUM_MAX_DISTANCE. Unlike ENV_MAX_DV_COEFF above (a PER-BURST cap
-# on any single impulse), this caps the TOTAL cumulative dv_used allowed
-# across the WHOLE episode: dv_budget = dv_ref * dv_budget_coeff, enforced in
-# CWRendezvousEnv.step() by clipping (not zeroing) any commanded burn down to
-# whatever budget remains once dv_used would exceed it — the tank runs
-# genuinely dry, direction preserved, magnitude reduced. A per-burst cap
-# alone doesn't limit burn COUNT: an earlier attempt capping only
-# ENV_MAX_DV_COEFF found the agent just chained many separate near-cap burns
-# and kept total dv_used/dv_ref sitting around ~20x even at a tight 1.2x
-# per-burst cap, since the flat docking bonus doesn't scale with efficiency.
-#
-# Starts, once activated, at a deliberately generous 50x dv_ref (looser than
-# the ~20x ratio observed in practice, so it's initially non-binding) and
-# ratchets down MULTIPLICATIVELY (not linearly — see ENV_DV_BUDGET_SHRINK)
-# toward a tight 3x floor as dock rate stays high, mirroring
-# CurriculumCallback's dock-rate-gated advance/stall-regress shape.
+# --- Total Δv budget curriculum, opt-in via --fuel-curriculum ---
+# Second curriculum axis (training.py's DvBudgetCurriculumCallback), gated
+# behind the distance curriculum reaching its max. Caps TOTAL episode dv_used
+# (clipping, not zeroing, any burn that would exceed it) rather than any one
+# burn, since a per-burst cap alone doesn't limit burn count.
 ENV_DV_BUDGET_COEFF_START = 50.0
 ENV_DV_BUDGET_COEFF_FLOOR = 3.0
-# Multiplicative ratchet per dock-rate window. 0.85**(1/3) rather than a
-# fresh round number on purpose: a live run's dock rate was oscillating
-# hard right at each 0.85 step (e.g. 16.03x -> 13.62x, a ~15% cut in one
-# shot), swinging 100%->0%->100% and never settling — the cube root turns
-# every old single step into 3 finer ones (2 new intermediate levels
-# between each old pair), same total 50x->3x range, ~3x more (smaller)
-# ratchets to get there.
+# Cube-root of 0.85 rather than 0.85 directly: finer ratchet steps stopped a
+# live run's dock rate oscillating 100%->0%->100% at each shrink.
 ENV_DV_BUDGET_SHRINK = 0.85 ** (1 / 3)  # ~0.9473
 
-# Burn deadzone / minimum-impulse-bit, as a FRACTION of the episode's max_dv
-# (CWRendezvousEnv.reset() sets burn_deadzone = ENV_BURN_DEADZONE_FRAC *
-# max_dv — relative to dv_ref for the same reason as ENV_MAX_DV_COEFF above,
-# so it stays proportionally sized across the whole curriculum range instead
-# of needing a hand-picked absolute m/s value). Any commanded burn whose
-# magnitude ‖a‖ is below this is treated as EXACTLY zero — no Δv charged, no
-# velocity change. Two reasons:
-#   1. Physical: real thrusters have a minimum impulse bit and an off state;
-#      an arbitrarily small continuous burn isn't realizable anyway.
-#   2. RL-critical (HISTORICAL, pre-coast-action): dv_used sums ‖aₜ‖ over EVERY
-#      agent step, but a neural-net actor can't output exactly zero, so in the
-#      old per-step regime every "coast" step leaked a little Δv and a long
-#      low-fuel coast accumulated MORE waste than a fast burn-straight-in dock.
-#      The coast-duration action removed that failure mode entirely: an episode
-#      is now ~2-3 deliberate impulses (transfer burn, optional trims, terminal
-#      brake) with the coasting done by a SINGLE action's duration, not by a
-#      long run of near-zero steps — so there is no per-step leakage to floor.
-#
-# Consequently the deadzone was LOWERED from 0.2. At 0.2 the deadzone was
-# 0.3·dv_ref, which is LARGER than the fuel-optimal transfer burn itself
-# (~0.21·dv_ref for the ~1-orbit V-bar coast) — it would have zeroed exactly
-# the soft, efficient burns the coast action exists to enable, capping
-# achievable efficiency. 0.05 (deadzone = 0.075·dv_ref) sits well below that
-# optimum so soft burns are representable, while still swallowing the actor's
-# near-zero output on an intended pure-coast step. The terminal brake bypasses
-# the deadzone entirely (see CWRendezvousEnv._brake_step). Set to 0 to disable.
+# Minimum-impulse-bit: a commanded burn below this fraction of max_dv is
+# charged and applied as exactly zero (free coasting). Was 0.2 pre-coast-
+# action (needed to swallow per-step actor leakage); lowered to 0.05 once the
+# coast action removed that failure mode, since 0.2 (0.3*dv_ref) was larger
+# than the optimal transfer burn itself and would have zeroed it. The brake
+# bypasses the deadzone entirely (CWRendezvousEnv._brake_step).
 ENV_BURN_DEADZONE_FRAC = 0.05
 
-# Base (max-curriculum) initial condition. Only the sign/quadrant is
-# randomized per episode (see CWRendezvousEnv._sample_initial_position) —
-# this vector just fixes the V-bar magnitude used at full curriculum
-# distance for the default "vbar" scenario.
 ENV_INITIAL_STATE_VBAR = np.array([100.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
-# --- Scenario config (goals 1 & 2 from CLAUDE.md, plus a generalisation) ---
-# "vbar"  : pure V-bar (x) displacement, sign randomized each episode (+x/-x).
-# "rbar"  : coupled x/z displacement with opposite signs, sign-combo randomized
-#           each episode between (+x,-z) and (-x,+z).
-# "random": the hardest generalisation — the initial displacement points a
-#           UNIFORMLY random direction on the in-plane circle at the curriculum
-#           distance, so a single policy must dock from every angle. The analytic
-#           two-impulse formulas (libs/reference.py) each assume a fixed geometry
-#           and are meaningless here, so dv_ref/dv_opt cannot use them: the
-#           optimum is looked up per episode from the numeric per-direction table
-#           (dv_opt_per_m_table) and the actuator scale dv_ref is derived from it
-#           (see ENV_RANDOM_DV_REF_MULT). 2-D only.
+# --- Scenarios ---
+# "vbar"  : pure V-bar (x) displacement, sign randomized each episode.
+# "rbar"  : coupled x/z displacement, sign-combo randomized each episode.
+# "random": displacement at a uniformly random angle each episode. No analytic
+#           formula applies, so dv_opt is looked up per episode from a numeric
+#           per-angle table (see ENV_RANDOM_* below and libs/reference.py).
 SCENARIO = os.environ.get("AE4350_SCENARIO", "vbar")
-RBAR_X_TO_Z_RATIO = 2.0  # matches the Δx = 2·Δz relation in goal 2 strategy 1
+RBAR_X_TO_Z_RATIO = 2.0  # Δx = 2·Δz, matches goal 2 strategy 1
 
-# "random" scenario actuator scale. There is no analytic dv_ref, so dv_ref is
-# set to ENV_RANDOM_DV_REF_MULT * dv_opt (the numeric optimum for THIS episode's
-# direction). dv_ref only sizes max_dv / deadzone / dv-budget / the dv_used obs
-# scale — the fuel bonus still grades against dv_opt itself. 2.5 gives
-# max_dv = ENV_MAX_DV_COEFF * dv_ref = 3.75 * dv_opt of per-burn headroom, which
-# comfortably clears the largest single optimal burn (measured max 0.875*dv_opt
-# over all directions) with room to explore/correct, and matches the ~3.5-5x
-# headroom "vbar"/"rbar" get from their analytic dv_ref. The transfer burn is
-# always >= 0.5*dv_opt so it clears the deadzone (0.05*max_dv = 0.19*dv_opt);
-# the small terminal brake bypasses the deadzone anyway.
+# "random" actuator scale: dv_ref = this * dv_opt (no analytic reference
+# exists). 2.5 gives max_dv = 3.75*dv_opt, clearing the largest measured
+# single optimal burn (0.875*dv_opt) with headroom to explore/correct.
 ENV_RANDOM_DV_REF_MULT = 2.5
-# Resolution of the per-direction optimum table over [0, pi) (period-pi by the
-# CW point-reflection symmetry). 180 = 1 deg; dv_opt is smooth in the angle so
-# linear interpolation error is negligible.
+# Per-direction dv_opt table resolution over [0, pi) (period-pi by the CW
+# point-reflection symmetry). 180 = 1 deg; dv_opt is smooth so linear
+# interpolation error is negligible.
 ENV_RANDOM_ANGLE_TABLE_N = 180
 
-# Normalization multiplier for the dv_used observation element (see
-# libs/normalization.py): the norm scale is DV_USED_NORM_MULT * max_dv for
-# that episode, not a fixed absolute value — max_dv (= dv_ref * max_dv_coeff)
-# already varies ~12x between "vbar" and "rbar" scenarios and linearly with
-# curriculum distance, so a single fixed scale can't cover both without
-# saturating dv_used to 1.0 for most of the episode in whichever case it
-# wasn't tuned for. 5x max_dv gives headroom for a multi-burn trajectory to
-# spend a few times the single-burn cap before the feature saturates.
+# dv_used observation scale = this * max_dv (per-episode, since max_dv varies
+# with scenario/distance). Headroom for a multi-burn trajectory to exceed the
+# single-burn cap a few times before the feature saturates.
 DV_USED_NORM_MULT = 5.0
 
 # --- Training defaults ---
-# The discount has to make the SLOW fuel-optimal transfer's terminal reward
-# survive back to the early "coast, don't burn" decisions, otherwise the
-# agent just fast-burns (see the ENV_FUEL_COEFF note). The number of AGENT
-# steps to that payoff is what matters, and that is now set by ENV_DT_AGENT,
-# not the physics dt:
-#   old: dt = 5 s  -> a ~1 orbit (~5800 s) transfer is ~1160 steps, so you
-#        needed gamma ~0.9999 (0.9999**1160 ~= 0.89) to see the reward — and
-#        that long an effective horizon (1/(1-gamma) ~= 10000) diverges the
-#        critic on anything but a tiny net.
-#   now: dt_agent = 100 s -> the same transfer is ~58 agent steps, so a MUCH
-#        gentler gamma sees it: 0.99**58 ~= 0.56. Effective horizon
-#        1/(1-0.99) = 100 steps ~ one max episode (ENV_TIMEOUT/dt_agent), so
-#        credit assignment is easy and wide/deep nets train stably.
-# This is the whole point of raising ENV_DT_AGENT: trade the (physically
-# free) fine control cadence for a short-horizon MDP a smart net can learn.
+# gamma must let the terminal reward survive back to early "coast, don't burn"
+# decisions. Raising ENV_DT_AGENT (fewer, longer agent steps per transfer) is
+# what makes a low, stable gamma sufficient instead of needing gamma~0.9999
+# with the fine physics dt, which diverges the critic on anything but a tiny
+# net.
 GAMMA = 0.99
 MAX_STEPS = int(ENV_TIMEOUT / ENV_DT) + 1
 
@@ -313,53 +147,31 @@ BATCH_SIZE = 256 * 5
 MIN_BUFFER = 5_000
 REPLAY_BUFFER_SIZE = 300_000
 
-# Parallel envs for rollout collection (the single biggest, safest lever for
-# wall-clock speed — env.step() is a cheap analytic matrix multiply, so
-# throughput scales ~linearly with cores). Override with --n-envs.
+# Parallel envs for rollout collection; override with --n-envs.
 NUM_ENVS = max(1, min((os.cpu_count() or 4) - 1, 16))
 
-# Exploration noise (OU, TD3-style — NOT tied to any fuel budget). Kept as
-# OU rather than i.i.d. Gaussian on purpose: exploration is a temporally
-# correlated random walk, so it can linger near zero (or hold a sustained
-# push) for many consecutive agent steps — needed to ever stumble into the
-# true-optimal V-bar transfer's ~230+ consecutive steps of coasting, which
-# i.i.d. per-step noise essentially cannot produce by chance.
+# Exploration noise (OU, TD3-style). OU rather than i.i.d. Gaussian so a
+# sustained push or near-zero stretch can persist for many consecutive steps
+# — needed to reach the long coasting stretches the optimal transfer requires.
 #
-# ACTION_NOISE_STD_* is the quantity that actually matters — the noise's
-# stationary std in the env's native [-1,1] action units (always [-1,1]
-# regardless of ENV_MAX_DV_COEFF; CWRendezvousEnv.step() scales u to the
-# physical impulse internally). It is NOT the same as the `sigma` parameter
-# OrnsteinUhlenbeckActionNoise takes: for the discrete OU update SB3 uses
-# (x += theta*(mean-x)*dt + sigma*sqrt(dt)*noise), the stationary std is
-# sigma / sqrt(2*theta - theta**2*dt), ~1.83x the sigma parameter at
-# OU_THETA/OU_DT below — verified empirically (see scratch check). The
-# previous ACTION_NOISE_SIGMA_* constants were passed straight into `sigma`
-# without this correction, so the *actual* std was ~1.83x bigger than the
-# number suggested — with the old 0.5 that meant a stationary std of ~0.94
-# on a box of half-width 1 (i.e. saturating near +-1 almost constantly),
-# leaving the burn deadzone (0.2, see ENV_BURN_DEADZONE_FRAC) essentially
-# unreachable through nearly all of training (decay only completes at
-# NOISE_DECAY_FRAC * TOTAL_TIMESTEPS). STD_START=0.25 instead gives noise a
-# genuine chance to dip under the deadzone (~30% instantaneous probability
-# of the 2-D noise norm alone landing under 0.2) while still producing
-# meaningful directed excursions (real optimal actions rarely need more than
-# a fraction of max_dv anyway).
-OU_THETA = 0.15   # SB3 OrnsteinUhlenbeckActionNoise default; pinned explicitly
-OU_DT    = 0.01   # so the amplification-factor math below can't silently drift
+# ACTION_NOISE_STD_* is the noise's stationary std in the env's native [-1,1]
+# action units — NOT the same as OrnsteinUhlenbeckActionNoise's `sigma` param.
+# For SB3's discrete OU update, stationary std = sigma / sqrt(2*theta -
+# theta**2*dt) = sigma * OU_STD_PER_SIGMA (~1.83x at the theta/dt below), so
+# ACTION_NOISE_SIGMA_* below applies that correction.
+OU_THETA = 0.15
+OU_DT = 0.01
 OU_STD_PER_SIGMA = (2 * OU_THETA - OU_THETA ** 2 * OU_DT) ** -0.5
 
-ACTION_NOISE_STD_START = 0.4
-ACTION_NOISE_STD_END   = 0.1
+ACTION_NOISE_STD_START = 0.1
+ACTION_NOISE_STD_END = 0.01
 ACTION_NOISE_SIGMA_START = ACTION_NOISE_STD_START / OU_STD_PER_SIGMA
-ACTION_NOISE_SIGMA_END   = ACTION_NOISE_STD_END / OU_STD_PER_SIGMA
-NOISE_DECAY_FRAC = 0.75  # ~3x faster than the old 0.7 — noise was still near
-# sigma_start at 20% of training, starving the agent of low-noise fuel-
-# efficiency practice for the back 80% of the run.
+ACTION_NOISE_SIGMA_END = ACTION_NOISE_STD_END / OU_STD_PER_SIGMA
+NOISE_DECAY_FRAC = 0.35  # fraction of training over which noise decays to END
 
-# TD3 target-policy-smoothing noise. SB3 defaults (0.2 / 0.5) already assume
-# the actual action range here, [-1, 1] — no rescaling needed (see above).
+# TD3 target-policy-smoothing noise; SB3 defaults already assume [-1,1] actions.
 TD3_TARGET_POLICY_NOISE = 0.2
-TD3_TARGET_NOISE_CLIP   = 0.5
+TD3_TARGET_NOISE_CLIP = 0.5
 
 TOTAL_TIMESTEPS = 10_000_000
 
