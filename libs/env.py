@@ -51,7 +51,25 @@ from libs.reference import (
 # ---------------------------------------------------------------------------
 
 def _build_stm_full(omega: float, dt: float) -> np.ndarray:
-    """Full 6x6 CW state-transition matrix for one timestep dt."""
+    """Full 6x6 CW state-transition matrix for one timestep dt.
+
+    Phi(t) = expm(A*t) solves the linearized relative-motion ODE in closed
+    form. For the in-plane pair [x, z, xdot, zdot] (n = omega), verified
+    symbolically and numerically against this matrix:
+
+        x(t)  = x0 + (6nt - 6 sin(nt)) z0 + (4 sin(nt)/n - 3t) xdot0
+                + (2/n)(1 - cos(nt)) zdot0
+        z(t)  = (4 - 3 cos(nt)) z0 + (2/n)(cos(nt) - 1) xdot0
+                + (sin(nt)/n) zdot0
+        xdot(t) = 6n(1 - cos(nt)) z0 + (4 cos(nt) - 3) xdot0 + 2 sin(nt) zdot0
+        zdot(t) = 3n sin(nt) z0 - 2 sin(nt) xdot0 + cos(nt) zdot0
+
+    x never feeds back into z/zdot (only z and xdot do); the "6nt - 6sin(nt)"
+    term in x(t) is the classic CW along-track secular drift. Repeated
+    application composes exactly (Phi(dt)^k == Phi(k*dt)), which is what lets
+    CWRendezvousEnv precompute stm^k and propagate a whole coast in one
+    batched matmul instead of a step-by-step loop.
+    """
     A = np.zeros((6, 6))
     A[0, 3] = 1.0
     A[1, 4] = 1.0
