@@ -161,17 +161,47 @@ def build_diagnostics_figure(cb: "TrainingCallback", scenario: str):
     axes[2, 1].grid(True, alpha=0.3)
 
     axes[2, 2].plot(cb.episode_curriculum_distances, color="tab:olive", linewidth=2, label="distance")
-    axes[2, 2].set_title("Curriculum distance + Δv budget (shared across all envs)")
-    axes[2, 2].set_ylabel("m")
+    axes[2, 2].set_ylabel("m", color="tab:olive")
+    axes[2, 2].tick_params(axis="y", colors="tab:olive")
     axes[2, 2].set_xlabel("Episode")
     axes[2, 2].grid(True, alpha=0.3)
+
+    # The other curriculum axes share the episode x-axis but have completely
+    # different units, so each active one gets its own right-hand y-axis. Only
+    # the axes actually running in THIS run are drawn (both are opt-in), and a
+    # second one has its spine pushed outward so the tick columns don't
+    # overlap. (values, colour, y-label, legend label, ylim)
+    twins = []
     if any(not np.isnan(c) for c in cb.episode_dv_budget_coeffs):
-        ax_budget = axes[2, 2].twinx()
-        ax_budget.plot(cb.episode_dv_budget_coeffs, color="tab:red", linewidth=2, label="dv_budget_coeff")
-        ax_budget.set_ylabel("dv_budget_coeff (x dv_ref)")
-        lines_l, labels_l = axes[2, 2].get_legend_handles_labels()
-        lines_r, labels_r = ax_budget.get_legend_handles_labels()
-        axes[2, 2].legend(lines_l + lines_r, labels_l + labels_r, loc="best")
+        twins.append((cb.episode_dv_budget_coeffs, "tab:red",
+                       "dv_budget_coeff (× dv_ref)", "Δv budget", None))
+    if any(not np.isnan(a) for a in cb.episode_angle_half_widths):
+        # Fixed 0..max scale rather than autoscaled: the useful reading is
+        # "how far toward the full circle has the sector opened", and at the
+        # max the sector IS the uniform draw (see ENV_ANGLE_CURRICULUM_* ).
+        twins.append((cb.episode_angle_half_widths, "tab:blue",
+                       "angle sector half-width (deg)", "angle sector",
+                       (0.0, ENV_ANGLE_CURRICULUM_MAX_DEG)))
+
+    lines, labels = axes[2, 2].get_legend_handles_labels()
+    for k, (values, color, ylabel, label, ylim) in enumerate(twins):
+        ax_twin = axes[2, 2].twinx()
+        if k:
+            ax_twin.spines["right"].set_position(("outward", 55))
+        ax_twin.plot(values, color=color, linewidth=2, label=label)
+        ax_twin.set_ylabel(ylabel, color=color)
+        ax_twin.tick_params(axis="y", colors=color)
+        if ylim is not None:
+            ax_twin.set_ylim(*ylim)
+        twin_lines, twin_labels = ax_twin.get_legend_handles_labels()
+        lines += twin_lines
+        labels += twin_labels
+
+    title = "Curriculum distance"
+    if twins:
+        title += " + " + " + ".join(t[3] for t in twins)
+        axes[2, 2].legend(lines, labels, loc="best")
+    axes[2, 2].set_title(f"{title} (shared across all envs)")
 
     fig.tight_layout()
     return fig
@@ -667,12 +697,17 @@ class TrainingCallback(BaseCallback):
     """
 
     def __init__(self, tmp_dir: Path, n_envs: int, log_every: int = LOG_EVERY,
-                 curriculum_callback: "CurriculumCallback | None" = None):
+                 curriculum_callback: "CurriculumCallback | None" = None,
+                 angle_curriculum_callback: "AngleCurriculumCallback | None" = None):
         super().__init__(verbose=0)
         self.tmp_dir   = tmp_dir
         self.n_envs    = n_envs
         self.log_every = log_every
         self.curriculum_callback = curriculum_callback
+        # Only used to decide whether the angle sector is worth recording:
+        # the env always reports angle_half_width_deg, but it's a meaningless
+        # constant 90 unless a curriculum is actually driving it.
+        self.angle_curriculum_callback = angle_curriculum_callback
 
         self.episode_rewards        = []
         self.episode_steps          = []
@@ -685,6 +720,7 @@ class TrainingCallback(BaseCallback):
         self.episode_noise_std      = []
         self.episode_curriculum_distances = []
         self.episode_dv_budget_coeffs = []
+        self.episode_angle_half_widths = []
 
         self._acc = [self._new_accumulator() for _ in range(n_envs)]
         self._episode_num = 0
@@ -786,6 +822,13 @@ class TrainingCallback(BaseCallback):
                 dv_ratio   = acc["delta_v"] / dv_opt if dv_opt else float("nan")
                 dv_budget_coeff = info.get("dv_budget_coeff")
                 dv_budget_coeff = float(dv_budget_coeff) if dv_budget_coeff is not None else float("nan")
+                # NaN when no angle curriculum is running, which is what keeps
+                # the diagnostics panel from drawing a flat, meaningless line.
+                angle_half_width = (
+                    float(info.get("angle_half_width_deg", float("nan")))
+                    if self.angle_curriculum_callback is not None
+                    else float("nan")
+                )
 
                 self.episode_rewards.append(reward)
                 self.episode_steps.append(steps)
@@ -798,6 +841,7 @@ class TrainingCallback(BaseCallback):
                 self.episode_noise_std.append(noise_std)
                 self.episode_curriculum_distances.append(cur_dist)
                 self.episode_dv_budget_coeffs.append(dv_budget_coeff)
+                self.episode_angle_half_widths.append(angle_half_width)
 
                 ep = self._episode_num
                 if ep % self.log_every == 0:
@@ -1357,7 +1401,8 @@ def main():
         remaining_timesteps = args.total_timesteps
 
     callback = [
-        TrainingCallback(tmp_dir=tmp_dir, n_envs=n_envs, curriculum_callback=curriculum_callback),
+        TrainingCallback(tmp_dir=tmp_dir, n_envs=n_envs, curriculum_callback=curriculum_callback,
+                          angle_curriculum_callback=angle_curriculum_callback),
         NoiseDecayCallback(
             total_timesteps=remaining_timesteps,
             sigma_start=noise_sigma_start,
@@ -1429,6 +1474,7 @@ def main():
         noise_std  = np.array(cb.episode_noise_std),
         curriculum_distance = np.array(cb.episode_curriculum_distances),
         dv_budget_coeff = np.array(cb.episode_dv_budget_coeffs),
+        angle_half_width_deg = np.array(cb.episode_angle_half_widths),
     )
     print("Done.")
 
