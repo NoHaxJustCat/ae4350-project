@@ -9,6 +9,7 @@ Usage:
 import argparse
 from collections import deque
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -102,6 +103,28 @@ def make_single_env(scenario: str, curriculum_start_distance: float | None = Non
         env = NormalizedObsEnv(env)
         return Monitor(env)
     return _init
+
+
+def json_number(value):
+    """Coerce a number for status.json, mapping None and any non-finite float
+    to None (-> JSON null).
+
+    Python's json.dumps emits BARE NaN/Infinity tokens, which are not valid
+    JSON. status.json is parsed by watch_remote_training.ps1 via
+    ConvertFrom-Json, which rejects them — and since that parse sits inside a
+    bare `catch { }`, a single NaN made the whole run vanish from the
+    dashboard rather than showing an error. Every numeric field there is
+    already optional (the watcher guards each with `$null -ne`), so null is
+    the honest encoding for "this run has no value for that".
+
+    NaN is how the per-episode histories mark an INACTIVE curriculum axis
+    (e.g. dv_budget_coeff without --fuel-curriculum) — meaningful in-process
+    and fine in history.npz, but it must not reach the JSON.
+    """
+    if value is None:
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
 
 
 def moving_average(values, window=SMOOTHING_WINDOW):
@@ -931,23 +954,31 @@ class LiveDiagnosticsCallback(BaseCallback):
             "num_timesteps": int(self.num_timesteps),
             "total_timesteps": int(self.total_timesteps),
             "episode_count": len(cb.episode_rewards),
-            "recent_dock_rate": float(np.mean(dock_window)) if dock_window else None,
-            "recent_avg_reward": float(np.mean(reward_window)) if reward_window else None,
-            "curriculum_distance": (float(cb.episode_curriculum_distances[-1])
-                                     if cb.episode_curriculum_distances else None),
-            "dv_budget_coeff": (float(cb.episode_dv_budget_coeffs[-1])
-                                 if cb.episode_dv_budget_coeffs else None),
-            "angle_half_width_deg": (
-                float(self.angle_curriculum_callback.half_width_deg)
-                if self.angle_curriculum_callback is not None
-                and self.angle_curriculum_callback.half_width_deg is not None
-                else None
-            ),
-            "elapsed_seconds": elapsed,
-            "steps_per_sec": (self.num_timesteps / elapsed) if elapsed > 0 else None,
+            "recent_dock_rate": json_number(np.mean(dock_window) if dock_window else None),
+            "recent_avg_reward": json_number(np.mean(reward_window) if reward_window else None),
+            "curriculum_distance": json_number(
+                cb.episode_curriculum_distances[-1] if cb.episode_curriculum_distances else None),
+            # null (not NaN) whenever --fuel-curriculum is off, which is the
+            # default — see json_number.
+            "dv_budget_coeff": json_number(
+                cb.episode_dv_budget_coeffs[-1] if cb.episode_dv_budget_coeffs else None),
+            "angle_half_width_deg": json_number(
+                self.angle_curriculum_callback.half_width_deg
+                if self.angle_curriculum_callback is not None else None),
+            "elapsed_seconds": json_number(elapsed),
+            "steps_per_sec": json_number((self.num_timesteps / elapsed) if elapsed > 0 else None),
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        self.status_path.write_text(json.dumps(status))
+        # allow_nan=False so a future field that forgets json_number fails here
+        # instead of writing the bare NaN token that silently drops the run
+        # from the watcher's dashboard. Caught, though: a diagnostics snapshot
+        # must never be able to kill a multi-hour training run.
+        try:
+            payload = json.dumps(status, allow_nan=False)
+        except ValueError as exc:
+            print(f"WARNING: {self.status_path} not written — non-finite value: {exc}")
+            return
+        self.status_path.write_text(payload)
 
     def _on_step(self) -> bool:
         now = time.perf_counter()
