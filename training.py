@@ -594,11 +594,17 @@ class EvalSaveBestCallback(BaseCallback):
 
     Evaluation uses the CURRENT curriculum state (distance, and angle sector if
     an angle curriculum is running), so an early-curriculum model is scored on
-    the task it is actually being trained on rather than the final one. That
-    does mean scores from different curriculum stages are not comparable — the
-    saved "best" is therefore reset whenever the curriculum advances, so this
-    tracks "best at the hardest stage reached so far" rather than letting an
-    easy-stage score block all later saves.
+    the task it is actually being trained on rather than the final one.
+
+    That means scores from different curriculum stages are NOT comparable, so
+    the best score is tracked per stage and the file is only written when the
+    run is at the hardest stage it has reached so far. Comparing only within a
+    stage matters more than it sounds: a curriculum that regresses (the angle
+    sector narrows on a stall, and the distance curriculum can step back too)
+    revisits stages repeatedly, and an earlier version of this that simply
+    reset the bar on every stage CHANGE thrashed — it declared "new best" on a
+    score of 131 right after one of 157 — degenerating into "save the latest
+    model", which is precisely the failure it exists to prevent.
 
     Scored on mean deterministic episode return, which already folds in dock
     success (~600 of terminal bonus), fuel (500/ratio) and arrival speed
@@ -616,9 +622,12 @@ class EvalSaveBestCallback(BaseCallback):
         self.eval_freq_calls = max(eval_freq_timesteps // max(n_envs, 1), 1)
         self.curriculum_callback = curriculum_callback
         self.angle_curriculum_callback = angle_curriculum_callback
-        self.best_score = -np.inf
+        # Best score per curriculum stage, plus the hardest stage reached.
+        # Both keyed/ordered on (distance, angle_half_width): larger is harder
+        # on both axes, so plain tuple comparison ranks difficulty.
+        self._best_by_stage: dict = {}
+        self._hardest = None
         self.best_at = None
-        self._stage = None
         self._raw = None
         self._env = None
 
@@ -630,15 +639,26 @@ class EvalSaveBestCallback(BaseCallback):
         self._env = NormalizedObsEnv(CanonicalizeDirectionEnv(self._raw))
 
     def _sync_curriculum(self):
-        """Mirror the live curriculum onto the eval env, and report the stage
-        so a curriculum change can reset the best-score baseline."""
+        """Mirror the live curriculum onto the eval env and return the stage
+        it is now evaluating at, as a (distance, angle_half_width) tuple.
+
+        The returned values are ROUNDED. Repeated widen/narrow arithmetic plus
+        the clip in set_angle_half_width leaves the sector at values like
+        0.10000000000000009 or 0.09999999999999998 rather than 0.1, and the
+        stage is used both as a dict key and in an ordering comparison: without
+        rounding, one stage becomes many distinct keys (so the within-stage
+        best is lost) and a numerically identical stage can compare as
+        "easier", locking out saves. Rounding is applied only to the bookkeeping
+        value — the env still gets the exact number."""
         dist = angle = None
         if self.curriculum_callback is not None and self.curriculum_callback.curriculum_distance is not None:
             dist = self.curriculum_callback.curriculum_distance
             self._raw.set_curriculum_distance(dist)
+            dist = round(float(dist), 3)
         if self.angle_curriculum_callback is not None and self.angle_curriculum_callback.half_width_deg is not None:
             angle = self.angle_curriculum_callback.half_width_deg
             self._raw.set_angle_half_width(angle)
+            angle = round(float(angle), 3)
         return (dist, angle)
 
     def _evaluate(self):
@@ -656,19 +676,36 @@ class EvalSaveBestCallback(BaseCallback):
             docks += bool(info.get("docked", False))
         return float(np.mean(returns)), docks / self.n_episodes
 
+    @staticmethod
+    def _hardness(stage):
+        """Sort key for curriculum difficulty. None (axis not running) is the
+        easiest, so it never outranks a real value."""
+        return tuple(-np.inf if v is None else float(v) for v in stage)
+
     def _on_step(self) -> bool:
         if self.n_calls % self.eval_freq_calls != 0:
             return True
 
         stage = self._sync_curriculum()
-        if stage != self._stage:
-            # New curriculum stage -> old scores are for a different task.
-            self._stage = stage
-            self.best_score = -np.inf
+        hardness = self._hardness(stage)
+        if self._hardest is None or hardness > self._hardest:
+            self._hardest = hardness
 
         score, dock_rate = self._evaluate()
-        if score > self.best_score:
-            self.best_score = score
+        prev = self._best_by_stage.get(stage, -np.inf)
+        self._best_by_stage[stage] = max(prev, score)
+
+        stage_txt = (f"d={stage[0]:.0f}m" if stage[0] is not None else "d=-") + \
+                    (f" a=±{stage[1]:.2f}°" if stage[1] is not None else "")
+        # Only the hardest stage reached may write the file: a curriculum that
+        # regressed to an easier stage would otherwise overwrite a harder-stage
+        # best with a score that is higher only because the task got easier.
+        if hardness < self._hardest:
+            hardest_txt = f"d={self._hardest[0]:.0f}m a=±{self._hardest[1]:.2f}°"
+            print(f"[eval] {self.num_timesteps} steps [{stage_txt}]: return {score:.1f}, "
+                  f"dock {100*dock_rate:.0f}% (curriculum regressed from {hardest_txt} — "
+                  f"best_model not touched)")
+        elif score > prev:
             self.best_at = self.num_timesteps
             self.save_path.parent.mkdir(parents=True, exist_ok=True)
             self.model.save(str(self.save_path))
@@ -677,11 +714,11 @@ class EvalSaveBestCallback(BaseCallback):
                        "eval_mean_return": score, "eval_dock_rate": dock_rate}
             self.save_path.with_suffix(".curriculum.json").write_text(
                 json.dumps({k: v for k, v in sidecar.items() if v is not None}))
-            print(f"[eval] {self.num_timesteps} steps: mean return {score:.1f}, "
+            print(f"[eval] {self.num_timesteps} steps [{stage_txt}]: return {score:.1f}, "
                   f"dock {100*dock_rate:.0f}% -> NEW BEST, saved {self.save_path}.zip")
         else:
-            print(f"[eval] {self.num_timesteps} steps: mean return {score:.1f}, "
-                  f"dock {100*dock_rate:.0f}% (best {self.best_score:.1f} @ {self.best_at})")
+            print(f"[eval] {self.num_timesteps} steps [{stage_txt}]: return {score:.1f}, "
+                  f"dock {100*dock_rate:.0f}% (best here {prev:.1f} @ {self.best_at})")
         return True
 
 
