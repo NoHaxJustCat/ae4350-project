@@ -23,7 +23,10 @@ from stable_baselines3 import TD3
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
-from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
+from stable_baselines3.common.noise import (
+    OrnsteinUhlenbeckActionNoise,
+    VectorizedActionNoise,
+)
 from stable_baselines3.common.monitor import Monitor
 
 from libs.constants import (
@@ -38,6 +41,9 @@ from libs.constants import (
     ENV_CURRICULUM_INCREMENT,
     ENV_CURRICULUM_MAX_DISTANCE,
     ENV_CURRICULUM_START_DISTANCE,
+    ENV_ANGLE_CURRICULUM_START_DEG,
+    ENV_ANGLE_CURRICULUM_MAX_DEG,
+    ENV_ANGLE_CURRICULUM_INCREMENT_DEG,
     ENV_DV_BUDGET_COEFF_FLOOR,
     ENV_DV_BUDGET_COEFF_START,
     ENV_DV_BUDGET_SHRINK,
@@ -68,7 +74,8 @@ from libs.trajectory import plot_trajectory
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def make_single_env(scenario: str, curriculum_start_distance: float | None = None,
-                     dv_budget_coeff_start: float | None = None):
+                     dv_budget_coeff_start: float | None = None,
+                     angle_half_width_deg: float | None = None):
     def _init():
         # Runs inside each SubprocVecEnv worker. Each worker only ever does
         # a 4x4 matmul per step — letting it default to a multi-threaded
@@ -88,6 +95,8 @@ def make_single_env(scenario: str, curriculum_start_distance: float | None = Non
             env_kwargs["curriculum_start_distance"] = curriculum_start_distance
         if dv_budget_coeff_start is not None:
             env_kwargs["dv_budget_coeff"] = dv_budget_coeff_start
+        if angle_half_width_deg is not None:
+            env_kwargs["angle_half_width_deg"] = angle_half_width_deg
         env = CWRendezvousEnv(omega=OMEGA, scenario=scenario, **env_kwargs)
         env = CanonicalizeDirectionEnv(env)  # must wrap the raw (unnormalized) env
         env = NormalizedObsEnv(env)
@@ -254,19 +263,19 @@ class PeriodicCheckpointCallback(BaseCallback):
     periodically, so a dropped SSH session doesn't lose all progress —
     only whatever happened since the last checkpoint.
 
-    Also writes a small <name>_<steps>_steps.curriculum.json sidecar with
-    the curriculum_distance (and, if a DvBudgetCurriculumCallback is active,
-    dv_budget_coeff) at save time. SB3's model.save() only persists the
-    policy/optimizer/num_timesteps — curriculum_distance/dv_budget_coeff
-    live in CurriculumCallback/DvBudgetCurriculumCallback, not the model, so
-    --resume-from needs this sidecar to avoid silently restarting either
-    curriculum from the beginning.
+    Also writes a small <name>_<steps>_steps.curriculum.json sidecar with the
+    curriculum_distance (plus dv_budget_coeff and/or angle_half_width_deg if
+    their callbacks are active) at save time. SB3's model.save() only persists
+    the policy/optimizer/num_timesteps — every curriculum's state lives in its
+    callback, not the model, so --resume-from needs this sidecar to avoid
+    silently restarting them from the beginning.
     """
 
     def __init__(self, save_dir: Path, name_prefix: str, n_envs: int,
                  save_freq_timesteps: int = 1000, keep_last: int = 20,
                  curriculum_callback: "CurriculumCallback | None" = None,
-                 dv_budget_curriculum_callback: "DvBudgetCurriculumCallback | None" = None):
+                 dv_budget_curriculum_callback: "DvBudgetCurriculumCallback | None" = None,
+                 angle_curriculum_callback: "AngleCurriculumCallback | None" = None):
         super().__init__(verbose=0)
         self.save_dir = save_dir
         self.name_prefix = name_prefix
@@ -274,6 +283,7 @@ class PeriodicCheckpointCallback(BaseCallback):
         self.save_freq_calls = max(save_freq_timesteps // n_envs, 1)
         self.curriculum_callback = curriculum_callback
         self.dv_budget_curriculum_callback = dv_budget_curriculum_callback
+        self.angle_curriculum_callback = angle_curriculum_callback
 
     def _on_step(self) -> bool:
         if self.n_calls % self.save_freq_calls == 0:
@@ -285,6 +295,8 @@ class PeriodicCheckpointCallback(BaseCallback):
                 sidecar_data = {"curriculum_distance": self.curriculum_callback.curriculum_distance}
                 if self.dv_budget_curriculum_callback is not None:
                     sidecar_data["dv_budget_coeff"] = self.dv_budget_curriculum_callback.dv_budget_coeff
+                if self.angle_curriculum_callback is not None:
+                    sidecar_data["angle_half_width_deg"] = self.angle_curriculum_callback.half_width_deg
                 sidecar = path.with_suffix(".curriculum.json")
                 sidecar.write_text(json.dumps(sidecar_data))
 
@@ -349,18 +361,19 @@ class CurriculumCallback(BaseCallback):
     def _on_training_start(self) -> None:
         self.curriculum_distance = self.training_env.get_attr("curriculum_distance")[0]
 
-    def lock(self) -> None:
+    def lock(self, reason: str = "fuel curriculum active") -> None:
         """Freezes curriculum_distance permanently: _on_step becomes a no-op,
         so it can no longer advance OR regress regardless of dock rate.
         Called by DvBudgetCurriculumCallback the instant the fuel curriculum
-        activates (see its _on_step/_on_training_start), so a dip in dock
-        rate while the Δv budget is being tightened can't ALSO regress the
-        distance out from under it — the two axes shouldn't fight each
-        other. No effect if --fuel-curriculum is off (nothing ever calls
-        this), so normal runs keep the old regress-on-stall behavior."""
+        activates, and by AngleCurriculumCallback the instant the angle sector
+        starts widening (see their _on_step/_on_training_start), so a dip in
+        dock rate while that other axis is being tightened can't ALSO regress
+        the distance out from under it — the axes shouldn't fight each other.
+        No effect if neither is enabled (nothing ever calls this), so normal
+        runs keep the old regress-on-stall behavior."""
         if not self.locked:
             self.locked = True
-            print(f"[curriculum] locked at {self.curriculum_distance:.1f} m (fuel curriculum active)")
+            print(f"[curriculum] locked at {self.curriculum_distance:.1f} m ({reason})")
 
     @property
     def progress(self) -> str:
@@ -401,6 +414,109 @@ class CurriculumCallback(BaseCallback):
                       f"{self.stall_patience} windows -> regressing to {self.curriculum_distance:.1f} m")
                 self._stalled_windows = 0
             self._recent_docks.clear()
+        return True
+
+
+class AngleCurriculumCallback(BaseCallback):
+    """
+    Curriculum over the "random" scenario's initial-direction SECTOR, gated
+    behind CurriculumCallback's distance ramp the same way
+    DvBudgetCurriculumCallback is.
+
+    The env draws each episode's displacement direction from a sector of
+    half-width `half_width_deg` centred on a V-bar axis (see
+    CWRendezvousEnv._sample_direction). This callback starts that sector
+    narrow, and widens it by `increment_deg` each time the pooled dock rate
+    clears the threshold, until it reaches 90 deg — which IS the plain uniform
+    draw over the whole circle, so a graduated run is training on exactly the
+    original task, not an easier one.
+
+    Why this axis exists at all (measured on the 2M-step uniform run): the
+    achievable optimum varies 23.6x with direction, V-bar is a cusp in it, and
+    the optimal coasting trajectory has only ~20% excursion margin off-axis
+    versus ~96% at V-bar. Sampling uniformly from step one therefore terminates
+    most exploratory coasts out-of-bounds, and the policy converges to
+    brute-force thrusting at ~11x optimal with the coast command pinned to its
+    minimum. Ramping outward from V-bar — where a specialist already reaches
+    1.15x optimal — keeps a working coasting solution in the replay buffer
+    while the sector opens.
+
+    Like DvBudgetCurriculumCallback this locks the distance curriculum on
+    activation: a dip in dock rate while the sector is widening must not ALSO
+    regress the distance, or the two axes fight each other.
+    """
+
+    def __init__(self, n_envs: int, start_deg: float, max_deg: float,
+                 increment_deg: float, distance_curriculum: "CurriculumCallback | None",
+                 window: int = 20, dock_rate_threshold: float = 0.5,
+                 stall_patience: int = 3):
+        super().__init__(verbose=0)
+        self.n_envs = n_envs
+        self.start_deg = start_deg
+        self.max_deg = max_deg
+        self.increment_deg = increment_deg
+        self.distance_curriculum = distance_curriculum
+        self.dock_rate_threshold = dock_rate_threshold
+        self.stall_patience = stall_patience
+        self._recent_docks = deque(maxlen=window)
+        self._stalled_windows = 0
+        self.half_width_deg = None
+
+    def _on_training_start(self) -> None:
+        # Adopt whatever the envs were constructed with (a --resume-from
+        # sidecar value, or start_deg) rather than always forcing start_deg,
+        # so resuming a partly-widened run doesn't throw the sector away.
+        self.half_width_deg = self.training_env.get_attr("angle_half_width_deg")[0]
+        if self._distance_graduated():
+            self._lock_distance()
+
+    def _distance_graduated(self) -> bool:
+        dc = self.distance_curriculum
+        return (dc is None or dc.curriculum_distance is None
+                or dc.curriculum_distance >= dc.max_distance)
+
+    def _lock_distance(self) -> None:
+        if self.distance_curriculum is not None:
+            self.distance_curriculum.lock("angle curriculum active")
+
+    @property
+    def progress(self) -> str:
+        return f"{self.half_width_deg:.0f}deg"
+
+    def _push(self, half_width_deg: float) -> None:
+        self.half_width_deg = float(np.clip(half_width_deg, self.start_deg, self.max_deg))
+        self.training_env.env_method("set_angle_half_width", self.half_width_deg)
+
+    def _on_step(self) -> bool:
+        if not self._distance_graduated():
+            return True
+        self._lock_distance()
+
+        infos = self.locals["infos"]
+        dones = self.locals["dones"]
+        for i in range(self.n_envs):
+            if dones[i]:
+                self._recent_docks.append(bool(infos[i].get("docked", False)))
+
+        if len(self._recent_docks) < self._recent_docks.maxlen:
+            return True
+
+        dock_rate = np.mean(self._recent_docks)
+        if dock_rate >= self.dock_rate_threshold:
+            self._stalled_windows = 0
+            if self.half_width_deg < self.max_deg:
+                self._push(self.half_width_deg + self.increment_deg)
+                print(f"[angle] dock rate >= {self.dock_rate_threshold:.0%} -> "
+                      f"widening sector to +-{self.half_width_deg:.0f} deg")
+        else:
+            self._stalled_windows += 1
+            if self._stalled_windows >= self.stall_patience and self.half_width_deg > self.start_deg:
+                self._push(self.half_width_deg - self.increment_deg)
+                print(f"[angle] dock rate < {self.dock_rate_threshold:.0%} for "
+                      f"{self.stall_patience} windows -> narrowing sector to "
+                      f"+-{self.half_width_deg:.0f} deg")
+                self._stalled_windows = 0
+        self._recent_docks.clear()
         return True
 
 
@@ -741,9 +857,11 @@ class LiveDiagnosticsCallback(BaseCallback):
 
     def __init__(self, training_callback: "TrainingCallback", diag_path: str,
                  status_path: Path, scenario: str, run_tag: str,
-                 total_timesteps: int, update_every_seconds: float = 30.0):
+                 total_timesteps: int, update_every_seconds: float = 30.0,
+                 angle_curriculum_callback: "AngleCurriculumCallback | None" = None):
         super().__init__(verbose=0)
         self.training_callback = training_callback
+        self.angle_curriculum_callback = angle_curriculum_callback
         self.diag_path = diag_path
         self.status_path = status_path
         self.scenario = scenario
@@ -775,6 +893,12 @@ class LiveDiagnosticsCallback(BaseCallback):
                                      if cb.episode_curriculum_distances else None),
             "dv_budget_coeff": (float(cb.episode_dv_budget_coeffs[-1])
                                  if cb.episode_dv_budget_coeffs else None),
+            "angle_half_width_deg": (
+                float(self.angle_curriculum_callback.half_width_deg)
+                if self.angle_curriculum_callback is not None
+                and self.angle_curriculum_callback.half_width_deg is not None
+                else None
+            ),
             "elapsed_seconds": elapsed,
             "steps_per_sec": (self.num_timesteps / elapsed) if elapsed > 0 else None,
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -852,6 +976,42 @@ def parse_args():
     p.add_argument("--noise-std-end", type=float, default=ACTION_NOISE_STD_END,
                     help="Exploration noise stationary std at the END of the decay schedule. "
                          "Default from constants.py.")
+    p.add_argument("--curriculum-start-distance", type=float, default=None,
+                    help="Start the distance curriculum here [m] instead of "
+                         "ENV_CURRICULUM_START_DISTANCE (30 m). Set to "
+                         "ENV_CURRICULUM_MAX_DISTANCE (1000) to skip the distance ramp "
+                         "entirely — the right thing when --resume-from already docks at "
+                         "full distance and the run is meant to train a DIFFERENT axis "
+                         "(e.g. --angle-curriculum). Also becomes the curriculum's floor, "
+                         "so a stalled window can't regress below it. Ignored if a "
+                         "--resume-from sidecar supplies a distance.")
+    p.add_argument("--angle-curriculum", action="store_true",
+                    help="(--scenario random only) Ramp the initial-direction SECTOR "
+                         "instead of sampling uniformly over the circle from step one. "
+                         "Starts at +-ANGLE_CURRICULUM_START deg around the V-bar axis "
+                         "(both signs) and widens by --angle-curriculum-increment each "
+                         "time the pooled dock rate clears 50%%, up to +-90 deg — which "
+                         "IS the uniform draw, so a graduated run trains the original "
+                         "task. Gated behind the distance curriculum reaching max, and "
+                         "locks it on activation. Measured motivation: the achievable "
+                         "optimum varies 23.6x with direction and V-bar is a cusp in it, "
+                         "and the optimal coasting trajectory has ~96%% excursion margin "
+                         "at V-bar but only ~20%% at 30-60 deg — so uniform sampling "
+                         "terminates exploratory coasts out-of-bounds and the policy "
+                         "settles on brute-force thrusting at ~11x optimal.")
+    p.add_argument("--angle-curriculum-start", type=float,
+                    default=ENV_ANGLE_CURRICULUM_START_DEG,
+                    help="Half-width [deg] the angle curriculum starts at (and its floor "
+                         "on a stall regression). Default from constants.py.")
+    p.add_argument("--angle-curriculum-max", type=float,
+                    default=ENV_ANGLE_CURRICULUM_MAX_DEG,
+                    help="Half-width [deg] the angle curriculum widens to. 90 = the full "
+                         "circle (default from constants.py); lower it to hold the policy "
+                         "in a restricted sector.")
+    p.add_argument("--angle-curriculum-increment", type=float,
+                    default=ENV_ANGLE_CURRICULUM_INCREMENT_DEG,
+                    help="Half-width [deg] added per dock-rate window that clears the "
+                         "threshold (default from constants.py).")
     p.add_argument("--fuel-curriculum", action="store_true",
                     help="Enable a SECOND curriculum axis (DvBudgetCurriculumCallback): once "
                          "the distance curriculum has reached ENV_CURRICULUM_MAX_DISTANCE and "
@@ -987,8 +1147,9 @@ def main():
     shutil.rmtree(tmp_dir, ignore_errors=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    resume_curriculum_distance = None
+    resume_curriculum_distance = args.curriculum_start_distance
     resume_dv_budget_coeff = None
+    resume_angle_half_width = args.angle_curriculum_start if args.angle_curriculum else None
     if args.resume_from:
         sidecar = Path(args.resume_from).with_suffix("").with_suffix(".curriculum.json")
         if sidecar.exists():
@@ -998,9 +1159,25 @@ def main():
             resume_dv_budget_coeff = sidecar_data.get("dv_budget_coeff")
             if resume_dv_budget_coeff is not None:
                 print(f"Resuming dv_budget_coeff = {resume_dv_budget_coeff:.2f}x dv_ref (from {sidecar})")
+            # Only honour a saved sector if THIS run also wants one — resuming
+            # a graduated 90 deg model into a fresh narrow ramp is a legitimate
+            # thing to ask for, and --angle-curriculum-start is how you ask.
+            if args.angle_curriculum and "angle_half_width_deg" in sidecar_data:
+                resume_angle_half_width = sidecar_data["angle_half_width_deg"]
+                print(f"Resuming angle sector = +-{resume_angle_half_width:.0f} deg (from {sidecar})")
         else:
+            start_d = (args.curriculum_start_distance
+                       if args.curriculum_start_distance is not None
+                       else ENV_CURRICULUM_START_DISTANCE)
             print(f"WARNING: no curriculum sidecar at {sidecar} — curriculum will "
-                  f"restart at {ENV_CURRICULUM_START_DISTANCE:.1f} m")
+                  f"restart at {start_d:.1f} m")
+
+    if args.angle_curriculum and args.scenario != "random":
+        raise SystemExit(
+            f"--angle-curriculum is only meaningful for --scenario random "
+            f"(got {args.scenario!r}): vbar/rbar have a fixed displacement "
+            f"direction, so there is no sector to ramp."
+        )
 
     n_envs = max(1, args.n_envs)
     if args.vec_env == "dummy":
@@ -1016,7 +1193,8 @@ def main():
           + (f" (start_method={vec_kwargs['start_method']})" if vec_kwargs else ""))
     env = make_vec_env(
         make_single_env(args.scenario, curriculum_start_distance=resume_curriculum_distance,
-                         dv_budget_coeff_start=resume_dv_budget_coeff),
+                         dv_budget_coeff_start=resume_dv_budget_coeff,
+                         angle_half_width_deg=resume_angle_half_width),
         n_envs=n_envs, vec_env_cls=vec_cls, vec_env_kwargs=vec_kwargs,
     )
 
@@ -1046,6 +1224,22 @@ def main():
         print(f"Resumed model from {args.resume_from} at {model.num_timesteps} timesteps "
               f"({args.total_timesteps - model.num_timesteps} remaining toward "
               f"--total-timesteps {args.total_timesteps})")
+
+        # TD3.load restores the SAVED action_noise, including the
+        # VectorizedActionNoise wrapper sized for the ORIGINAL run's --n-envs.
+        # Resuming with a different --n-envs then dies in _sample_action with
+        # a broadcast error ((n_envs_now, act) vs (n_envs_then, act)). Rebuild
+        # it fresh for this run's env instead — NoiseDecayCallback restarts the
+        # decay schedule on resume anyway (see its start_timesteps), so there
+        # is no OU state worth carrying over.
+        model.action_noise = OrnsteinUhlenbeckActionNoise(
+            mean=np.zeros(env.action_space.shape[0]),
+            sigma=noise_sigma_start * np.ones(env.action_space.shape[0]),
+            theta=OU_THETA,
+            dt=OU_DT,
+        )
+        if n_envs > 1:
+            model.action_noise = VectorizedActionNoise(model.action_noise, n_envs)
     else:
         action_dim = env.action_space.shape[0]
         # OU (not i.i.d. Gaussian): exploration is a temporally-correlated
@@ -1124,8 +1318,21 @@ def main():
         n_envs=n_envs,
         increment=ENV_CURRICULUM_INCREMENT,
         max_distance=ENV_CURRICULUM_MAX_DISTANCE,
-        min_distance=ENV_CURRICULUM_START_DISTANCE,
+        # Floor at wherever this run actually starts, not the global default:
+        # a run launched at 1000 m (--curriculum-start-distance) must not be
+        # able to regress back down into the ramp it was told to skip.
+        min_distance=(resume_curriculum_distance
+                      if resume_curriculum_distance is not None
+                      else ENV_CURRICULUM_START_DISTANCE),
     ) if ENV_CURRICULUM_ENABLED else None
+
+    angle_curriculum_callback = AngleCurriculumCallback(
+        n_envs=n_envs,
+        start_deg=args.angle_curriculum_start,
+        max_deg=args.angle_curriculum_max,
+        increment_deg=args.angle_curriculum_increment,
+        distance_curriculum=curriculum_callback,
+    ) if args.angle_curriculum else None
 
     dv_budget_curriculum_callback = DvBudgetCurriculumCallback(
         n_envs=n_envs,
@@ -1165,6 +1372,7 @@ def main():
             keep_last=args.keep_last_checkpoints,
             curriculum_callback=curriculum_callback,
             dv_budget_curriculum_callback=dv_budget_curriculum_callback,
+            angle_curriculum_callback=angle_curriculum_callback,
         ),
         ThroughputCallback(log_every_timesteps=args.throughput_log_every),
     ]
@@ -1176,10 +1384,13 @@ def main():
         run_tag=args.run_tag,
         total_timesteps=args.total_timesteps,
         update_every_seconds=args.diag_update_every_seconds,
+        angle_curriculum_callback=angle_curriculum_callback,
     )
     callback.append(live_diag_callback)
     if curriculum_callback is not None:
         callback.append(curriculum_callback)
+    if angle_curriculum_callback is not None:
+        callback.append(angle_curriculum_callback)
     if dv_budget_curriculum_callback is not None:
         callback.append(dv_budget_curriculum_callback)
 

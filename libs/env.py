@@ -23,6 +23,8 @@ from libs.constants import (
     ENV_CURRICULUM_MAX_DISTANCE,
     ENV_CURRICULUM_INCREMENT,
     ENV_CURRICULUM_BOUNDARY_MULT,
+    ENV_ANGLE_CURRICULUM_START_DEG,
+    ENV_ANGLE_CURRICULUM_MAX_DEG,
     SCENARIO,
     RBAR_X_TO_Z_RATIO,
     ENV_RANDOM_DV_REF_MULT,
@@ -132,6 +134,7 @@ class CWRendezvousEnv(gym.Env):
         curriculum_max_distance: float = ENV_CURRICULUM_MAX_DISTANCE,
         curriculum_increment: float = ENV_CURRICULUM_INCREMENT,
         curriculum_boundary_mult: float = ENV_CURRICULUM_BOUNDARY_MULT,
+        angle_half_width_deg: float = ENV_ANGLE_CURRICULUM_MAX_DEG,
         rbar_x_to_z_ratio: float = RBAR_X_TO_Z_RATIO,
     ):
         super().__init__()
@@ -189,6 +192,14 @@ class CWRendezvousEnv(gym.Env):
             else curriculum_max_distance
         )
 
+        # Angle curriculum ("random" only), pushed in by training.py's
+        # AngleCurriculumCallback exactly like curriculum_distance. Defaults to
+        # the max (= uniform over the whole circle), so an env constructed
+        # without one behaves as it always did.
+        self.angle_half_width_deg = float(
+            np.clip(angle_half_width_deg, 0.0, ENV_ANGLE_CURRICULUM_MAX_DEG)
+        )
+
         # STM for the fine physics substep. n_substeps of dt_phys == one dt
         # exactly (expm(A*dt_phys)**n == expm(A*n*dt_phys)); this only buys
         # finer sampling for the docking/OOB test, not different physics.
@@ -244,12 +255,20 @@ class CWRendezvousEnv(gym.Env):
     def _sample_direction(self) -> np.ndarray:
         """Unit direction for this episode's initial displacement. vbar/rbar
         randomize only the sign (force with reset(options={"sign": +-1}));
-        random draws a uniform angle (force with options={"angle": radians})."""
+        random draws an angle from the current curriculum sector (force with
+        options={"angle": radians})."""
         if self.scenario == "random":
             if self._forced_angle is not None:
                 theta = float(self._forced_angle)
             else:
-                theta = float(self.np_random.uniform(0.0, 2.0 * np.pi))
+                # Sector of half-width angle_half_width_deg centred on a V-bar
+                # axis, +x or -x with equal probability. At the 90 deg max the
+                # two sectors tile the circle exactly once, so this reduces to
+                # the plain uniform draw — see ENV_ANGLE_CURRICULUM_* in
+                # constants.py for why the ramp starts at V-bar.
+                hw = np.radians(self.angle_half_width_deg)
+                base = 0.0 if self.np_random.random() < 0.5 else np.pi
+                theta = base + float(self.np_random.uniform(-hw, hw))
             return np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
         if self._forced_sign is not None:
             sign = float(self._forced_sign)
@@ -268,6 +287,14 @@ class CWRendezvousEnv(gym.Env):
         shares one synchronized curriculum distance."""
         self.curriculum_distance = float(
             np.clip(distance, 0.0, self.curriculum_max_distance)
+        )
+
+    def set_angle_half_width(self, half_width_deg: float):
+        """Set by training.py's AngleCurriculumCallback so every parallel
+        sub-env shares one synchronized sampling sector. "random" only —
+        harmless no-op elsewhere, since vbar/rbar don't read it."""
+        self.angle_half_width_deg = float(
+            np.clip(half_width_deg, 0.0, ENV_ANGLE_CURRICULUM_MAX_DEG)
         )
 
     def set_dv_budget_coeff(self, coeff: Optional[float]):
@@ -330,7 +357,11 @@ class CWRendezvousEnv(gym.Env):
         self.burn_deadzone = self.burn_deadzone_frac * self.max_dv
 
         observation = self._build_observation()
-        info = {"curriculum_distance": self.curriculum_distance, "state": self.state.copy()}
+        info = {
+            "curriculum_distance": self.curriculum_distance,
+            "angle_half_width_deg": self.angle_half_width_deg,
+            "state": self.state.copy(),
+        }
         return observation, info
 
     @staticmethod
@@ -475,6 +506,7 @@ class CWRendezvousEnv(gym.Env):
             "dv_opt": self.dv_opt,
             "dv_budget_coeff": self.dv_budget_coeff,
             "curriculum_distance": self.curriculum_distance,
+            "angle_half_width_deg": self.angle_half_width_deg,
             "excursion_limit": self.excursion_limit,
             "braking_phase": self.braking_phase,
         }
@@ -538,6 +570,7 @@ class CWRendezvousEnv(gym.Env):
             "dv_opt": self.dv_opt,
             "dv_budget_coeff": self.dv_budget_coeff,
             "curriculum_distance": self.curriculum_distance,
+            "angle_half_width_deg": self.angle_half_width_deg,
             "excursion_limit": self.excursion_limit,
             "braking_phase": False,
         }

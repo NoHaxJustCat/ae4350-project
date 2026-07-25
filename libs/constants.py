@@ -30,6 +30,42 @@ ENV_CURRICULUM_INCREMENT = 10.0        # distance added per successful dock [m]
 # excursion_limit = curriculum_distance * this (see CWRendezvousEnv.reset()).
 ENV_CURRICULUM_BOUNDARY_MULT = 2.0
 
+# --- Angle curriculum ("random" scenario only) ---
+# Second curriculum axis for the "random" scenario, gated behind the distance
+# ramp (training.py's AngleCurriculumCallback). Instead of drawing the initial
+# displacement direction uniformly over the whole circle from step one, draw it
+# from a sector of half-width `angle_half_width_deg` centred on the V-bar axis
+# and widen it as the dock rate holds.
+#
+# Why: the achievable optimum varies 23.6x with direction and rises ~6x within
+# 10 deg of V-bar, so V-bar is a CUSP in the target — and only 3.9% of uniform
+# angles land within 2x of it. Worse, the optimal coasting trajectory peaks at
+# 1.02x the initial distance at V-bar but 1.57-1.64x at 30-60 deg, against an
+# excursion_limit of 2x: there is ~96% margin for noisy exploration of the
+# efficient solution at V-bar but only ~20% off-axis. Uniform sampling
+# therefore punishes exactly the coasting behaviour that makes a transfer
+# cheap, and the policy settles on brute-force thrusting at ~11x optimal
+# instead. Starting in the V-bar sector (where a specialist already reaches
+# 1.15x) and widening keeps a working solution in the replay buffer the whole
+# way out.
+#
+# MAX = 90 deg is the full circle, not a half of it: the sector is centred on
+# BOTH V-bar directions (+x and -x) with equal probability, so half-width 90
+# reproduces the uniform draw exactly (see CWRendezvousEnv._sample_direction).
+#
+# START is 2 deg, not wider, because the V-bar specialist's dock is an
+# OPEN-LOOP point solution with almost no robustness: seeded from out/best_1
+# (which matches its 1.15x-optimal dock exactly at 0 deg once dv_ref agrees —
+# see ENV_RANDOM_DV_REF_MULT) it already misses by 0.5 deg and goes
+# out-of-bounds past 1.5 deg, because it fires one burn and never corrects.
+# So expect a LOW dock rate at first even at the start width: the opening
+# phase is the policy learning a mid-coast correction burn, not free-riding on
+# the seed. The sector floors at START and only widens once dock rate holds,
+# so a slow start costs nothing but time.
+ENV_ANGLE_CURRICULUM_START_DEG = 2.0
+ENV_ANGLE_CURRICULUM_MAX_DEG = 90.0
+ENV_ANGLE_CURRICULUM_INCREMENT_DEG = 5.0
+
 # --- Environment timesteps ---
 # ENV_DT_PHYS: fine physics/collision substep (CW's STM is exact, so this adds
 #   no integration error — it only controls docking/OOB sampling resolution).
@@ -116,9 +152,22 @@ SCENARIO = os.environ.get("AE4350_SCENARIO", "vbar")
 RBAR_X_TO_Z_RATIO = 2.0  # Δx = 2·Δz, matches goal 2 strategy 1
 
 # "random" actuator scale: dv_ref = this * dv_opt (no analytic reference
-# exists). 2.5 gives max_dv = 3.75*dv_opt, clearing the largest measured
-# single optimal burn (0.875*dv_opt) with headroom to explore/correct.
-ENV_RANDOM_DV_REF_MULT = 2.5
+# exists). Gives max_dv = 3.54*dv_opt, clearing the largest measured single
+# optimal burn (0.875*dv_opt) with ample headroom to explore/correct.
+#
+# 3*pi/4 rather than a round 2.5 so that AT V-BAR this scenario's actuator
+# scale is IDENTICAL to the "vbar" scenario's: there dv_ref = 0.5 *
+# dv_vbar_two_impulse_rr = 0.25*omega*d, and dv_opt per metre at V-bar is the
+# two-V-bar-impulse optimum omega/(3*pi), so the ratio is exactly 0.25*3*pi.
+#
+# This matters because a "vbar" model has to be loadable into this scenario as
+# a starting point (runs/smart_cuda_random.ps1 resumes out/best_1 and ramps the
+# angle sector outward from V-bar). Docking is a 5 m closest-approach test from
+# up to 1000 m — 0.5% of the initial distance — so the learned open-loop burn
+# is far more sensitive to max_dv than 0.5%: at the old 2.5 the two scenarios'
+# max_dv differed by 6% at the SAME geometry, which was enough to turn the
+# specialist's 1.15x-optimal dock into an out-of-bounds miss on transfer.
+ENV_RANDOM_DV_REF_MULT = 3.0 * np.pi / 4.0
 # Per-direction dv_opt table resolution over [0, pi) (period-pi by the CW
 # point-reflection symmetry). 180 = 1 deg; dv_opt is smooth so linear
 # interpolation error is negligible.
