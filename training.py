@@ -48,6 +48,7 @@ from libs.constants import (
     ENV_DV_BUDGET_COEFF_FLOOR,
     ENV_DV_BUDGET_COEFF_START,
     ENV_DV_BUDGET_SHRINK,
+    MAX_STEPS,
     ENV_MAX_DV_COEFF,
     GAMMA,
     LOG_EVERY,
@@ -534,7 +535,7 @@ class AngleCurriculumCallback(BaseCallback):
 
     @property
     def progress(self) -> str:
-        return f"{self.half_width_deg:.0f}deg"
+        return f"{self.half_width_deg:.2f}deg"
 
     def _push(self, half_width_deg: float) -> None:
         self.half_width_deg = float(np.clip(half_width_deg, self.start_deg, self.max_deg))
@@ -560,16 +561,127 @@ class AngleCurriculumCallback(BaseCallback):
             if self.half_width_deg < self.max_deg:
                 self._push(self.half_width_deg + self.increment_deg)
                 print(f"[angle] dock rate >= {self.dock_rate_threshold:.0%} -> "
-                      f"widening sector to +-{self.half_width_deg:.0f} deg")
+                      f"widening sector to +-{self.half_width_deg:.2f} deg")
         else:
             self._stalled_windows += 1
             if self._stalled_windows >= self.stall_patience and self.half_width_deg > self.start_deg:
                 self._push(self.half_width_deg - self.increment_deg)
                 print(f"[angle] dock rate < {self.dock_rate_threshold:.0%} for "
                       f"{self.stall_patience} windows -> narrowing sector to "
-                      f"+-{self.half_width_deg:.0f} deg")
+                      f"+-{self.half_width_deg:.2f} deg")
                 self._stalled_windows = 0
         self._recent_docks.clear()
+        return True
+
+
+class EvalSaveBestCallback(BaseCallback):
+    """
+    Periodically evaluates the DETERMINISTIC policy on a separate env and keeps
+    the best model seen, at <run_dir>/best_model.zip.
+
+    Why this exists: nothing else in this loop preserves a good policy. The
+    per-episode log reports the NOISY behaviour policy, and for a solution as
+    narrow as the V-bar transfer (measured: the dock survives only a ~0.006
+    wide window in the along-track burn component) the two are very different
+    numbers. A refinement run was observed climbing to ~95% dock rate and then
+    collapsing to 0% over a few thousand episodes once exploration noise hit
+    its floor: the actor drifted ~0.0115 in action space, about 2x the width
+    of the docking basin, every dock vanished from the replay buffer, and the
+    critic then ranked the WORKING action below the failing one (Q = -1565 for
+    an action whose true return is +970). All three surviving checkpoints were
+    strictly worse than the seed the run started from, and the good policy in
+    the middle was simply overwritten.
+
+    Evaluation uses the CURRENT curriculum state (distance, and angle sector if
+    an angle curriculum is running), so an early-curriculum model is scored on
+    the task it is actually being trained on rather than the final one. That
+    does mean scores from different curriculum stages are not comparable — the
+    saved "best" is therefore reset whenever the curriculum advances, so this
+    tracks "best at the hardest stage reached so far" rather than letting an
+    easy-stage score block all later saves.
+
+    Scored on mean deterministic episode return, which already folds in dock
+    success (~600 of terminal bonus), fuel (500/ratio) and arrival speed
+    (up to 500) with the weights the reward function intends.
+    """
+
+    def __init__(self, scenario: str, save_path: Path, n_envs: int,
+                 eval_freq_timesteps: int, n_episodes: int,
+                 curriculum_callback: "CurriculumCallback | None" = None,
+                 angle_curriculum_callback: "AngleCurriculumCallback | None" = None):
+        super().__init__(verbose=0)
+        self.scenario = scenario
+        self.save_path = save_path
+        self.n_episodes = n_episodes
+        self.eval_freq_calls = max(eval_freq_timesteps // max(n_envs, 1), 1)
+        self.curriculum_callback = curriculum_callback
+        self.angle_curriculum_callback = angle_curriculum_callback
+        self.best_score = -np.inf
+        self.best_at = None
+        self._stage = None
+        self._raw = None
+        self._env = None
+
+    def _on_training_start(self) -> None:
+        # A private env: never touches the training vec-env or replay buffer.
+        # Same wrapper stack as make_single_env, or the policy sees a different
+        # observation convention than it was trained on.
+        self._raw = CWRendezvousEnv(omega=OMEGA, scenario=self.scenario)
+        self._env = NormalizedObsEnv(CanonicalizeDirectionEnv(self._raw))
+
+    def _sync_curriculum(self):
+        """Mirror the live curriculum onto the eval env, and report the stage
+        so a curriculum change can reset the best-score baseline."""
+        dist = angle = None
+        if self.curriculum_callback is not None and self.curriculum_callback.curriculum_distance is not None:
+            dist = self.curriculum_callback.curriculum_distance
+            self._raw.set_curriculum_distance(dist)
+        if self.angle_curriculum_callback is not None and self.angle_curriculum_callback.half_width_deg is not None:
+            angle = self.angle_curriculum_callback.half_width_deg
+            self._raw.set_angle_half_width(angle)
+        return (dist, angle)
+
+    def _evaluate(self):
+        returns, docks = [], 0
+        for _ in range(self.n_episodes):
+            obs, _ = self._env.reset()
+            total = 0.0
+            for _ in range(MAX_STEPS):
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = self._env.step(action)
+                total += reward
+                if terminated or truncated:
+                    break
+            returns.append(total)
+            docks += bool(info.get("docked", False))
+        return float(np.mean(returns)), docks / self.n_episodes
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.eval_freq_calls != 0:
+            return True
+
+        stage = self._sync_curriculum()
+        if stage != self._stage:
+            # New curriculum stage -> old scores are for a different task.
+            self._stage = stage
+            self.best_score = -np.inf
+
+        score, dock_rate = self._evaluate()
+        if score > self.best_score:
+            self.best_score = score
+            self.best_at = self.num_timesteps
+            self.save_path.parent.mkdir(parents=True, exist_ok=True)
+            self.model.save(str(self.save_path))
+            sidecar = {"curriculum_distance": stage[0], "angle_half_width_deg": stage[1],
+                       "num_timesteps": int(self.num_timesteps),
+                       "eval_mean_return": score, "eval_dock_rate": dock_rate}
+            self.save_path.with_suffix(".curriculum.json").write_text(
+                json.dumps({k: v for k, v in sidecar.items() if v is not None}))
+            print(f"[eval] {self.num_timesteps} steps: mean return {score:.1f}, "
+                  f"dock {100*dock_rate:.0f}% -> NEW BEST, saved {self.save_path}.zip")
+        else:
+            print(f"[eval] {self.num_timesteps} steps: mean return {score:.1f}, "
+                  f"dock {100*dock_rate:.0f}% (best {self.best_score:.1f} @ {self.best_at})")
         return True
 
 
@@ -1060,6 +1172,18 @@ def parse_args():
                          "(e.g. --angle-curriculum). Also becomes the curriculum's floor, "
                          "so a stalled window can't regress below it. Ignored if a "
                          "--resume-from sidecar supplies a distance.")
+    p.add_argument("--eval-freq", type=int, default=20000,
+                    help="Evaluate the DETERMINISTIC policy every N env timesteps on a "
+                         "separate env and keep the best model at <run_dir>/best_model.zip. "
+                         "0 disables. The training log only ever shows the NOISY behaviour "
+                         "policy, so without this a run can climb to a great policy and then "
+                         "overwrite it -- which is exactly how a V-bar refinement run lost a "
+                         "~95%%-dock policy and finished with three checkpoints all worse than "
+                         "its own starting point.")
+    p.add_argument("--eval-episodes", type=int, default=20,
+                    help="Deterministic episodes per evaluation. Scored on mean return, which "
+                         "already weights dock success, fuel and arrival speed as the reward "
+                         "function intends.")
     p.add_argument("--angle-curriculum", action="store_true",
                     help="(--scenario random only) Ramp the initial-direction SECTOR "
                          "instead of sampling uniformly over the circle from step one. "
@@ -1239,7 +1363,7 @@ def main():
             # thing to ask for, and --angle-curriculum-start is how you ask.
             if args.angle_curriculum and "angle_half_width_deg" in sidecar_data:
                 resume_angle_half_width = sidecar_data["angle_half_width_deg"]
-                print(f"Resuming angle sector = +-{resume_angle_half_width:.0f} deg (from {sidecar})")
+                print(f"Resuming angle sector = +-{resume_angle_half_width:.2f} deg (from {sidecar})")
         else:
             start_d = (args.curriculum_start_distance
                        if args.curriculum_start_distance is not None
@@ -1469,6 +1593,18 @@ def main():
         callback.append(angle_curriculum_callback)
     if dv_budget_curriculum_callback is not None:
         callback.append(dv_budget_curriculum_callback)
+    # Appended last so it evaluates against the curriculum state the other
+    # callbacks have already settled for this step.
+    if args.eval_freq > 0:
+        callback.append(EvalSaveBestCallback(
+            scenario=args.scenario,
+            save_path=run_dir / "best_model",
+            n_envs=n_envs,
+            eval_freq_timesteps=args.eval_freq,
+            n_episodes=args.eval_episodes,
+            curriculum_callback=curriculum_callback,
+            angle_curriculum_callback=angle_curriculum_callback,
+        ))
 
     model.learn(
         total_timesteps      = remaining_timesteps,

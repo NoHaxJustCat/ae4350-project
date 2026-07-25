@@ -53,18 +53,23 @@ ENV_CURRICULUM_BOUNDARY_MULT = 2.0
 # BOTH V-bar directions (+x and -x) with equal probability, so half-width 90
 # reproduces the uniform draw exactly (see CWRendezvousEnv._sample_direction).
 #
-# START is 2 deg, not wider, because the V-bar specialist's dock is an
-# OPEN-LOOP point solution with almost no robustness: seeded from out/best_1
-# (which matches its 1.15x-optimal dock exactly at 0 deg once dv_ref agrees —
-# see ENV_RANDOM_DV_REF_MULT) it already misses by 0.5 deg and goes
-# out-of-bounds past 1.5 deg, because it fires one burn and never corrects.
-# So expect a LOW dock rate at first even at the start width: the opening
-# phase is the policy learning a mid-coast correction burn, not free-riding on
-# the seed. The sector floors at START and only widens once dock rate holds,
-# so a slow start costs nothing but time.
-ENV_ANGLE_CURRICULUM_START_DEG = 2.0
+# START must be TINY. Measured with evaluate_model.py on the V-bar specialist:
+# at 0 deg it reproduces its 1.15x-optimal dock exactly (that is what the
+# 3*pi/4 ENV_RANDOM_DV_REF_MULT buys), but its usable envelope is only about
+# +-0.12 deg — it docks at 0.10 deg and already fails at 0.15 deg. At a +-2 deg
+# sector it docks 4% of the time; at +-1 deg the angle curriculum immediately
+# stall-regresses. The cause is that it fires ONE burn and never corrects, so
+# there is no feedback to absorb an off-axis start.
+#
+# The opening phase of a run is therefore the policy learning a mid-coast
+# CORRECTION burn. Two things must be true for that to be learnable at all:
+#   * ENV_TIMEOUT has to leave room for a second leg. It currently does not
+#     at V-bar — see the note on ENV_TIMEOUT below.
+#   * exploration noise has to be large enough to discover a 3-burn episode;
+#     ACTION_NOISE_STD_* near 1e-3 cannot.
+ENV_ANGLE_CURRICULUM_START_DEG = 0.0
 ENV_ANGLE_CURRICULUM_MAX_DEG = 90.0
-ENV_ANGLE_CURRICULUM_INCREMENT_DEG = 5.0
+ENV_ANGLE_CURRICULUM_INCREMENT_DEG = 1.0
 
 # --- Environment timesteps ---
 # ENV_DT_PHYS: fine physics/collision substep (CW's STM is exact, so this adds
@@ -212,11 +217,11 @@ OU_THETA = 0.15
 OU_DT = 0.01
 OU_STD_PER_SIGMA = (2 * OU_THETA - OU_THETA ** 2 * OU_DT) ** -0.5
 
-ACTION_NOISE_STD_START = 0.1
-ACTION_NOISE_STD_END = 0.01
+ACTION_NOISE_STD_START = 0.005
+ACTION_NOISE_STD_END = 0.001
 ACTION_NOISE_SIGMA_START = ACTION_NOISE_STD_START / OU_STD_PER_SIGMA
 ACTION_NOISE_SIGMA_END = ACTION_NOISE_STD_END / OU_STD_PER_SIGMA
-NOISE_DECAY_FRAC = 0.35  # fraction of training over which noise decays to END
+NOISE_DECAY_FRAC = 0.5  # fraction of training over which noise decays to END
 
 # TD3 target-policy-smoothing noise; SB3 defaults already assume [-1,1] actions.
 TD3_TARGET_POLICY_NOISE = 0.2
