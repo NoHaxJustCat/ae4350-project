@@ -37,7 +37,7 @@ from config import (
     TRAIN_FREQ, VEC_ENV,
 )
 from lib.paths import RunPaths
-from lib.plots.diagnostics import build_diagnostics_figure
+from lib.plots.diagnostics import write_panels
 from lib.rl.callbacks.checkpoint import BestModelEval, Checkpointer
 from lib.rl.callbacks.curriculum import AngleCurriculum, DistanceCurriculum
 from lib.rl.callbacks.monitor import EpisodeLogger, LiveDiagnostics, NoiseDecay, Throughput
@@ -241,7 +241,8 @@ def main():
     model.save(str(paths.final_model))
     print(f"Model saved -> {paths.final_model}.zip")
 
-    build_diagnostics_figure(logger.history, args.scenario, paths.figure)
+    write_panels(logger.history, args.scenario, paths.panels)
+    print(f"Plots -> {paths.panels}")
     # The periodic status write is throttled, so a short run could finish
     # between updates and never get one.
     live.write_status(time.perf_counter())

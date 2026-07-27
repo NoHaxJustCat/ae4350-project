@@ -8,8 +8,7 @@
             best_model.zip        best deterministic evaluation
             status.json
         diagnostics/
-            diagnostics.png       6-panel overview
-            plots/                individual panels
+            plots/                one figure per metric
 """
 
 import shutil
@@ -63,7 +62,3 @@ class RunPaths:
     @property
     def history(self) -> Path:
         return self.model / "history.npz"
-
-    @property
-    def figure(self) -> Path:
-        return self.diagnostics / "diagnostics.png"

@@ -12,12 +12,12 @@ from config import (
     ACTION_IMPULSE_DIM, DOCK_RATE_WINDOW, ENV_MAX_DV_COEFF, LOG_EVERY,
     NOISE_DECAY_FRAC, OU_STD_PER_SIGMA, SMOOTHING_WINDOW,
 )
-from lib.plots.diagnostics import build_diagnostics_figure
+from lib.plots.diagnostics import write_panels
 from lib.plots.trajectory import plot_trajectory
 
 HISTORY_KEYS = ("rewards", "steps", "delta_v", "dv_ratio", "docked", "r_pos",
                 "r_fuel", "r_term", "noise_std", "curriculum_distance",
-                "angle_half_width_deg")
+                "angle_half_width_deg", "actor_loss", "critic_loss")
 
 
 def json_number(value):
@@ -121,9 +121,17 @@ class EpisodeLogger(BaseCallback):
         for i in range(self.n_envs):
             self._seed_start(i)
 
+    def _losses(self):
+        """SB3 stashes the latest train/* values on its own logger; they are
+        NaN until the replay buffer passes learning_starts."""
+        values = getattr(self.model.logger, "name_to_value", {})
+        return (float(values.get("train/actor_loss", float("nan"))),
+                float(values.get("train/critic_loss", float("nan"))))
+
     def _record(self, info, acc):
         dv_opt = info.get("dv_opt", float("nan"))
         ep = info.get("episode", {})
+        actor_loss, critic_loss = self._losses()
         return {
             "rewards": ep.get("r", 0.0), "steps": ep.get("l", 1),
             "delta_v": acc["delta_v"],
@@ -133,6 +141,7 @@ class EpisodeLogger(BaseCallback):
             "curriculum_distance": info.get("curriculum_distance", float("nan")),
             "angle_half_width_deg": (info.get("angle_half_width_deg", float("nan"))
                                      if self.angle_cb else float("nan")),
+            "actor_loss": actor_loss, "critic_loss": critic_loss,
         }
 
     def _on_step(self) -> bool:
@@ -231,6 +240,6 @@ class LiveDiagnostics(BaseCallback):
             return True
         self._last = now
         if self.episodes.history["rewards"]:
-            build_diagnostics_figure(self.episodes.history, self.scenario, self.paths.figure)
+            write_panels(self.episodes.history, self.scenario, self.paths.panels)
         self.write_status(now)
         return True

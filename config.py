@@ -18,7 +18,9 @@ ORBIT_PERIOD = 2 * np.pi / OMEGA
 ENV_DT_PHYS = 5.0                          # collision/docking sampling substep
 ENV_DT_AGENT = 100.0                       # decision interval
 ENV_DT = ENV_DT_AGENT
-ENV_TIMEOUT = 2 * ORBIT_PERIOD             # 3 orbits needed for a correction leg
+# 3 orbits, not 2: a correction leg needs a full orbit and t* is independent
+# of distance, so at 2 a missed transfer can never be corrected.
+ENV_TIMEOUT = 3 * ORBIT_PERIOD
 MAX_STEPS = int(ENV_TIMEOUT / ENV_DT) + 1
 
 # Coast length in agent-dt units; 58 units = 1 orbit = the V-bar coast leg.
@@ -30,7 +32,11 @@ ENV_CURRICULUM_ENABLED = True
 ENV_CURRICULUM_START_DISTANCE = 30.0       # m
 ENV_CURRICULUM_MAX_DISTANCE = 1000.0       # m
 ENV_CURRICULUM_INCREMENT = 10.0            # m per cleared window
-ENV_CURRICULUM_BOUNDARY_MULT = 2.0         # excursion_limit = distance * this
+# 4, not 2: the optimal coasting trajectory peaks at 1.64x the initial
+# distance off-axis, and a +-15% burn error reaches 4.1x, so at 2 the agent
+# was punished for exploring near the correct solution. Safe to change only
+# because OBS_POS_SCALE below is no longer derived from it.
+ENV_CURRICULUM_BOUNDARY_MULT = 4.0
 ENV_BOUNDARY = ENV_CURRICULUM_MAX_DISTANCE * ENV_CURRICULUM_BOUNDARY_MULT
 
 # Observation position scale. Pinned, NOT derived from ENV_BOUNDARY: coupling

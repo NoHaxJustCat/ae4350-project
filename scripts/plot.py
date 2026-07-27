@@ -2,7 +2,6 @@
 Plot a saved training history.npz.
 
     python scripts/plot.py tmp/<run-tag>
-    python scripts/plot.py tmp/<run-tag> --panels     # individual panels too
     python scripts/plot.py tmp/a tmp/b --compare      # overlay runs
 """
 
@@ -19,18 +18,8 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from lib.plots.diagnostics import build_diagnostics_figure, moving_average, rolling_dock_rate
+from lib.plots.diagnostics import moving_average, rolling_dock_rate, write_panels
 from lib.plots.style import PALETTE, save, style_axes, use_style
-
-PANELS = [
-    ("rewards", "Total reward", "reward"),
-    ("dv_ratio", r"Fuel vs. optimum", r"$\Delta v / \Delta v_{opt}$"),
-    ("steps", "Episode length", "steps"),
-    ("r_fuel", "Fuel reward", "reward"),
-    ("r_term", "Terminal reward", "reward"),
-    ("noise_std", "Exploration noise", "std"),
-]
-
 
 def resolve(path: Path) -> Path:
     if path.is_dir():
@@ -63,29 +52,6 @@ def scenario_of(npz: Path) -> str:
         if any(name in part for part in npz.parts):
             return name
     return "unknown"
-
-
-def plot_panels(history, out_dir: Path, stem: str):
-    use_style()
-    written = []
-    for key, title, ylabel in PANELS:
-        if key not in history or not len(history[key]):
-            continue
-        data = np.asarray(history[key], dtype=float)
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(data, color=PALETTE[0], linewidth=0.6, alpha=0.25)
-        smooth = moving_average(data)
-        ax.plot(np.arange(len(data) - len(smooth), len(data)), smooth,
-                color=PALETTE[0], linewidth=1.5, label=title)
-        if key == "dv_ratio":
-            ax.axhline(1.0, color="black", linestyle="--", linewidth=1.0, label="optimum")
-        ax.set_title(title)
-        ax.set_xlabel("Episode")
-        ax.set_ylabel(ylabel)
-        style_axes(ax)
-        written.append(save(fig, out_dir / f"{stem}_{key}.png"))
-        plt.close(fig)
-    return written
 
 
 def plot_compare(histories, labels, out_path: Path):
@@ -130,7 +96,6 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("paths", nargs="+", type=Path, help="history.npz files or run dirs")
     p.add_argument("--out", type=Path, default=None, help="Output dir (default: alongside)")
-    p.add_argument("--panels", action="store_true", help="Also write individual panels")
     p.add_argument("--compare", action="store_true", help="Overlay all inputs on one figure")
     args = p.parse_args()
 
@@ -148,14 +113,9 @@ def main():
         return
 
     for q, h in zip(paths, histories):
-        diag = args.out or (run_root(q) / "diagnostics")
-        (diag / "plots").mkdir(parents=True, exist_ok=True)
-        target = diag / "diagnostics.png"
-        build_diagnostics_figure(h, scenario_of(q), target)
-        print("wrote", target)
-        if args.panels:
-            for w in plot_panels(h, diag / "plots", run_root(q).name):
-                print("wrote", w)
+        panels = (args.out or (run_root(q) / "diagnostics")) / "plots"
+        for w in write_panels(h, scenario_of(q), panels):
+            print("wrote", w)
 
 
 if __name__ == "__main__":
