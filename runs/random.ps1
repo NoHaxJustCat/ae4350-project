@@ -17,11 +17,11 @@ param(
     [string]$RunTag = "random_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
     [string]$ResumeFrom = "out/vbar_specialist/vbar_td3.zip",
     [int]$TotalTimesteps = 2300000,
-    [double]$AngleStart = 0.1,
-    [double]$AngleIncrement = 1.0,
-    [double]$NoiseStart = 0.05,
+    [double]$AngleStart = 0.25,
+    [double]$AngleIncrement = 0.25,
+    [double]$NoiseStart = 0.3,
     [double]$NoiseEnd = 0.01,
-    [double]$NoiseDecayFrac = 0.5
+    [double]$NoiseDecayFrac = 0.75
 )
 
 $ErrorActionPreference = "Stop"

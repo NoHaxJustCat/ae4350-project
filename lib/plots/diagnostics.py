@@ -47,6 +47,9 @@ def _dv_ratio(ax, h):
     trend(ax, h["dv_ratio"], r"$\Delta v/\Delta v_{opt}$", COLOR_4)
     ax.axhline(1.0, color="black", linestyle="--", linewidth=1.0, label="optimum")
     ax.set_ylabel(r"$\Delta v / \Delta v_{opt}$")
+    # Log: early episodes reach several hundred x optimal, which on a linear
+    # axis squashes the 1-10x band that actually matters into a sliver.
+    ax.set_yscale("log")
 
 
 def _dock_rate(ax, h):
