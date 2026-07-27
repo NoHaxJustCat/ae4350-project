@@ -1,1 +1,0 @@
-{"scenario": "random", "run_tag": "smart_cuda_random_20260724_103314", "num_timesteps": 2000004, "total_timesteps": 2000000, "episode_count": 224414, "recent_dock_rate": 0.7, "recent_avg_reward": 167.19417969999998, "curriculum_distance": 1000.0, "dv_budget_coeff": NaN, "elapsed_seconds": 12792.3422326, "steps_per_sec": 156.34384725130246, "updated_at": "2026-07-24 14:07:07"}

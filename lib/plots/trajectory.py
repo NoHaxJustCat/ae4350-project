@@ -1,0 +1,75 @@
+"""Relative-motion trajectory plot in the LVLH x-z plane."""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from config import ENV_POS_TOLERANCE, MODE_2D
+from lib.plots.style import COLOR_1, COLOR_2, COLOR_3, COLOR_4, save, style_axes, use_style
+
+
+def plot_trajectory(states, actions=None, path="trajectory.png",
+                    min_dv_display=0.0, title=None):
+    """`states` are raw physical states, `actions` the impulse applied at each
+    (zero where coasting). Burns are drawn as arrows anchored at the position
+    they were applied from."""
+    use_style()
+    states = np.asarray(states, dtype=float)
+    if states.ndim != 2 or len(states) < 2:
+        return None
+    xi, zi = (0, 1) if MODE_2D else (0, 2)
+    x, z = states[:, xi], states[:, zi]
+
+    # Equal aspect is physically meaningful, but a V-bar transfer spans ~1000 m
+    # along-track against ~250 m radial, so a fixed square figure squashes it
+    # into an unreadable strip. Size the figure from the data extent instead.
+    span_x = max(np.ptp(x), 2 * ENV_POS_TOLERANCE)
+    span_z = max(np.ptp(z), 2 * ENV_POS_TOLERANCE)
+    ratio = float(np.clip(span_z / span_x, 0.30, 3.0))
+    fig, ax = plt.subplots(figsize=(7.0, 7.0 * ratio) if ratio <= 1
+                           else (7.0 / ratio, 7.0))
+    ax.plot(x, z, color=COLOR_1, linewidth=1.5, label="Trajectory")
+    ax.plot(x[0], z[0], "o", color=COLOR_2, markersize=8, markeredgecolor="black",
+            markeredgewidth=0.8, zorder=5, label="Start")
+    ax.plot(0.0, 0.0, "o", color=COLOR_3, markersize=9, markeredgecolor="black",
+            markeredgewidth=0.8, zorder=5, label="Target")
+
+    theta = np.linspace(0, 2 * np.pi, 200)
+    ax.plot(ENV_POS_TOLERANCE * np.cos(theta), ENV_POS_TOLERANCE * np.sin(theta),
+            linestyle="--", linewidth=1.0, color=COLOR_3, zorder=4,
+            label=f"Dock tolerance ({ENV_POS_TOLERANCE:.0f} m)")
+
+    if actions is not None:
+        _draw_burns(ax, states, actions, xi, zi, min_dv_display)
+
+    ax.set_xlabel(r"$x$ [m] (V-bar)")
+    ax.set_ylabel(r"$z$ [m] (R-bar)")
+    ax.set_title(title or "Relative trajectory")
+    style_axes(ax, legend=False, equal=True)
+    # Legend below the axes: a rendezvous spiral fills its own bounding box, so
+    # any in-axes placement covers the trajectory.
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=2, fontsize=12,
+              frameon=True, edgecolor="black", framealpha=1.0, columnspacing=0.9,
+              handletextpad=0.4, borderpad=0.3)
+    save(fig, path)
+    plt.close(fig)
+    return path
+
+
+def _draw_burns(ax, states, actions, xi, zi, min_dv_display):
+    actions = np.asarray(actions, dtype=float)
+    if actions.ndim != 2 or not len(actions):
+        return
+    mags = np.linalg.norm(actions, axis=1)
+    burns = np.flatnonzero(mags > max(min_dv_display, 0.0))
+    burns = burns[burns < len(states)]
+    if not burns.size:
+        return
+    span = max(np.ptp(states[:, xi]), np.ptp(states[:, zi]), 1.0)
+    scale = 0.12 * span / mags[burns].max()
+    for i in burns:
+        ax.annotate("", xy=(states[i, xi] + actions[i, 0] * scale,
+                            states[i, zi] + actions[i, -1] * scale),
+                    xytext=(states[i, xi], states[i, zi]),
+                    arrowprops=dict(arrowstyle="->", color=COLOR_4, lw=1.4), zorder=6)
+    ax.plot([], [], color=COLOR_4, linewidth=1.4,
+            label=rf"$\Delta v$ impulses ({len(burns)})")
