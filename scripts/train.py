@@ -246,7 +246,7 @@ def main():
     # The periodic status write is throttled, so a short run could finish
     # between updates and never get one.
     live.write_status(time.perf_counter())
-    np.savez(paths.history, **{k: np.array(v) for k, v in logger.history.items()})
+    live.write_history()
     print("Done.")
 
 

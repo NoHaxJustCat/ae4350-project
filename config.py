@@ -119,5 +119,7 @@ LOG_EVERY = 10
 SMOOTHING_WINDOW = 20
 DOCK_RATE_WINDOW = LOG_EVERY
 THROUGHPUT_LOG_EVERY = 2000
-DIAG_UPDATE_SECONDS = 30.0
+# 60s, not 30: the diagnostics set is 11 separate figures (~5.7s to write), so
+# a 30s cadence spent ~19% of training on plotting.
+DIAG_UPDATE_SECONDS = 60.0
 OUT_DIR = "tmp"        # every run writes to tmp/<run_tag>/

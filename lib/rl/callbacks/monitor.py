@@ -87,10 +87,16 @@ class EpisodeLogger(BaseCallback):
     """
 
     def __init__(self, episodes_dir: Path, n_envs, log_every=LOG_EVERY,
-                 distance_cb=None, angle_cb=None):
+                 distance_cb=None, angle_cb=None, traj_every_seconds=60.0):
         super().__init__(verbose=0)
         self.episodes_dir, self.n_envs, self.log_every = episodes_dir, n_envs, log_every
         self.distance_cb, self.angle_cb = distance_cb, angle_cb
+        # Trajectory plots are time-throttled, NOT tied to log_every: a fresh
+        # run completes an episode every ~3 timesteps, so plotting one per
+        # logged episode meant a figure every ~35 steps and capped throughput
+        # at ~50 steps/s. Time-throttling self-adapts as episodes lengthen.
+        self.traj_every_seconds = traj_every_seconds
+        self._last_traj = 0.0
         self.history = {k: [] for k in HISTORY_KEYS}
         self._acc = [self._new_acc() for _ in range(n_envs)]
         self._episode = 0
@@ -176,10 +182,12 @@ class EpisodeLogger(BaseCallback):
                       f"{rec['r_pos']:>8.2f} | {rec['r_fuel']:>8.2f} | {rec['r_term']:>8.2f} | "
                       f"{rec['noise_std']:>7.4f} | {rec['dv_ratio']:>7.2f} | "
                       f"{rec['curriculum_distance']:>6.1f} | {dock:>5.1f}% | {prog:>8}")
-                if i == 0:
-                    plot_trajectory(acc["states"], acc["actions"],
-                                    self.episodes_dir / f"ep_{self._episode:06d}.png",
-                                    min_dv_display=ENV_MAX_DV_COEFF * 0.01)
+            now = time.perf_counter()
+            if i == 0 and now - self._last_traj >= self.traj_every_seconds:
+                self._last_traj = now
+                plot_trajectory(acc["states"], acc["actions"],
+                                self.episodes_dir / f"ep_{self._episode:06d}.png",
+                                min_dv_display=ENV_MAX_DV_COEFF * 0.01)
 
             self._acc[i] = self._new_acc()
             self._seed_start(i)
@@ -234,6 +242,13 @@ class LiveDiagnostics(BaseCallback):
             return
         self.paths.status.write_text(payload)
 
+    def write_history(self) -> None:
+        """Snapshot the raw per-episode series next to the model. Written
+        periodically, not only at the end, so a run that is killed or crashes
+        still leaves replottable data (scripts/plot.py reads this)."""
+        np.savez(self.paths.history,
+                 **{k: np.array(v) for k, v in self.episodes.history.items()})
+
     def _on_step(self) -> bool:
         now = time.perf_counter()
         if now - self._last < self.every_seconds:
@@ -241,5 +256,6 @@ class LiveDiagnostics(BaseCallback):
         self._last = now
         if self.episodes.history["rewards"]:
             write_panels(self.episodes.history, self.scenario, self.paths.panels)
+            self.write_history()
         self.write_status(now)
         return True
