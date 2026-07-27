@@ -201,11 +201,17 @@ def build_callbacks(args, paths, model, remaining, sigma_start, sigma_end):
         live,
     ]
     callbacks += [cb for cb in (distance_cb, angle_cb) if cb is not None]
-    # Last, so it sees the curriculum state the others settled this step.
+    # Last, so it sees the curriculum state the others settled this step. The
+    # angle curriculum then gates on ITS dock rate rather than the noisy one.
     if args.eval_freq > 0:
-        callbacks.append(BestModelEval(args.scenario, paths.best_model, NUM_ENVS,
-                                       args.eval_freq, args.eval_episodes,
-                                       distance_cb, angle_cb))
+        eval_cb = BestModelEval(args.scenario, paths.best_model, NUM_ENVS,
+                                args.eval_freq, args.eval_episodes, distance_cb, angle_cb)
+        callbacks.append(eval_cb)
+        if angle_cb is not None:
+            angle_cb.eval_source = eval_cb
+    elif angle_cb is not None:
+        print("WARNING: --eval-freq 0 disables the deterministic gate the angle "
+              "curriculum needs; it will fall back to the noisy dock rate.")
     return callbacks, logger, live
 
 

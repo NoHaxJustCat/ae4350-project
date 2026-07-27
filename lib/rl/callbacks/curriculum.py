@@ -92,14 +92,24 @@ class AngleCurriculum(_DockRateCurriculum):
     Sampling the whole circle from step one instead drives the policy to
     brute-force thrusting at ~11x optimal, because the optimal coasting
     trajectory has ~96% excursion margin at V-bar but only ~20% off-axis.
+
+    Gated on the DETERMINISTIC evaluation dock rate, not the behaviour
+    policy's. The docking basin is ~0.006 wide in action space, so exploration
+    noise alone holds the noisy dock rate far below any sensible threshold even
+    when the policy is fine: a live run sat at 11% noisy against 58% actual,
+    and the sector could never widen. `eval_source` is the BestModelEval
+    callback; without one this falls back to the noisy window.
     """
 
-    def __init__(self, n_envs, start_deg, max_deg, increment_deg, distance_curriculum, **kw):
+    def __init__(self, n_envs, start_deg, max_deg, increment_deg, distance_curriculum,
+                 eval_source=None, **kw):
         super().__init__(n_envs, **kw)
         self.start_deg, self.max_deg = start_deg, max_deg
         self.increment_deg = increment_deg
         self.distance_curriculum = distance_curriculum
+        self.eval_source = eval_source
         self.half_width_deg = None
+        self._last_eval_step = None
 
     def _on_training_start(self) -> None:
         # Adopt whatever the envs were built with, so resuming a partly-widened
@@ -124,13 +134,34 @@ class AngleCurriculum(_DockRateCurriculum):
         self.half_width_deg = float(np.clip(half_width, self.start_deg, self.max_deg))
         self.training_env.env_method("set_angle_half_width", self.half_width_deg)
 
+    def _eval_decision(self):
+        """Advance/regress from the newest deterministic evaluation, or None if
+        no fresh one has landed since the last decision."""
+        src = self.eval_source
+        if src is None or src.last_eval_step is None:
+            return None
+        if src.last_eval_step == self._last_eval_step:
+            return None
+        self._last_eval_step = src.last_eval_step
+        if src.last_dock_rate >= self.threshold:
+            self._stalled = 0
+            return "advance"
+        self._stalled += 1
+        if self._stalled >= self.stall_patience:
+            self._stalled = 0
+            return "regress"
+        return None
+
     def _on_step(self) -> bool:
         if not self._distance_ready():
             return True
         self._lock()
-        if not self._collect():
+        if self.eval_source is not None:
+            action = self._eval_decision()
+        elif self._collect():
+            action = self._decide()
+        else:
             return True
-        action = self._decide()
         if action == "advance" and self.half_width_deg < self.max_deg:
             self._push(self.half_width_deg + self.increment_deg)
             print(f"[angle] widening sector to +-{self.half_width_deg:.2f} deg")

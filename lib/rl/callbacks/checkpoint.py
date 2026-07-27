@@ -85,6 +85,10 @@ class BestModelEval(BaseCallback):
         self._best_by_stage = {}
         self._hardest = None
         self.best_at = None
+        # Latest deterministic result, consumed by AngleCurriculum: the noisy
+        # dock rate is unusable as a curriculum gate on a basin this narrow.
+        self.last_dock_rate = None
+        self.last_eval_step = None
         self._raw = self._env = None
 
     def _on_training_start(self) -> None:
@@ -127,6 +131,7 @@ class BestModelEval(BaseCallback):
             self._hardest = hardness
 
         score, dock_rate = self._evaluate()
+        self.last_dock_rate, self.last_eval_step = dock_rate, self.num_timesteps
         prev = self._best_by_stage.get(stage, -np.inf)
         self._best_by_stage[stage] = max(prev, score)
 
