@@ -67,9 +67,25 @@ ENV_BURN_DEADZONE_FRAC = 0.05              # smaller commands are applied as zer
 # --- Scenarios ---
 SCENARIO = os.environ.get("AE4350_SCENARIO", "vbar")
 RBAR_X_TO_Z_RATIO = 2.0
-# 3*pi/4, not a round 2.5, so "random" max_dv matches "vbar" exactly at V-bar
-# and a vbar model transfers in unchanged.
-ENV_RANDOM_DV_REF_MULT = 3.0 * np.pi / 4.0
+# "random" actuator scale: max_dv = ENV_MAX_DV_COEFF * this * dv_opt.
+#
+# 1.0 (max_dv = 1.5*dv_opt), not the old 3*pi/4 (3.53*dv_opt). dv_opt varies
+# 23.6x with direction, so the action scale does too -- one unit of normalized
+# action does 23.6x more physical damage off-axis while the 5 m tolerance stays
+# fixed. Measured dock rate of the OPTIMAL action under 0.02 burn noise at
+# 30 m, as the cap shrinks:
+#       cap    0deg  15deg  45deg  90deg
+#      3.53     82%    10%     3%    15%
+#      1.50    100%    28%    12%    34%
+# The largest optimal burn is 0.746*dv_opt (at 90 deg), so a 1.5 cap still
+# leaves 2x headroom for corrections.
+#
+# This drops the old property that a vbar model transfers into "random"
+# unchanged -- deliberate: seeding from the V-bar specialist starts at 1000 m,
+# where the basin is narrowest, which is the worst place to begin. Random now
+# trains from scratch up the distance curriculum instead.
+# random-only: vbar/rbar set dv_ref from their analytic references.
+ENV_RANDOM_DV_REF_MULT = 1.0
 ENV_RANDOM_ANGLE_TABLE_N = 180
 
 # --- TD3 ---
@@ -111,7 +127,7 @@ NOISE_DECAY_FRAC = 0.5
 # --- Checkpointing / evaluation ---
 CHECKPOINT_FREQ = 10_000
 KEEP_LAST_CHECKPOINTS = 3
-EVAL_FREQ = 20_000
+EVAL_FREQ = 1_000
 EVAL_EPISODES = 20
 
 # --- Logging ---

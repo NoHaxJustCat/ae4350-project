@@ -1,44 +1,45 @@
-# "random" (all-angles) run, seeded from the V-bar specialist at full distance
-# and ramping the direction sector outward from V-bar.
+# "random" (all-angles) run, trained FROM SCRATCH up the distance curriculum.
 #
-# Starts from the specialist rather than from scratch: the "random" dv_ref is
-# 3*pi/4 * dv_opt precisely so its actuator scale matches the vbar scenario's
-# at 0 deg, letting a vbar model transfer in unchanged (1.15x optimal, 100%
-# dock). Sampling the whole circle from step one instead drives the policy into
-# brute-force thrusting at ~11x optimal -- see ENV_ANGLE_CURRICULUM_* in
-# config.py.
+# Not seeded from the V-bar specialist, and no angle curriculum. Both of those
+# start the policy at 1000 m, which measurement says is the worst possible
+# place to begin: the docking basin scales as 5/d (the tolerance is a fixed
+# 5 m while everything else scales with distance), so it is ~12x wider at 30 m
+# than at 1000 m. Dock rate of the OPTIMAL action under 0.02 burn noise:
 #
-# The seed's usable envelope is only ~+-0.12 deg, so the sector starts tiny and
-# the opening phase is the policy learning a mid-coast correction burn.
+#            30 m   1000 m
+#     0 deg   82%       5%
+#    15 deg   10%       0%
+#    45 deg    3%       0%
+#    90 deg   15%       0%
 #
-# -TotalTimesteps is the ABSOLUTE target including the seed's own steps.
+# So: learn the angle->(burn, coast) mapping at short range where noise is
+# survivable, then let the distance curriculum tighten precision. That mapping
+# is itself distance-invariant -- CW is linear, so the optimal normalized burn
+# and coast time depend only on direction -- which is what makes the ramp work.
+#
+# ENV_RANDOM_DV_REF_MULT is also down to 1.0 (max_dv = 1.5*dv_opt), which buys
+# back off-axis resolution. See config.py. Both changes are random-only.
 
 param(
     [string]$RunTag = "random_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
-    [string]$ResumeFrom = "out/vbar_specialist/vbar_td3.zip",
-    [int]$TotalTimesteps = 2300000,
-    [double]$AngleStart = 0.25,
-    [double]$AngleIncrement = 0.25,
-    [double]$NoiseStart = 0.3,
+    [int]$TotalTimesteps = 2000000,
+    [double]$NoiseStart = 0.10,
     [double]$NoiseEnd = 0.01,
-    [double]$NoiseDecayFrac = 0.75
+    [double]$NoiseDecayFrac = 0.5,
+    [int]$EvalFreq = 10000
 )
 
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath (Split-Path $PSScriptRoot -Parent)
 
-Write-Host "random | run-tag=$RunTag | steps=$TotalTimesteps | from $ResumeFrom"
-Write-Host "  sector +-$AngleStart deg, +$AngleIncrement per cleared window | noise $NoiseStart -> $NoiseEnd over $NoiseDecayFrac"
+Write-Host "random | run-tag=$RunTag | steps=$TotalTimesteps | from scratch"
+Write-Host "  distance curriculum 30 -> 1000 m, full angle range | noise $NoiseStart -> $NoiseEnd over $NoiseDecayFrac"
 
 & ./.conda/python.exe -u scripts/train.py `
     --scenario random `
     --total-timesteps $TotalTimesteps `
-    --resume-from $ResumeFrom `
-    --curriculum-start-distance 1000 `
-    --angle-curriculum `
-    --angle-curriculum-start $AngleStart `
-    --angle-curriculum-increment $AngleIncrement `
     --noise-std-start $NoiseStart `
     --noise-std-end $NoiseEnd `
     --noise-decay-frac $NoiseDecayFrac `
+    --eval-freq $EvalFreq `
     --run-tag $RunTag
