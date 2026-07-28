@@ -1,38 +1,51 @@
-# Continue an existing "random" run, keeping its angle sector.
+# Refine out/random_specialist at very low noise.
 #
-# Use runs/random.ps1 to START from the V-bar specialist; use this to pick a
-# run back up from one of its own checkpoints. The sector is read from the
-# checkpoint's .curriculum.json sidecar, so a partly-widened run resumes where
-# it left off; pass -AngleStart to deliberately restart the ramp narrower.
+# Polishes a converged policy rather than searching, so the noise defaults are
+# an order of magnitude below a training run. Use runs/random.ps1 to train from
+# scratch, runs/random_resume.ps1 to continue a run in tmp/.
 #
-# -TotalTimesteps is the ABSOLUTE target including the resumed model's steps.
+# Where the specialist stands (60 deterministic episodes, full circle):
+#     dock rate  91.7%
+#     dv/opt     1.56x median
+#     arrival    3.51 m/s  <-- 1.38x dv_opt, i.e. it is NOT braking
+#
+# So the thing to watch is reward_term rising and arrival speed falling. It
+# currently collects ~10 of a possible 500 stop bonus, and braking is worth
+# about +420 net even after the extra fuel, so the gradient does point there.
+# dv/opt drifting up toward ~2 while that happens is correct, not a regression.
+#
+# CAUTION: a V-bar refinement at low noise once collapsed from ~95% dock to 0%
+# -- the actor drifted off a narrow basin and the critic inverted. best_model
+# protects the artifact, but watch the [eval] line rather than the training log.
+#
+# -TotalTimesteps is the ABSOLUTE target including the resumed model's steps
+# (best_model is at ~960k).
 
 param(
-    [Parameter(Mandatory = $true)][string]$ResumeFrom,
+    [string]$ResumeFrom = "out/random_specialist/model/best_model.zip",
     [string]$RunTag = "random_refine_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
-    [int]$TotalTimesteps = 4000000,
-    [double]$AngleStart = 0.1,
-    [double]$AngleIncrement = 1.0,
-    [double]$NoiseStart = 0.02,
-    [double]$NoiseEnd = 0.005,
-    [double]$NoiseDecayFrac = 0.5
+    [int]$TotalTimesteps = 1500000,
+    [double]$NoiseStart = 0.005,
+    [double]$NoiseEnd = 0.001,
+    [double]$NoiseDecayFrac = 0.5,
+    [int]$EvalFreq = 10000
 )
 
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath (Split-Path $PSScriptRoot -Parent)
 
-Write-Host "random refine | run-tag=$RunTag | steps=$TotalTimesteps | from $ResumeFrom"
-Write-Host "  sector floor +-$AngleStart deg, +$AngleIncrement per cleared window | noise $NoiseStart -> $NoiseEnd over $NoiseDecayFrac"
+if (-not (Test-Path $ResumeFrom)) { throw "Checkpoint not found: $ResumeFrom" }
+
+Write-Host "random refine | run-tag=$RunTag | steps=$TotalTimesteps"
+Write-Host "  from: $ResumeFrom"
+Write-Host "  noise $NoiseStart -> $NoiseEnd over $NoiseDecayFrac | eval every $EvalFreq"
 
 & ./.conda/python.exe -u scripts/train.py `
     --scenario random `
     --total-timesteps $TotalTimesteps `
     --resume-from $ResumeFrom `
-    --curriculum-start-distance 1000 `
-    --angle-curriculum `
-    --angle-curriculum-start $AngleStart `
-    --angle-curriculum-increment $AngleIncrement `
     --noise-std-start $NoiseStart `
     --noise-std-end $NoiseEnd `
     --noise-decay-frac $NoiseDecayFrac `
+    --eval-freq $EvalFreq `
     --run-tag $RunTag
