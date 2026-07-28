@@ -9,6 +9,25 @@ from config import (
 from lib.plots.style import COLOR_1, COLOR_2, COLOR_4, COLOR_5, new_figure, save, style_axes
 
 
+# A 6.5in figure at 300 dpi is ~1950 px wide, so past a few thousand points
+# every extra sample is invisible -- but matplotlib still allocates and renders
+# it, twice, because savefig uses bbox_inches="tight". Measured cost of ONE
+# write_panels() call, which runs every DIAG_UPDATE_SECONDS:
+#     25k episodes -> 30 s     100k -> 83 s     400k -> 141 s
+# A 2M-step run reaches ~1M episodes, so this outran its own 60 s cadence and
+# grew without bound until the machine ran out of memory.
+MAX_PLOT_POINTS = 4000
+
+
+def decimate(y, offset=0):
+    """(x, y) thinned to at most MAX_PLOT_POINTS for plotting."""
+    y = np.asarray(y, dtype=float)
+    if y.size <= MAX_PLOT_POINTS:
+        return np.arange(y.size) + offset, y
+    idx = np.arange(0, y.size, int(np.ceil(y.size / MAX_PLOT_POINTS)))
+    return idx + offset, y[idx]
+
+
 def moving_average(values, window=SMOOTHING_WINDOW):
     values = np.asarray(values, dtype=float)
     if len(values) < window:
@@ -21,17 +40,23 @@ def trend(ax, data, label, color, linewidth=1.5):
     data = np.asarray(data, dtype=float)
     if not data.size:
         return
-    ax.plot(data, color=color, linewidth=0.6, alpha=0.22)
+    ax.plot(*decimate(data), color=color, linewidth=0.6, alpha=0.22)
+    # Smooth on the FULL series, then thin -- decimating first would alias.
     smooth = moving_average(data)
-    ax.plot(np.arange(len(data) - len(smooth), len(data)), smooth,
+    ax.plot(*decimate(smooth, offset=len(data) - len(smooth)),
             color=color, linewidth=linewidth, label=label)
 
 
 def rolling_dock_rate(docked, window=DOCK_RATE_WINDOW):
+    """Vectorized via a cumulative sum. The previous version built one numpy
+    slice per episode in a Python loop -- O(n) temporaries every redraw."""
     docked = np.asarray(docked, dtype=float)
     if not docked.size:
         return docked
-    return np.array([100 * docked[max(0, i - window):i + 1].mean() for i in range(len(docked))])
+    cumulative = np.concatenate([[0.0], np.cumsum(docked)])
+    hi = np.arange(1, docked.size + 1)
+    lo = np.maximum(0, np.arange(docked.size) - window)
+    return 100.0 * (cumulative[hi] - cumulative[lo]) / (hi - lo)
 
 
 # -- panels ------------------------------------------------------------------
@@ -53,7 +78,8 @@ def _dv_ratio(ax, h):
 
 
 def _dock_rate(ax, h):
-    ax.plot(rolling_dock_rate(h["docked"]), color=COLOR_2, linewidth=1.5, label="dock rate")
+    ax.plot(*decimate(rolling_dock_rate(h["docked"])), color=COLOR_2,
+            linewidth=1.5, label="dock rate")
     ax.set_ylabel(r"\%" if plt.rcParams["text.usetex"] else "%")
     ax.set_ylim(0, 100)
 
@@ -79,7 +105,7 @@ def _r_term(ax, h):
 
 
 def _noise(ax, h):
-    ax.plot(h["noise_std"], color=COLOR_5, linewidth=1.5, label="noise std")
+    ax.plot(*decimate(h["noise_std"]), color=COLOR_5, linewidth=1.5, label="noise std")
     ax.axhline(ENV_BURN_DEADZONE_FRAC, color="black", linestyle="--", linewidth=1.0,
                label=f"deadzone ({ENV_BURN_DEADZONE_FRAC})")
     ax.set_ylabel("std [action units]")
@@ -99,7 +125,8 @@ def _critic_loss(ax, h):
 
 def _curriculum(ax, h):
     """Distance on the left axis; the angle sector on a right axis when active."""
-    ax.plot(h["curriculum_distance"], color=COLOR_1, linewidth=1.5, label="distance")
+    ax.plot(*decimate(h["curriculum_distance"]), color=COLOR_1,
+            linewidth=1.5, label="distance")
     ax.set_ylabel("distance [m]", color=COLOR_1)
     ax.tick_params(axis="y", colors=COLOR_1)
 
@@ -107,7 +134,7 @@ def _curriculum(ax, h):
         if "angle_half_width_deg" in h else np.array([])
     if angle.size and np.isfinite(angle).any():
         twin = ax.twinx()
-        twin.plot(angle, color=COLOR_4, linewidth=1.5, label="angle sector")
+        twin.plot(*decimate(angle), color=COLOR_4, linewidth=1.5, label="angle sector")
         twin.set_ylabel("sector half-width [deg]", color=COLOR_4)
         twin.tick_params(axis="y", colors=COLOR_4)
         # Fixed 0..max: the reading that matters is how far toward the full
