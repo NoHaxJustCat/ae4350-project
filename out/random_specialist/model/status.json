@@ -1,0 +1,1 @@
+{"scenario": "random", "run_tag": "random_20260728_095951_cont_170013", "num_timesteps": 992196, "total_timesteps": 2000000, "episode_count": 366243, "recent_dock_rate": 0.6, "recent_avg_reward": 199.81321725, "curriculum_distance": 1000.0, "angle_half_width_deg": null, "elapsed_seconds": 9125.4497014, "steps_per_sec": 108.72844982618008, "updated_at": "2026-07-28 19:32:49"}
