@@ -62,3 +62,7 @@ class RunPaths:
     @property
     def history(self) -> Path:
         return self.model / "history.npz"
+
+    @property
+    def params(self) -> Path:
+        return self.model / "params.json"

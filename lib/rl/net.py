@@ -22,12 +22,13 @@ from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
-_ACTIVATIONS = {
+ACTIVATIONS = {
     "silu": nn.SiLU,
     "relu": nn.ReLU,
     "gelu": nn.GELU,
     "tanh": nn.Tanh,
 }
+_ACTIVATIONS = ACTIVATIONS      # legacy alias
 
 
 class SmartEncoder(BaseFeaturesExtractor):
