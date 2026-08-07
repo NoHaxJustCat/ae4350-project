@@ -49,7 +49,7 @@ from lib.rl.obs import NormalizedObsEnv
 from lib.rl.symmetry import CanonicalizeDirectionEnv
 
 
-def make_env(scenario, distance=None, angle=None):
+def make_env(scenario, distance=None, angle=None, dv_ref_mult=None):
     def _init():
         # Each worker does only a small matmul per step, so a multi-threaded
         # pool just means n_envs processes fighting for the same cores.
@@ -59,6 +59,8 @@ def make_env(scenario, distance=None, angle=None):
             kwargs["curriculum_start_distance"] = distance
         if angle is not None:
             kwargs["angle_half_width_deg"] = angle
+        if dv_ref_mult is not None:
+            kwargs["dv_ref_mult"] = dv_ref_mult
         env = CWRendezvousEnv(omega=OMEGA, scenario=scenario, **kwargs)
         return Monitor(NormalizedObsEnv(CanonicalizeDirectionEnv(env)))
     return _init
@@ -88,6 +90,13 @@ def parse_args():
                    help="Use a stock SB3 MlpPolicy instead of the LayerNorm encoder.")
     p.add_argument("--no-curriculum", dest="curriculum", action="store_false",
                    help="Train at the final distance from step 0; no distance ramp.")
+    p.add_argument("--learning-starts", type=int, default=MIN_BUFFER,
+                   help="Steps of uniform-random actions before the policy takes "
+                        "over AND gradient updates begin -- both switch on here.")
+    p.add_argument("--dv-ref-mult", type=float, default=None,
+                   help="Size the actuator as this multiple of the true optimum "
+                        "instead of the scenario's analytic reference. vbar's "
+                        "default gives max_dv = 3.54*dv_opt; 1.0 here gives 1.5x.")
 
     p.add_argument("--noise-std-start", type=float, default=ACTION_NOISE_STD_START)
     p.add_argument("--noise-std-end", type=float, default=ACTION_NOISE_STD_END)
@@ -156,7 +165,7 @@ def build_vec_env(args, distance, angle):
     else:
         vec_cls, vec_kwargs = DummyVecEnv, {}
     print(f"vec_env: {vec_cls.__name__} x{NUM_ENVS}")
-    return make_vec_env(make_env(args.scenario, distance, angle),
+    return make_vec_env(make_env(args.scenario, distance, angle, args.dv_ref_mult),
                         n_envs=NUM_ENVS, vec_env_cls=vec_cls, vec_env_kwargs=vec_kwargs)
 
 
@@ -191,7 +200,8 @@ def build_model(args, env, sigma_start):
     model = build_algo(
         args.algo,
         env=env, learning_rate=args.learning_rate,
-        buffer_size=args.buffer_size, learning_starts=MIN_BUFFER, batch_size=BATCH_SIZE,
+        buffer_size=args.buffer_size, learning_starts=args.learning_starts,
+        batch_size=BATCH_SIZE,
         tau=TAU, gamma=args.gamma, train_freq=(TRAIN_FREQ, "step"),
         gradient_steps=GRADIENT_STEPS, verbose=0, device=DEVICE, seed=args.seed,
         policy_kwargs=build_policy_kwargs([args.net_width] * 2, args.net_width,
@@ -239,7 +249,8 @@ def build_callbacks(args, paths, model, remaining, sigma_start, sigma_end):
     # angle curriculum then gates on ITS dock rate rather than the noisy one.
     if args.eval_freq > 0:
         eval_cb = BestModelEval(args.scenario, paths.best_model, NUM_ENVS,
-                                args.eval_freq, args.eval_episodes, distance_cb, angle_cb)
+                                args.eval_freq, args.eval_episodes, distance_cb, angle_cb,
+                                dv_ref_mult=args.dv_ref_mult)
         callbacks.append(eval_cb)
         if angle_cb is not None:
             angle_cb.eval_source = eval_cb
@@ -262,7 +273,7 @@ def write_params(args, paths, model, sigma_start, sigma_end):
         # -- learning
         "gamma": args.gamma, "learning_rate": args.learning_rate,
         "buffer_size": args.buffer_size, "batch_size": BATCH_SIZE, "tau": TAU,
-        "learning_starts": MIN_BUFFER, "train_freq": TRAIN_FREQ,
+        "learning_starts": args.learning_starts, "train_freq": TRAIN_FREQ,
         "gradient_steps": GRADIENT_STEPS,
         "target_policy_noise": TD3_TARGET_POLICY_NOISE if args.algo == "td3" else None,
         "target_noise_clip": TD3_TARGET_NOISE_CLIP if args.algo == "td3" else None,
@@ -288,6 +299,7 @@ def write_params(args, paths, model, sigma_start, sigma_end):
         "angle_curriculum": args.angle_curriculum,
         "env_dt_agent": ENV_DT_AGENT, "env_timeout": ENV_TIMEOUT,
         "pos_tolerance": ENV_POS_TOLERANCE, "max_dv_coeff": ENV_MAX_DV_COEFF,
+        "dv_ref_mult": args.dv_ref_mult,
         "boundary_mult": ENV_CURRICULUM_BOUNDARY_MULT,
         # -- compute / provenance
         "n_envs": NUM_ENVS, "device": DEVICE,
@@ -318,7 +330,8 @@ def main():
     print(f"Platform: {platform.system()} | device: {DEVICE} | "
           f"torch threads: {TORCH_THREADS} | cpu_count: {os.cpu_count()}")
 
-    check_env(CWRendezvousEnv(omega=OMEGA, scenario=args.scenario))
+    check_env(CWRendezvousEnv(omega=OMEGA, scenario=args.scenario,
+                              dv_ref_mult=args.dv_ref_mult))
     paths = RunPaths(args.run_tag, args.scenario)
     print(f"output: {paths.root}")
 

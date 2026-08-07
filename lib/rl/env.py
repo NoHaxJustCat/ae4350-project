@@ -55,6 +55,7 @@ class CWRendezvousEnv(gym.Env):
         curriculum_boundary_mult: float = ENV_CURRICULUM_BOUNDARY_MULT,
         angle_half_width_deg: float = ENV_ANGLE_CURRICULUM_MAX_DEG,
         rbar_x_to_z_ratio: float = RBAR_X_TO_Z_RATIO,
+        dv_ref_mult: float = None,
     ):
         super().__init__()
         if scenario not in ("vbar", "rbar", "random"):
@@ -76,6 +77,12 @@ class CWRendezvousEnv(gym.Env):
         if self.n_substeps < 1 or abs(n_sub - self.n_substeps) > 1e-9:
             raise ValueError(f"dt ({dt}) must be an integer multiple of dt_phys ({dt_phys})")
 
+        # None -> each scenario's analytic reference. A float sizes the actuator
+        # as a multiple of the TRUE optimum instead, for every scenario, the way
+        # "random" already does. vbar's analytic reference gives max_dv =
+        # 3.54*dv_opt, which is the oversized cap that was removed for "random";
+        # dv_ref_mult=1.0 gives 1.5*dv_opt to match it.
+        self.dv_ref_mult = dv_ref_mult
         self.max_dv_coeff = max_dv_coeff
         self.burn_deadzone_frac = burn_deadzone_frac
         self.burn_deadzone = 0.0
@@ -203,7 +210,9 @@ class CWRendezvousEnv(gym.Env):
         self.dv_opt = per_m * dist
 
         # dv_ref is the actuator/observation scale only, NOT the fuel target.
-        if self.scenario == "vbar":
+        if self.dv_ref_mult is not None:
+            self.dv_ref = self.dv_ref_mult * self.dv_opt
+        elif self.scenario == "vbar":
             self.dv_ref = 0.5 * dv_vbar_two_impulse_rr(dist, self.omega)
         elif self.scenario == "rbar":
             self.dv_ref = dv_rbar_strategy_rv(dist, self.omega)

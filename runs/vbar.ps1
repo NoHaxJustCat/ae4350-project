@@ -2,10 +2,11 @@
 
 param(
     [string]$RunTag = "vbar_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
-    [int]$TotalTimesteps = 500000,
+    [int]$TotalTimesteps = 100000,
     [double]$NoiseStart = 0.10,
     [double]$NoiseEnd = 0.01,
-    [double]$NoiseDecayFrac = 0.35
+    [double]$NoiseDecayFrac = 0.8,
+    [int]$EvalFreq = 10000
 )
 
 $ErrorActionPreference = "Stop"

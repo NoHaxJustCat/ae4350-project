@@ -77,9 +77,12 @@ class BestModelEval(BaseCallback):
     """
 
     def __init__(self, scenario, save_path: Path, n_envs, freq, n_episodes,
-                 distance_cb=None, angle_cb=None):
+                 distance_cb=None, angle_cb=None, dv_ref_mult=None):
         super().__init__(verbose=0)
         self.scenario, self.save_path, self.n_episodes = scenario, save_path, n_episodes
+        # Must match training: a different actuator scale here would evaluate a
+        # different problem than the one being trained.
+        self.dv_ref_mult = dv_ref_mult
         self.freq_calls = max(freq // max(n_envs, 1), 1)
         self.distance_cb, self.angle_cb = distance_cb, angle_cb
         self._best_by_stage = {}
@@ -92,7 +95,8 @@ class BestModelEval(BaseCallback):
         self._raw = self._env = None
 
     def _on_training_start(self) -> None:
-        self._raw = CWRendezvousEnv(omega=OMEGA, scenario=self.scenario)
+        self._raw = CWRendezvousEnv(omega=OMEGA, scenario=self.scenario,
+                                    dv_ref_mult=self.dv_ref_mult)
         self._env = NormalizedObsEnv(CanonicalizeDirectionEnv(self._raw))
 
     def _sync(self):
