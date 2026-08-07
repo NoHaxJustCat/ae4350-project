@@ -3,8 +3,7 @@ Gather the ablation study into one self-contained directory for plotting.
 
     python scripts/collect_ablations.py
 
-Reads tmp/abl_*/model/{history.npz,params.json} plus the reused nominal, and
-writes for each run:
+Reads tmp/abl_*/model/{history.npz,params.json} and writes for each run:
 
     tmp/ablations/<name>.npz      per-episode history + a "params_json" entry
 
@@ -12,8 +11,9 @@ so a plotting script needs exactly one file per run and never has to consult
 config.py, which will have moved on by the time the report is written. A
 human-readable tmp/ablations/manifest.json indexes them.
 
-The nominal is tmp/vbar_fresh, trained before the ablation flags existed, so its
-params.json is reconstructed here from the values recorded in its saved model.
+The nominal is tmp/abl_nominal -- a real seeded run at the same settings as the
+rest, NOT the older tmp/vbar_fresh. See runs/ablations.ps1 for why that one
+cannot serve as a baseline.
 """
 
 import json
@@ -27,13 +27,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import OUT_DIR
 
 OUT = Path(OUT_DIR) / "ablations"
-NOMINAL_TAG = "vbar_fresh"
 
 # What each run is meant to show, carried into the manifest so the plots can be
 # labelled without re-deriving it from the parameter diff.
 LABELS = {
     "nominal":       ("Nominal", "TD3, gamma 0.99, lr 1e-4, net [256,256], replay 300k"),
-    "gamma_low":     ("gamma 0.90", "Discount lowered from 0.99"),
+    "gamma_095":     ("gamma 0.95", "Discount lowered from 0.99"),
+    "gamma_090":     ("gamma 0.90", "Discount lowered from 0.99"),
+    "gamma_080":     ("gamma 0.80", "Discount lowered from 0.99"),
     "lr_low":        ("lr 1e-5", "Learning rate lowered 10x"),
     "lr_high":       ("lr 1e-3", "Learning rate raised 10x"),
     "net_32":        ("net 32", "Hidden width 32 (nominal 256)"),
@@ -48,58 +49,8 @@ LABELS = {
 ORDER = list(LABELS)
 
 
-def nominal_params(run_dir: Path) -> dict:
-    """Rebuild the nominal's params.json from its saved model and status.json.
-
-    Read from the artefacts rather than hardcoded so this cannot silently
-    disagree with what actually ran.
-    """
-    from stable_baselines3 import TD3
-
-    from config import (
-        ACTIVATION, ENV_CURRICULUM_BOUNDARY_MULT, ENV_CURRICULUM_INCREMENT,
-        ENV_CURRICULUM_MAX_DISTANCE, ENV_CURRICULUM_START_DISTANCE, ENV_DT_AGENT,
-        ENV_MAX_DV_COEFF, ENV_POS_TOLERANCE, ENV_TIMEOUT, MIN_BUFFER, N_BLOCKS,
-        NUM_ENVS, OU_DT, OU_THETA, TD3_TARGET_NOISE_CLIP, TD3_TARGET_POLICY_NOISE,
-        TRAIN_FREQ, GRADIENT_STEPS,
-    )
-
-    model = TD3.load(run_dir / "model" / "best_model.zip", device="cpu")
-    status = json.loads((run_dir / "model" / "status.json").read_text())
-    width = model.policy_kwargs["features_extractor_kwargs"]["features_dim"]
-    return {
-        "run_tag": NOMINAL_TAG, "scenario": status["scenario"], "algo": "td3",
-        "total_timesteps": status["total_timesteps"], "seed": None,
-        "gamma": model.gamma, "learning_rate": float(model.learning_rate),
-        "buffer_size": model.buffer_size, "batch_size": model.batch_size,
-        "tau": model.tau, "learning_starts": MIN_BUFFER, "train_freq": TRAIN_FREQ,
-        "gradient_steps": GRADIENT_STEPS,
-        "target_policy_noise": TD3_TARGET_POLICY_NOISE,
-        "target_noise_clip": TD3_TARGET_NOISE_CLIP,
-        "net_arch": list(model.policy_kwargs["net_arch"]), "features_dim": width,
-        "n_blocks": N_BLOCKS, "activation": ACTIVATION, "smart_encoder": True,
-        # runs/vbar.ps1 defaults, which is how this run was launched.
-        "action_noise": "ou", "noise_std_start": 0.10, "noise_std_end": 0.01,
-        "noise_decay_frac": 0.35, "ou_theta": OU_THETA, "ou_dt": OU_DT,
-        "curriculum": True,
-        "curriculum_start_distance": ENV_CURRICULUM_START_DISTANCE,
-        "curriculum_max_distance": ENV_CURRICULUM_MAX_DISTANCE,
-        "curriculum_increment": ENV_CURRICULUM_INCREMENT,
-        "angle_curriculum": False,
-        "env_dt_agent": ENV_DT_AGENT, "env_timeout": ENV_TIMEOUT,
-        "pos_tolerance": ENV_POS_TOLERANCE, "max_dv_coeff": ENV_MAX_DV_COEFF,
-        "boundary_mult": ENV_CURRICULUM_BOUNDARY_MULT,
-        "n_envs": NUM_ENVS, "device": "cuda",
-        "policy_class": "TD3Policy",
-        "n_parameters": sum(p.numel() for p in model.policy.parameters()),
-        "reconstructed": "Trained before the ablation flags existed; these values "
-                         "are read back from the saved model, not from a live run.",
-    }
-
-
 def run_dir_for(name: str) -> Path:
-    root = Path(OUT_DIR)
-    return root / (NOMINAL_TAG if name == "nominal" else f"abl_{name}")
+    return Path(OUT_DIR) / f"abl_{name}"
 
 
 def summarize(history: dict) -> dict:
@@ -129,15 +80,10 @@ def collect(name: str) -> dict | None:
         return None
 
     params_path = run / "model" / "params.json"
-    if params_path.exists():
-        params = json.loads(params_path.read_text())
-    elif name == "nominal":
-        params = nominal_params(run)
-        params_path.write_text(json.dumps(params, indent=2))
-        print(f"  {name:<14} reconstructed params -> {params_path}")
-    else:
+    if not params_path.exists():
         print(f"  {name:<14} SKIPPED (no params.json)")
         return None
+    params = json.loads(params_path.read_text())
 
     with np.load(history_path) as data:
         history = {k: data[k] for k in data.files}
