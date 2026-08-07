@@ -1,36 +1,36 @@
 # Hyperparameter ablation study for the report: one knob changed per run.
 #
-# EVERY run here shares one fixed -Seed, INCLUDING the nominal, which is
-# therefore retrained rather than reused. tmp/vbar_fresh is NOT a valid
-# baseline: the V-bar outcome is bimodal -- policies land either in the coasting
-# basin (~1.1x optimal) or the brute-force-thrust basin (~7.2x) -- and
-# vbar_fresh is pinned in the bad one, with 91% of its last 5000 episodes within
-# 1% of exactly 7.20x. Dock rate does not reveal this (96% either way); only
-# dv_ratio does. Comparing single unseeded runs against it credited basin luck
-# to the knob: the first gamma 0.90 run looked like reward 931 vs 515 purely
-# because the baseline had fallen into the bad basin.
+# EVERY run shares one fixed -Seed and -LearningStarts; apart from the named
+# knob they are identical (100k steps, noise 0.10 -> 0.01 over 80%, eval every
+# 10k). Seeding is verified bit-for-bit reproducible.
 #
-# One seed still means n=1 per config, so a lone large jump should be read as
-# possible basin luck until a second seed confirms it. The gamma sweep is three
-# points (0.95/0.90/0.80) precisely so that knob shows a trend rather than an
-# anecdote.
+# The nominal is tmp/abl_nominal, copied from the winning arm of
+# runs/actuator_test.ps1 -- same seed, steps, schedule and warmup, so it is a
+# real member of this grid, not an older run pressed into service. It reaches
+# 1.08x optimal with 97% dock. Do NOT use tmp/vbar_fresh: at the old
+# learning_starts=5000 it sits at 7.20x, and dock rate cannot see the difference.
 #
-# Apart from the named knob, all runs share the nominal's noise schedule
-# (0.10 -> 0.01 over 35%), 150k steps and 20k eval cadence.
-#
-# The nominal runs FIRST, so if the baseline itself lands in the bad basin the
-# study can be stopped early instead of after 7 hours.
+# One seed means n=1 per config, so read a lone large jump as possibly noise
+# until a second seed confirms it. The gamma sweep is three points
+# (0.95/0.90/0.80) so that knob shows a trend rather than an anecdote.
 #
 # Resumable: a run whose history.npz already exists is skipped, so an
 # interrupted study restarts where it stopped. Pass -Force to redo everything.
 
 param(
-    [int]$TotalTimesteps = 150000,
+    [int]$TotalTimesteps = 100000,
     [int]$Seed = 42,
+    # 25000, not the config default 5000. At 5000 the actor starts driving while
+    # the critic is still untrained, saturates at the action-box corner, and the
+    # run settles for brute-force thrusting at ~7.14x optimal. At 25000 the same
+    # config reaches 1.08x -- and finishes FASTER, because the extra warmup runs
+    # at ~1200 steps/s against ~80 once gradients start. Measured, three arms,
+    # runs/actuator_test.ps1.
+    [int]$LearningStarts = 25000,
     [double]$NoiseStart = 0.10,
     [double]$NoiseEnd = 0.01,
-    [double]$NoiseDecayFrac = 0.35,
-    [int]$EvalFreq = 20000,
+    [double]$NoiseDecayFrac = 0.8,
+    [int]$EvalFreq = 10000,
     [string[]]$Only = @(),
     [switch]$Force
 )
@@ -65,7 +65,7 @@ foreach ($n in $Names) {
     if (-not $Ablations.Contains($n)) { throw "Unknown ablation '$n'" }
 }
 
-Write-Host "ablation study | $($Names.Count) runs x $TotalTimesteps steps | seed $Seed" -ForegroundColor Cyan
+Write-Host "ablation study | $($Names.Count) runs x $TotalTimesteps steps | seed $Seed | learning_starts $LearningStarts" -ForegroundColor Cyan
 
 $i = 0
 foreach ($name in $Names) {
@@ -89,6 +89,7 @@ foreach ($name in $Names) {
         --noise-decay-frac $NoiseDecayFrac `
         --eval-freq $EvalFreq `
         --seed $Seed `
+        --learning-starts $LearningStarts `
         --run-tag $tag `
         @extra
 
