@@ -76,6 +76,9 @@ GROUPS = {
 
 MAX_POINTS = 3000
 BOX_ASPECT = 0.72      # identical for all four panels, per the spec
+# Font sizes are fixed in rcParams, so a larger figure buys panel area rather
+# than bigger text -- the labels get relatively smaller and the curves clearer.
+FIGSIZE = (14.5, 10.0)
 
 
 def rolling_nanmean(y, window):
@@ -175,7 +178,7 @@ def make_figure(group, window, out_dir):
         print(f"  {group:<12} SKIPPED (need 2 runs, have {len(loaded)})")
         return None
 
-    fig, axes = plt.subplots(2, 2, figsize=(13.0, 9.0))
+    fig, axes = plt.subplots(2, 2, figsize=FIGSIZE)
     (ax_r, ax_dv), (ax_dk, ax_cl) = axes
 
     variant = iter(VARIANT_COLORS)
