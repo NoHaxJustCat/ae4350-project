@@ -5,11 +5,14 @@ Gather the ablation study into one self-contained directory for plotting.
 
 Reads tmp/abl_*/model/{history.npz,params.json} and writes for each run:
 
-    tmp/ablations/<name>.npz      per-episode history + a "params_json" entry
+    out/ablations/<name>.npz      per-episode history + a "params_json" entry
 
 so a plotting script needs exactly one file per run and never has to consult
 config.py, which will have moved on by the time the report is written. A
-human-readable tmp/ablations/manifest.json indexes them.
+human-readable out/ablations/manifest.json indexes them.
+
+Output goes to out/, not tmp/: tmp/ is gitignored scratch that gets cleared,
+and the collected study is what the report is written from.
 
 The nominal is tmp/abl_nominal -- a real seeded run at the same settings as the
 rest, NOT the older tmp/vbar_fresh. See runs/ablations.ps1 for why that one
@@ -26,7 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import OUT_DIR
 
-OUT = Path(OUT_DIR) / "ablations"
+# out/ is tracked and tmp/ is gitignored, and the collected study is the thing
+# the report is written from, so it belongs in out/.
+OUT = Path(__file__).resolve().parents[1] / "out" / "ablations"
 
 # What each run is meant to show, carried into the manifest so the plots can be
 # labelled without re-deriving it from the parameter diff.

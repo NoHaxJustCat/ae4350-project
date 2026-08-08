@@ -4,8 +4,9 @@ Ablation study figures: one 2x2 panel per hyperparameter group.
     python scripts/plot_ablations.py                 # all groups
     python scripts/plot_ablations.py --group gamma   # just one
 
-Reads the self-contained tmp/ablations/<name>.npz written by
-collect_ablations.py, so plots can be redrawn without retraining.
+Reads the self-contained out/ablations/<name>.npz written by
+collect_ablations.py, so plots can be redrawn without retraining. Figures go to
+out/ablations/figures/.
 
 Each figure holds one group (all its variants plus the nominal) and four
 panels: reward, fuel, dock rate, critic loss. The nominal keeps the same colour
@@ -32,8 +33,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import OUT_DIR
 from lib.plots.style import COLOR_1, COLOR_2, COLOR_3, COLOR_4, COLOR_5, save, style_axes, use_style
 
-IN_DIR = Path(OUT_DIR) / "ablations"
+REPO = Path(__file__).resolve().parents[1]
+# out/ is tracked, tmp/ is gitignored, so the study lives in out/ once it is
+# worth keeping. Fall back to tmp/ for a study that has not been promoted yet.
+IN_DIR = REPO / "out" / "ablations"
+if not IN_DIR.exists():
+    IN_DIR = Path(OUT_DIR) / "ablations"
 OUT_SUBDIR = "figures"
+
+# Fixed across every figure so the fuel panels are comparable between groups,
+# and so the optimum line does not land on the x axis. The smoothed series span
+# 1.03 (net_128) to 206.6 (no_curriculum); the lower bound sits below 1.0 to
+# leave visible clearance under the optimum.
+FUEL_YLIM = (0.5, 300.0)
 
 # The nominal is pinned to COLOR_1 in every figure; variants draw from the rest
 # in order. Gold is last because it is the weakest on white.
@@ -180,6 +192,7 @@ def make_figure(group, window, out_dir):
     ax_r.set_ylabel("Reward")
     ax_dv.set_title("Fuel")
     ax_dv.set_ylabel(r"$\Delta v / \Delta v_{opt}$")
+    ax_dv.set_ylim(*FUEL_YLIM)
     ax_dk.set_title("Dock rate")
     ax_dk.set_ylabel(f"Docked [{pct_label()}]")
     ax_dk.set_ylim(0, 100)
@@ -207,14 +220,22 @@ def make_figure(group, window, out_dir):
 
 
 def main():
+    global IN_DIR          # must precede the f-string default below
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--group", choices=sorted(GROUPS), default=None,
                    help="Only this group (default: all).")
     p.add_argument("--window", type=int, default=400,
                    help="Moving-average window in episodes.")
-    p.add_argument("--out", type=Path, default=IN_DIR / OUT_SUBDIR)
+    p.add_argument("--in-dir", type=Path, default=None,
+                   help=f"Where the collected npz live (default {IN_DIR}).")
+    p.add_argument("--out", type=Path, default=None,
+                   help="Figure directory (default <in-dir>/figures).")
     args = p.parse_args()
+    if args.in_dir is not None:
+        IN_DIR = args.in_dir
+    if args.out is None:
+        args.out = IN_DIR / OUT_SUBDIR
 
     if not IN_DIR.exists():
         sys.exit(f"No {IN_DIR}. Run scripts/collect_ablations.py first.")
