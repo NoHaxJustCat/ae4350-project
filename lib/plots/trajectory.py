@@ -7,15 +7,32 @@ from matplotlib.ticker import MultipleLocator
 from config import ENV_POS_TOLERANCE, MODE_2D
 from lib.plots.style import COLOR_1, COLOR_2, COLOR_3, COLOR_4, save, style_axes, use_style
 
-# Figure geometry. AXES_HEIGHT_IN sizes the plotting box; the pads are the
-# fixed room the labels, title and legend need around it. ASPECT_LIMITS caps
-# how elongated the box may get -- an early episode can be a near-flat sliver,
-# and deriving the figure shape from that alone once collapsed the axes to zero
-# height ("constrained_layout not applied").
-AXES_HEIGHT_IN = 4.0
+# Figure geometry. AXES_HEIGHT_IN is THE size knob -- the figsize passed to
+# plt.subplots is overwritten by set_size_inches below, since the figure has to
+# take the data's shape for the equal-scale axes to fill it. Fonts are in
+# POINTS and set once in style.py, so text and line weights do not shrink with
+# the box: a smaller box is what makes them read larger once the figure is
+# scaled to a column width. The pads are the fixed room the labels, title and
+# legend need, and do not scale with the box for the same reason.
+#
+# ASPECT_LIMITS caps how elongated the box may get -- an early episode can be a
+# near-flat sliver, and deriving the figure shape from that alone once
+# collapsed the axes to zero height ("constrained_layout not applied").
+AXES_HEIGHT_IN = 2.2
 PAD_W_IN = 1.0
 PAD_H_IN = 1.8
-ASPECT_LIMITS = (0.75, 2.4)
+ASPECT_LIMITS = (1.0, 2.4)
+
+# If the legend is ever moved back below the axes, anchor it with
+# bbox_to_anchor=(0.5, -GAP_IN / AXES_HEIGHT_IN) rather than a bare fraction:
+# the y there is a fraction of the AXES HEIGHT, so a fixed fraction slides the
+# legend onto the x label as soon as the box is made shorter.
+
+# Stroke weights. Absolute like the fonts, so they read heavier on a small box.
+LINE_W = 2.4
+MARKER_START = 11
+MARKER_TARGET = 12
+ARROW_W = 2.2
 
 
 def _tick_step(span, target=6):
@@ -70,11 +87,11 @@ def plot_trajectory(states, actions=None, path="trajectory.png",
               float(np.nanmin(z)), float(np.nanmax(z))]
 
     fig, ax = plt.subplots(figsize=(5.5, 5.5))
-    ax.plot(x, z, color=COLOR_1, linewidth=1.5, label="Trajectory")
-    ax.plot(x[0], z[0], "o", color=COLOR_2, markersize=8, markeredgecolor="black",
-            markeredgewidth=0.8, zorder=5, label="Start")
-    ax.plot(0.0, 0.0, "o", color=COLOR_3, markersize=9, markeredgecolor="black",
-            markeredgewidth=0.8, zorder=5, label="Target")
+    ax.plot(x, z, color=COLOR_1, linewidth=LINE_W, label="Trajectory")
+    ax.plot(x[0], z[0], "o", color=COLOR_2, markersize=MARKER_START,
+            markeredgecolor="black", markeredgewidth=0.8, zorder=5, label="Start")
+    ax.plot(0.0, 0.0, "o", color=COLOR_3, markersize=MARKER_TARGET,
+            markeredgecolor="black", markeredgewidth=0.8, zorder=5, label="Target")
 
     theta = np.linspace(0, 2 * np.pi, 200)
 
@@ -107,9 +124,20 @@ def plot_trajectory(states, actions=None, path="trajectory.png",
     ax.set_ylabel(r"$z$ [m] (R-bar)")
     ax.set_title(title or "Relative trajectory")
     style_axes(ax, legend=False, equal=True)
-    # Legend below the axes: a rendezvous spiral fills its own bounding box, so
-    # any in-axes placement covers the trajectory.
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=2, fontsize=12,
+    # Top right, inside the axes. A V-bar approach leaves that corner empty
+    # because the transfer arc hangs below the V-bar line; a trajectory that
+    # does fill its own bounding box will be covered, and wants the legend put
+    # back outside.
+    #
+    # matplotlib fills legend columns TOP-DOWN, not left-to-right, so the order
+    # below is what puts the two markers in the left column and the two lines
+    # in the right one.
+    handles, labels = ax.get_legend_handles_labels()
+    order = ["Start", "Target", "Trajectory"]
+    rank = {name: i for i, name in enumerate(order)}
+    pairs = sorted(zip(labels, handles), key=lambda kv: rank.get(kv[0], len(order)))
+    ax.legend([h for _, h in pairs], [l for l, _ in pairs],
+              loc="upper right", ncol=2, fontsize=12,
               frameon=True, edgecolor="black", framealpha=1.0, columnspacing=0.9,
               handletextpad=0.4, borderpad=0.3)
     save(fig, path)
@@ -137,8 +165,8 @@ def _draw_burns(ax, states, actions, xi, zi, min_dv_display):
                states[i, zi] + actions[i, -1] * scale)
         tips.append(tip)
         ax.annotate("", xy=tip, xytext=(states[i, xi], states[i, zi]),
-                    arrowprops=dict(arrowstyle="->", color=COLOR_4, lw=1.4), zorder=6)
+                    arrowprops=dict(arrowstyle="->", color=COLOR_4, lw=ARROW_W), zorder=6)
     tips = np.asarray(tips)
-    ax.plot([], [], color=COLOR_4, linewidth=1.4,
+    ax.plot([], [], color=COLOR_4, linewidth=ARROW_W,
             label=rf"$\Delta v$ impulses")
     return [tips[:, 0].min(), tips[:, 0].max(), tips[:, 1].min(), tips[:, 1].max()]
