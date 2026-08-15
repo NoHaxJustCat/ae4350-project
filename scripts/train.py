@@ -195,6 +195,17 @@ def build_model(args, env, sigma_start):
         # The saved noise is wrapped for the ORIGINAL run's env count, which
         # breaks broadcasting if NUM_ENVS changed.
         model.action_noise = make_action_noise(action_dim, sigma_start)
+        # The replay buffer is NOT saved with the checkpoint, so a resume
+        # starts with an empty one. learning_starts is restored from the
+        # checkpoint as an ABSOLUTE step count, and the resumed model is
+        # already far past it, so gradient updates would restart immediately
+        # against a buffer holding a handful of transitions -- a good policy
+        # can be destroyed in a few thousand steps that way. Re-anchor it so
+        # --learning-starts means what it does on a fresh run: collect this
+        # many transitions before any updates.
+        model.learning_starts = model.num_timesteps + args.learning_starts
+        print(f"Replay buffer starts empty; refilling {args.learning_starts} steps "
+              f"before gradient updates resume (at {model.learning_starts})")
         return model
 
     model = build_algo(

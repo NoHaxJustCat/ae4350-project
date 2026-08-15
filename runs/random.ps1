@@ -22,24 +22,35 @@
 
 param(
     [string]$RunTag = "random_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
-    [int]$TotalTimesteps = 300000,
+    [int]$TotalTimesteps = 1000000,
+    # 25000, not the config default 5000. Measured over three 100k arms
+    # (runs/random_diag.ps1): at 5000 the actor starts driving an untrained
+    # critic, pins the coast command to its minimum and thrusts its way in at
+    # 5-20x optimal; at 25000 the same config coasts, uses 2 burns and holds
+    # ~1.6x. The warmup itself is nearly free -- it runs at ~1200 steps/s
+    # against ~80 once gradient updates begin.
+    [int]$LearningStarts = 25000,
     [double]$NoiseStart = 0.10,
     [double]$NoiseEnd = 0.005,
-    [double]$NoiseDecayFrac = 0.8,
-    [int]$EvalFreq = 10000
+    [double]$NoiseDecayFrac = 0.6,
+    [int]$EvalFreq = 10000,
+    [int]$Seed = 42
 )
 
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath (Split-Path $PSScriptRoot -Parent)
 
-Write-Host "random | run-tag=$RunTag | steps=$TotalTimesteps | from scratch"
+Write-Host "random | run-tag=$RunTag | steps=$TotalTimesteps | from scratch | seed $Seed"
 Write-Host "  distance curriculum 30 -> 1000 m, full angle range | noise $NoiseStart -> $NoiseEnd over $NoiseDecayFrac"
+Write-Host "  warmup $LearningStarts steps of uniform random actions before gradients start"
 
 & ./.conda/python.exe -u scripts/train.py `
     --scenario random `
     --total-timesteps $TotalTimesteps `
+    --learning-starts $LearningStarts `
     --noise-std-start $NoiseStart `
     --noise-std-end $NoiseEnd `
     --noise-decay-frac $NoiseDecayFrac `
     --eval-freq $EvalFreq `
+    --seed $Seed `
     --run-tag $RunTag
