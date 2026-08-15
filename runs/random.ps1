@@ -22,10 +22,10 @@
 
 param(
     [string]$RunTag = "random_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
-    [int]$TotalTimesteps = 2000000,
+    [int]$TotalTimesteps = 300000,
     [double]$NoiseStart = 0.10,
-    [double]$NoiseEnd = 0.01,
-    [double]$NoiseDecayFrac = 0.5,
+    [double]$NoiseEnd = 0.005,
+    [double]$NoiseDecayFrac = 0.8,
     [int]$EvalFreq = 10000
 )
 

@@ -24,11 +24,8 @@ def plot_trajectory(states, actions=None, path="trajectory.png",
     # the axes to zero height on short early episodes ("constrained_layout not
     # applied"), and left the target off-centre.
     reach = float(np.nanmax(np.abs(np.stack([x, z])))) if len(x) else 0.0
-    limit = max(reach, 2 * ENV_POS_TOLERANCE) * (1.0 + margin)
 
     fig, ax = plt.subplots(figsize=(6.5, 6.5))
-    ax.set_xlim(-limit, limit)
-    ax.set_ylim(-limit, limit)
     ax.plot(x, z, color=COLOR_1, linewidth=1.5, label="Trajectory")
     ax.plot(x[0], z[0], "o", color=COLOR_2, markersize=8, markeredgecolor="black",
             markeredgewidth=0.8, zorder=5, label="Start")
@@ -41,7 +38,14 @@ def plot_trajectory(states, actions=None, path="trajectory.png",
             label=f"Dock tolerance ({ENV_POS_TOLERANCE:.0f} m)")
 
     if actions is not None:
-        _draw_burns(ax, states, actions, xi, zi, min_dv_display)
+        # Arrow tips widen the plot: the first impulse of a V-bar transfer
+        # points outward from the start, i.e. past the trajectory's own reach,
+        # and was being clipped away by limits sized from the states alone.
+        reach = max(reach, _draw_burns(ax, states, actions, xi, zi, min_dv_display))
+
+    limit = max(reach, 2 * ENV_POS_TOLERANCE) * (1.0 + margin)
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
 
     ax.set_xlabel(r"$x$ [m] (V-bar)")
     ax.set_ylabel(r"$z$ [m] (R-bar)")
@@ -58,20 +62,25 @@ def plot_trajectory(states, actions=None, path="trajectory.png",
 
 
 def _draw_burns(ax, states, actions, xi, zi, min_dv_display):
+    """Draws one arrow per impulse and returns how far the tips reach from the
+    target, so the caller can size the axes to keep every arrow on the figure."""
     actions = np.asarray(actions, dtype=float)
     if actions.ndim != 2 or not len(actions):
-        return
+        return 0.0
     mags = np.linalg.norm(actions, axis=1)
     burns = np.flatnonzero(mags > max(min_dv_display, 0.0))
     burns = burns[burns < len(states)]
     if not burns.size:
-        return
+        return 0.0
     reach = max(float(np.nanmax(np.abs(states[:, [xi, zi]]))), 1.0)
     scale = 0.18 * reach / mags[burns].max()
+    tip_reach = 0.0
     for i in burns:
-        ax.annotate("", xy=(states[i, xi] + actions[i, 0] * scale,
-                            states[i, zi] + actions[i, -1] * scale),
-                    xytext=(states[i, xi], states[i, zi]),
+        tip = (states[i, xi] + actions[i, 0] * scale,
+               states[i, zi] + actions[i, -1] * scale)
+        tip_reach = max(tip_reach, abs(tip[0]), abs(tip[1]))
+        ax.annotate("", xy=tip, xytext=(states[i, xi], states[i, zi]),
                     arrowprops=dict(arrowstyle="->", color=COLOR_4, lw=1.4), zorder=6)
     ax.plot([], [], color=COLOR_4, linewidth=1.4,
             label=rf"$\Delta v$ impulses ({len(burns)})")
+    return tip_reach

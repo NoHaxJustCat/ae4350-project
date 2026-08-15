@@ -1,7 +1,7 @@
 # Continue a "random" run from its own latest checkpoint.
 #
 #   .\runs\random_resume.ps1                          # continues -Run below
-#   .\runs\random_resume.ps1 -Run random_20260728_095951
+#   .\runs\random_resume.ps1 -Run random_20260728_095951   # a different run
 #   .\runs\random_resume.ps1 -ResumeFrom <path-to.zip> # pick a checkpoint yourself
 #
 # The checkpoint's .curriculum.json sidecar carries the curriculum distance, so
@@ -12,21 +12,25 @@
 # run's tag: RunPaths wipes the directory it is given, which would delete the
 # run being resumed.
 #
-# Noise defaults are low: this continues a policy that already docks, so it
-# should refine rather than re-explore. On resume the decay schedule restarts
-# over the REMAINING budget.
+# Noise picks up exactly where random.ps1 leaves off. That run decays
+# 0.10 -> 0.005 over the first 80% of its budget, so it spends its whole tail
+# at the 0.005 floor; starting a resume anywhere above that would re-inject
+# exploration into a policy that has already settled, and restarting the decay
+# from 0.05 (the old default here) meant a 10x noise step UP at the seam. Flat
+# 0.005 -> 0.005 keeps the continuation seamless. Drop below the floor only
+# deliberately -- runs/random_refine.ps1 is the script for that.
 #
 # NOTE: the replay buffer is not saved, so gradient updates pause until it
 # refills past MIN_BUFFER. -TotalTimesteps is the ABSOLUTE target including the
 # resumed model's own steps.
 
 param(
-    [string]$Run = "random_20260728_095951",
+    [string]$Run = "random_20260815_114845",
     [string]$ResumeFrom = "",
     [string]$RunTag = "",
-    [int]$TotalTimesteps = 2000000,
-    [double]$NoiseStart = 0.05,
-    [double]$NoiseEnd = 0.01,
+    [int]$TotalTimesteps = 1000000,
+    [double]$NoiseStart = 0.005,
+    [double]$NoiseEnd = 0.005,
     [double]$NoiseDecayFrac = 0.5,
     [int]$EvalFreq = 10000
 )

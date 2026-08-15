@@ -1,0 +1,1 @@
+{"scenario": "vbar", "run_tag": "vbar_lstart25k", "num_timesteps": 250002, "total_timesteps": 250000, "episode_count": 78404, "recent_dock_rate": 1.0, "recent_avg_reward": 914.2892494000001, "curriculum_distance": 1000.0, "angle_half_width_deg": null, "elapsed_seconds": 2899.9228521, "steps_per_sec": 86.20987962454217, "updated_at": "2026-08-13 11:43:48"}

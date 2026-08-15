@@ -122,16 +122,20 @@ def summarize(results, label=""):
         d = [r["final_distance"] for r in results]
         print(f"final distance      : median {np.median(d):.1f} m  "
               f"[min {np.min(d):.1f}, max {np.max(d):.1f}]")
-        print(f"dv/opt (all eps)    : median {np.median([r['ratio'] for r in results]):.2f}x")
+        print(f"dv/opt (all eps)    : median {np.median([r['ratio'] for r in results]):.4f}x")
         return
 
     ratios = [r["ratio"] for r in docked]
     vels = [r["arrival_speed"] for r in docked]
     steps = [r["steps"] for r in docked]
     print(f"--- docked episodes only ---")
-    print(f"dv/opt              : median {np.median(ratios):6.2f}x   "
-          f"p10 {_pct(ratios, 10):.2f}x  p90 {_pct(ratios, 90):.2f}x   "
-          f"[min {np.min(ratios):.2f}, max {np.max(ratios):.2f}]")
+    print(f"dv/opt              : median {np.median(ratios):8.4f}x   "
+          f"p10 {_pct(ratios, 10):.4f}x  p90 {_pct(ratios, 90):.4f}x   "
+          f"[min {np.min(ratios):.4f}, max {np.max(ratios):.4f}]")
+    dvs = [r["dv_used"] for r in docked]
+    print(f"dv used [m/s]       : median {np.median(dvs):.4f}   "
+          f"p10 {_pct(dvs, 10):.4f}  p90 {_pct(dvs, 90):.4f}   "
+          f"[min {np.min(dvs):.4f}, max {np.max(dvs):.4f}]")
     print(f"arrival speed [m/s] : median {np.median(vels):.5f}   "
           f"p90 {_pct(vels, 90):.5f}   max {np.max(vels):.5f}")
     print(f"arrival speed / dv_opt : median {np.median([r['arrival_speed'] / r['dv_opt'] for r in docked]):.3f}"
@@ -155,11 +159,11 @@ def print_references(results, scenario):
     if scenario == "vbar":
         for name, val in [("two V-bar impulses", dv_vbar_two_impulse_vv(dx, OMEGA)),
                           ("two R-bar impulses", dv_vbar_two_impulse_rr(dx, OMEGA))]:
-            print(f"  {name:<22}: {val:.5f} m/s  ({dv / val:.2f}x)")
+            print(f"  {name:<22}: {val:.5f} m/s  ({dv / val:.4f}x)")
     else:
         for name, val in [("R-bar + V-bar impulse", dv_rbar_strategy_rv(dz, OMEGA)),
                           ("two V-bar impulses*", dv_rbar_strategy_vv(dz, OMEGA))]:
-            print(f"  {name:<22}: {val:.5f} m/s  ({dv / val:.2f}x)")
+            print(f"  {name:<22}: {val:.5f} m/s  ({dv / val:.4f}x)")
         print("  * not reachable from this scenario's geometry -- comparison only")
 
 
@@ -168,13 +172,13 @@ def angle_sweep(model, args, step_deg=10):
     since quality varies enormously with direction."""
     raw, env = build_env("random", args.distance, ENV_ANGLE_CURRICULUM_MAX_DEG)
     print(f"\n=== per-angle sweep (deterministic, distance {args.distance:.0f} m) ===")
-    print(f"{'angle':>6} {'result':>14} {'dv/opt':>8} {'arr.speed':>10} {'steps':>6} {'coasts'}")
+    print(f"{'angle':>6} {'result':>14} {'dv/opt':>10} {'arr.speed':>10} {'steps':>6} {'coasts'}")
     docked = 0
     angles = np.arange(0, 360, step_deg)
     for deg in angles:
         r = rollout(model, raw, env, options={"angle": np.deg2rad(float(deg))}, seed=args.seed)
         docked += r["docked"]
-        print(f"{deg:6.0f} {r['cause']:>14} {r['ratio']:8.2f} {r['arrival_speed']:10.5f} "
+        print(f"{deg:6.0f} {r['cause']:>14} {r['ratio']:10.4f} {r['arrival_speed']:10.5f} "
               f"{r['steps']:6d} {r['coasts'][:6]}")
     print(f"\ndock rate over the circle: {docked}/{len(angles)} = {100 * docked / len(angles):.0f}%")
 
@@ -249,7 +253,7 @@ def main():
                 sub = [r for r, k in zip(results, m) if k]
                 dk = [r for r in sub if r["docked"]]
                 med = np.median([r["ratio"] for r in dk]) if dk else float("nan")
-                print(f"{a:5.0f}-{b:<6.0f} {len(sub):5d} {100 * len(dk) / len(sub):7.1f} {med:15.2f}")
+                print(f"{a:5.0f}-{b:<6.0f} {len(sub):5d} {100 * len(dk) / len(sub):7.1f} {med:15.4f}")
 
     if args.angle_sweep:
         angle_sweep(model, args, step_deg=args.sweep_step)
