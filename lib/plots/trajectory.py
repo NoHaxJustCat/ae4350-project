@@ -2,6 +2,7 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
 
 from config import ENV_POS_TOLERANCE, MODE_2D
 from lib.plots.style import COLOR_1, COLOR_2, COLOR_3, COLOR_4, save, style_axes, use_style
@@ -15,6 +16,18 @@ AXES_HEIGHT_IN = 4.0
 PAD_W_IN = 1.0
 PAD_H_IN = 1.8
 ASPECT_LIMITS = (0.75, 2.4)
+
+
+def _tick_step(span, target=6):
+    """A 1/2/2.5/5-style step giving roughly `target` intervals across `span`."""
+    if not np.isfinite(span) or span <= 0:
+        return 1.0
+    raw = span / target
+    mag = 10.0 ** np.floor(np.log10(raw))
+    for m in (1.0, 2.0, 2.5, 5.0):
+        if raw <= m * mag:
+            return m * mag
+    return 10.0 * mag
 
 
 def _frame(bounds, margin):
@@ -82,6 +95,13 @@ def plot_trajectory(states, actions=None, path="trajectory.png",
     # shape too or the leftover is what the reader sees. The pads are the room
     # taken by the labels, title and legend, which do not scale with the data.
     fig.set_size_inches(AXES_HEIGHT_IN * aspect + PAD_W_IN, AXES_HEIGHT_IN + PAD_H_IN)
+    # One step for both axes: the scale is already equal, so a shared tick
+    # interval is what makes the grid read as squares rather than rectangles.
+    # Sized off the longer axis, or the short one would carry a step so fine
+    # the long one is unreadable.
+    step = _tick_step(max(x_hi - x_lo, z_hi - z_lo))
+    ax.xaxis.set_major_locator(MultipleLocator(step))
+    ax.yaxis.set_major_locator(MultipleLocator(step))
 
     ax.set_xlabel(r"$x$ [m] (V-bar)")
     ax.set_ylabel(r"$z$ [m] (R-bar)")
