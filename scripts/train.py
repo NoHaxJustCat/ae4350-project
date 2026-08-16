@@ -76,6 +76,10 @@ def parse_args():
                    help="Checkpoint .zip to continue from; reads its .curriculum.json "
                         "sidecar. The replay buffer is NOT restored.")
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--load-replay-buffer", type=Path, default=None,
+                   help="Pre-fill the replay buffer from a .pkl written by "
+                        "scripts/seed_buffer.py. Also cancels the resume warmup: "
+                        "the buffer is not empty, so there is nothing to refill.")
 
     # --- Ablation knobs. Every one defaults to the config.py nominal, so
     # omitting all of them reproduces the baseline run exactly.
@@ -203,9 +207,32 @@ def build_model(args, env, sigma_start):
         # can be destroyed in a few thousand steps that way. Re-anchor it so
         # --learning-starts means what it does on a fresh run: collect this
         # many transitions before any updates.
-        model.learning_starts = model.num_timesteps + args.learning_starts
-        print(f"Replay buffer starts empty; refilling {args.learning_starts} steps "
-              f"before gradient updates resume (at {model.learning_starts})")
+        if args.load_replay_buffer:
+            # Inserted in NUM_ENVS-sized chunks: an SB3 buffer stores one
+            # transition per env slot per add(), so the seed file holds raw
+            # arrays rather than a pickled buffer shaped for a different
+            # n_envs than this run uses.
+            # Materialized once: indexing an NpzFile decompresses the WHOLE
+            # array on every access, so slicing it inside the loop turns a
+            # one-second insert into an unbounded hang.
+            with np.load(args.load_replay_buffer) as fh:
+                seed = {k: fh[k] for k in ("obs", "next_obs", "actions",
+                                           "rewards", "dones")}
+            n = (len(seed["obs"]) // NUM_ENVS) * NUM_ENVS
+            infos = [{} for _ in range(NUM_ENVS)]
+            for i in range(0, n, NUM_ENVS):
+                sl = slice(i, i + NUM_ENVS)
+                model.replay_buffer.add(seed["obs"][sl], seed["next_obs"][sl],
+                                        seed["actions"][sl], seed["rewards"][sl],
+                                        seed["dones"][sl], infos)
+            print(f"Seeded replay buffer from {args.load_replay_buffer} "
+                  f"({model.replay_buffer.size() * NUM_ENVS} transitions); "
+                  f"gradient updates resume immediately")
+            model.learning_starts = 0
+        else:
+            model.learning_starts = model.num_timesteps + args.learning_starts
+            print(f"Replay buffer starts empty; refilling {args.learning_starts} steps "
+                  f"before gradient updates resume (at {model.learning_starts})")
         return model
 
     model = build_algo(

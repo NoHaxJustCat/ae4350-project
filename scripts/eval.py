@@ -155,7 +155,7 @@ def print_references(results, scenario):
     dx = np.median([abs(r["start"][0]) for r in docked])
     dz = np.median([abs(r["start"][1]) for r in docked])
     dv = np.median([r["dv_used"] for r in docked])
-    print(f"--- vs. the analytic references (CLAUDE.md), median dv_used = {dv:.5f} m/s ---")
+    print(f"--- vs. the analytic references (see README), median dv_used = {dv:.5f} m/s ---")
     if scenario == "vbar":
         for name, val in [("two V-bar impulses", dv_vbar_two_impulse_vv(dx, OMEGA)),
                           ("two R-bar impulses", dv_vbar_two_impulse_rr(dx, OMEGA))]:

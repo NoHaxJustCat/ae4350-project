@@ -1,1 +1,1 @@
-{"curriculum_distance": 1000.0, "num_timesteps": 959616, "eval_mean_return": 383.6129986772973, "eval_dock_rate": 1.0}
+{"curriculum_distance": 1000.0, "num_timesteps": 929640, "eval_mean_return": 379.99028079748484, "eval_dock_rate": 1.0}

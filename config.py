@@ -1,4 +1,6 @@
+import importlib.util
 import os
+
 import numpy as np
 
 MODE_2D: bool = True
@@ -109,10 +111,17 @@ N_BLOCKS = 2
 ACTIVATION = "relu"
 
 # --- Compute ---
-DEVICE = "cuda"
-NUM_ENVS = 6
+# "auto" resolves to cuda when a GPU is visible and cpu otherwise, so the repo
+# runs unchanged on a machine without CUDA. Override with AE4350_DEVICE=cpu.
+# The nets here are small (256x256), so CPU is perhaps 2-3x slower, not 50x.
+DEVICE = os.environ.get("AE4350_DEVICE") or (
+    "cuda" if importlib.util.find_spec("torch")
+    and __import__("torch").cuda.is_available() else "cpu")
+# Tuned for a 6-core box: one env per core, one torch thread left over. Lower
+# NUM_ENVS on fewer cores -- oversubscribing makes the workers fight for cores.
+NUM_ENVS = int(os.environ.get("AE4350_NUM_ENVS", 6))
 VEC_ENV = "dummy"
-TORCH_THREADS = 5
+TORCH_THREADS = max(1, NUM_ENVS - 1)
 
 # --- Exploration noise (OU) ---
 # ACTION_NOISE_STD_* is the stationary std in native action units, not SB3's

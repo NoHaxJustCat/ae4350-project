@@ -1,5 +1,5 @@
 """
-Reference two-impulse Δv formulas from the project objective (CLAUDE.md).
+Reference two-impulse Δv formulas for the CW rendezvous problem (see README).
 
 Reported alongside a trained policy's actual Δv (see libs/evaluate.py) so
 the learned solution can be judged against the classical analytic transfer.

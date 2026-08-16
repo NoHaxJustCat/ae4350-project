@@ -117,9 +117,7 @@ def main():
         out = run_root / "episodes" / f"deterministic_{args.scenario}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    title = (f"{args.scenario} deterministic — "
-             rf"$\Delta v$/opt {ratio:.2f}x, {burns} impulses"
-             + ("" if docked else ", NOT docked"))
+    title = (f"{args.scenario}")
     plot_trajectory(states, actions, str(out),
                     min_dv_display=args.min_dv, title=title)
 
