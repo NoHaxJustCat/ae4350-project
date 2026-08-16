@@ -25,10 +25,15 @@
 # resumed model's own steps.
 
 param(
-    [string]$Run = "random_20260815_114845",
+    [string]$Run = "random_specialist",
     [string]$ResumeFrom = "",
     [string]$RunTag = "",
     [int]$TotalTimesteps = 1000000,
+    # Matches runs/random.ps1. On a resume this counts FRESH transitions to
+    # collect before gradient updates restart, because the replay buffer is not
+    # saved with the checkpoint -- leaving it at the config default of 5000
+    # restarts updates against a buffer far too thin to protect a good policy.
+    [int]$LearningStarts = 25000,
     [double]$NoiseStart = 0.005,
     [double]$NoiseEnd = 0.005,
     [double]$NoiseDecayFrac = 0.5,
@@ -53,11 +58,13 @@ if ($RunTag -eq $Run) { throw "RunTag must differ from -Run, or the source run i
 Write-Host "random resume | run-tag=$RunTag | steps=$TotalTimesteps"
 Write-Host "  from: $ResumeFrom"
 Write-Host "  noise $NoiseStart -> $NoiseEnd over $NoiseDecayFrac | eval every $EvalFreq"
+Write-Host "  refilling $LearningStarts transitions before gradient updates resume"
 
 & ./.conda/python.exe -u scripts/train.py `
     --scenario random `
     --total-timesteps $TotalTimesteps `
     --resume-from $ResumeFrom `
+    --learning-starts $LearningStarts `
     --noise-std-start $NoiseStart `
     --noise-std-end $NoiseEnd `
     --noise-decay-frac $NoiseDecayFrac `
